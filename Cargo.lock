@@ -746,7 +746,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "dirigent"
+name = "dirigent-chat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossterm",
+ "futures",
+ "prost",
+ "protox",
+ "ratatui",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "dirigent-player"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -774,25 +793,6 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "dirigent-chat"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "crossterm",
- "futures",
- "prost",
- "protox",
- "ratatui",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
 ]
 
 [[package]]

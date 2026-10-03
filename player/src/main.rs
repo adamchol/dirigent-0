@@ -32,8 +32,8 @@ const HELP_STYLES: Styles = Styles::styled()
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "dirigent",
-    about = "headless-first coding agent harness",
+    name = "player",
+    about = "headless coding agent, a worker of dirigent",
     styles = HELP_STYLES
 )]
 struct Cli {
@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "dirigent=info,genai=warn".into()),
+                .unwrap_or_else(|_| "player=info,genai=warn".into()),
         )
         .init();
     let cli: &'static Cli = Box::leak(Box::new(Cli::parse()));

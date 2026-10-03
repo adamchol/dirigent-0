@@ -19,10 +19,10 @@ use crate::event::{Event, TurnEndReason};
 use crate::provider::{ContentBlock, Delta, StopReason, Usage};
 
 pub mod pb {
-    tonic::include_proto!("dirigent.v1");
+    tonic::include_proto!("player.v1");
 }
 
-use pb::dirigent_server::{Dirigent, DirigentServer};
+use pb::player_server::{Player, PlayerServer};
 
 pub struct GrpcServer {
     addr: SocketAddr,
@@ -40,7 +40,7 @@ impl GrpcServer {
         };
         tokio::spawn(async move {
             let result = tonic::transport::Server::builder()
-                .add_service(DirigentServer::new(service))
+                .add_service(PlayerServer::new(service))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await;
             if let Err(e) = result {
@@ -75,7 +75,7 @@ impl Drop for ActiveGuard {
 }
 
 #[tonic::async_trait]
-impl Dirigent for Service {
+impl Player for Service {
     type SessionStream = UnboundedReceiverStream<Result<pb::Event, Status>>;
 
     async fn session(
@@ -408,7 +408,7 @@ mod tests {
     use crate::agent::{Agent, AgentConfig};
     use crate::provider::mock::{MockProvider, Script};
     use crate::tools::Registry;
-    use pb::dirigent_client::DirigentClient;
+    use pb::player_client::PlayerClient;
     use serde_json::json;
     use std::time::Duration;
     use tokio_stream::wrappers::ReceiverStream;
@@ -557,7 +557,7 @@ mod tests {
     }
 
     async fn connect(addr: SocketAddr) -> Result<Client, Status> {
-        let mut client = DirigentClient::connect(format!("http://{addr}"))
+        let mut client = PlayerClient::connect(format!("http://{addr}"))
             .await
             .unwrap();
         let (input, rx) = mpsc::channel(8);

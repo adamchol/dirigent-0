@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package dirigent.v1;
+package player.v1;
 
-service Dirigent {
+service Player {
   // Opening the stream starts a session; closing it ends the session.
   // Only one session at a time: a second client gets FAILED_PRECONDITION.
   rpc Session(stream Input) returns (stream Event);

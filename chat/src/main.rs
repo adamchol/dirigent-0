@@ -1,9 +1,9 @@
-//! Temporary terminal client for dirigent's gRPC session.
+//! Temporary terminal client for a dirigent player's gRPC session.
 
 mod app;
 
 pub mod pb {
-    tonic::include_proto!("dirigent.v1");
+    tonic::include_proto!("player.v1");
 }
 
 use anyhow::{anyhow, Context};
@@ -16,12 +16,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Streaming;
 
 use crate::app::{Action, App};
-use crate::pb::dirigent_client::DirigentClient;
+use crate::pb::player_client::PlayerClient;
 
 #[derive(Parser)]
 #[command(
     name = "dirigent-chat",
-    about = "terminal client for a dirigent session"
+    about = "terminal client for a dirigent player"
 )]
 struct Cli {
     #[arg(long, env = "DIRIGENT_ADDR", default_value = "http://127.0.0.1:8787")]
@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Connect before taking over the terminal, so a refusal prints normally.
-    let mut client = DirigentClient::connect(cli.addr.clone())
+    let mut client = PlayerClient::connect(cli.addr.clone())
         .await
         .with_context(|| format!("could not connect to {}", cli.addr))?;
     let (input, rx) = mpsc::channel::<pb::Input>(32);
@@ -80,7 +80,7 @@ async fn run(
                 Ok(Some(ev)) => app.on_event(ev),
                 Ok(None) => {
                     connected = false;
-                    app.status = Some("server closed the session · Ctrl-C quits".into());
+                    app.status = Some("player closed the session · Ctrl-C quits".into());
                 }
                 Err(status) => {
                     connected = false;

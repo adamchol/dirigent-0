@@ -1,7 +1,11 @@
 [package]
-name = "dirigent"
+name = "dirigent-player"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "player"
+path = "src/main.rs"
 
 [dependencies]
 genai = "=0.7.0-beta.22"
