@@ -1,11 +1,9 @@
 mod agent;
-mod event;
 mod history;
 mod provider;
 mod session;
 mod tools;
 
-use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,7 +14,7 @@ use tracing::info;
 
 use crate::agent::{Agent, AgentConfig};
 use crate::provider::{Effort, Provider};
-use crate::session::grpc::GrpcServer;
+use crate::session::chlive::ChliveSession;
 use crate::tools::Registry;
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
@@ -37,8 +35,17 @@ const HELP_STYLES: Styles = Styles::styled()
     styles = HELP_STYLES
 )]
 struct Cli {
-    #[arg(long, env = "PORT", default_value_t = 8787)]
-    port: u16,
+    /// The session to run (a UUID); a new one when absent.
+    #[arg(long, env = "DIRIGENT_SESSION")]
+    session: Option<String>,
+
+    /// chlive's WebSocket, where the session's log and inputs are read.
+    #[arg(long, env = "CHLIVE_URL", default_value = "ws://127.0.0.1:8080/live")]
+    chlive_url: String,
+
+    /// Kafka bootstrap servers, where the session's events are written.
+    #[arg(long, env = "DIRIGENT_KAFKA", default_value = "127.0.0.1:9092")]
+    kafka: String,
 
     #[arg(long, env = "MOCK")]
     mock: bool,
@@ -103,22 +110,24 @@ async fn main() -> anyhow::Result<()> {
         workdir,
     };
 
-    let mut server = GrpcServer::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, cli.port))).await?;
+    let id = match &cli.session {
+        Some(id) => uuid::Uuid::parse_str(id)
+            .with_context(|| format!("--session {id}: not a UUID"))?
+            .to_string(),
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+    let mut session = ChliveSession::new(&id, &cli.chlive_url, &cli.kafka)?;
     info!(
-        bind = %server.addr(),
+        session = id,
+        chlive = cli.chlive_url,
+        kafka = cli.kafka,
         provider = provider.name(),
         model = cfg.model,
         workdir = %workdir.display(),
-        "listening for a gRPC session"
+        "running the session"
     );
-    let serve = async {
-        // One session at a time; the server refuses a second client meanwhile.
-        while let Some(mut session) = server.accept().await {
-            agent.run(&mut session).await;
-        }
-    };
     tokio::select! {
-        _ = serve => {}
+        r = agent.run(&mut session) => r?,
         _ = tokio::signal::ctrl_c() => info!("shutting down"),
     }
     Ok(())

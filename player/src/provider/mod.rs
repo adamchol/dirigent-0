@@ -9,35 +9,13 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use dirigent_protocol::{ContentBlock, Delta, StopReason, Usage};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     User,
     Assistant,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentBlock {
-    Text {
-        text: String,
-    },
-    Thinking {
-        text: String,
-        #[serde(default, skip_serializing_if = "Value::is_null")]
-        provider_data: Value,
-    },
-    ToolCall {
-        id: String,
-        name: String,
-        input: Value,
-    },
-    ToolResult {
-        call_id: String,
-        content: String,
-        #[serde(default)]
-        is_error: bool,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,38 +75,6 @@ pub struct Request {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub effort: Option<Effort>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "reason", rename_all = "snake_case")]
-pub enum StopReason {
-    EndTurn,
-    MaxTokens,
-    ToolUse,
-    Refusal,
-    ContextOverflow,
-    Other { raw: String },
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Usage {
-    pub input: u64,
-    pub output: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Delta {
-    BlockStart { index: usize, block: ContentBlock },
-    Text { index: usize, text: String },
-    Thinking { index: usize, text: String },
-    ToolCallArgs { index: usize, json: String },
-    BlockData { index: usize, provider_data: Value },
-    BlockStop { index: usize },
-    Usage(Usage),
-    Stop(StopReason),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

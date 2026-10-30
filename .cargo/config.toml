@@ -1,0 +1,3 @@
+[net]
+# private git dependencies (chlive) go through git and its credentials
+git-fetch-with-cli = true

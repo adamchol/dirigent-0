@@ -1,58 +1,116 @@
 {
   "nodes": {
-    "flake-utils": {
+    "chlive": {
       "inputs": {
-        "systems": "systems"
+        "continuous-backup": [
+          "continuous-backup"
+        ],
+        "dnvr": [
+          "dnvr"
+        ],
+        "flake-parts": [
+          "flake-parts"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
       },
       "locked": {
-        "lastModified": 1731533236,
-        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
-        "owner": "numtide",
-        "repo": "flake-utils",
-        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "lastModified": 1793054447,
+        "narHash": "sha256-KH5ztfgsA7gkSU0OH+jp3b1hlgP5r75ZrYcxSv2iNQ8=",
+        "ref": "all-in",
+        "rev": "016bb7b455d016e949e8a3859bea9d09cf64d154",
+        "revCount": 118,
+        "type": "git",
+        "url": "https://github.com/dialohq/chlive"
+      },
+      "original": {
+        "ref": "all-in",
+        "type": "git",
+        "url": "https://github.com/dialohq/chlive"
+      }
+    },
+    "continuous-backup": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792668058,
+        "narHash": "sha256-i5m2/PP/pmntv3boIXGk9Opom4EO3jaC+eWl3pdaIPs=",
+        "owner": "dialohq",
+        "repo": "clickhouse-continuous-backup",
+        "rev": "4bfe2915182a3ad9b1411480419451dc7a760bf1",
         "type": "github"
       },
       "original": {
-        "owner": "numtide",
-        "repo": "flake-utils",
+        "owner": "dialohq",
+        "ref": "pause-server",
+        "repo": "clickhouse-continuous-backup",
+        "type": "github"
+      }
+    },
+    "dnvr": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793318164,
+        "narHash": "sha256-mNf2GGAg3IMVZU1f37J4q8OkFqTvG2kQvTmqhw7btYw=",
+        "owner": "dialohq",
+        "repo": "dnvr",
+        "rev": "28f112bde11c784b3e4b8e5b850182dae72d26c6",
+        "type": "github"
+      },
+      "original": {
+        "owner": "dialohq",
+        "ref": "feat/rex-runner",
+        "repo": "dnvr",
+        "type": "github"
+      }
+    },
+    "flake-parts": {
+      "inputs": {
+        "nixpkgs-lib": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1790898470,
+        "narHash": "sha256-zTwuwezD0w3hpga6a6P8emidzAZFyWqlNeRBlpWOOl8=",
+        "owner": "hercules-ci",
+        "repo": "flake-parts",
+        "rev": "024633cd702b10285db5cb19b40ad48d2399ba60",
+        "type": "github"
+      },
+      "original": {
+        "owner": "hercules-ci",
+        "repo": "flake-parts",
         "type": "github"
       }
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1781809869,
-        "narHash": "sha256-1hwp8CfoJFznProg3evYaIHXgkmicdDeF8cUmj63zfI=",
+        "lastModified": 1793110635,
+        "narHash": "sha256-dhoW6VgFWlaodSY5jrBn+CF2FLmaUvDVgM7+C7T2+NM=",
         "owner": "nixos",
         "repo": "nixpkgs",
-        "rev": "093f96236926e390d6d92555834e62c0647cfd2e",
+        "rev": "31ecbaca1bdefa45dffc409f0250bd8039ea0010",
         "type": "github"
       },
       "original": {
         "owner": "nixos",
-        "ref": "master",
+        "ref": "nixos-unstable",
         "repo": "nixpkgs",
         "type": "github"
       }
     },
     "root": {
       "inputs": {
-        "flake-utils": "flake-utils",
+        "chlive": "chlive",
+        "continuous-backup": "continuous-backup",
+        "dnvr": "dnvr",
+        "flake-parts": "flake-parts",
         "nixpkgs": "nixpkgs"
-      }
-    },
-    "systems": {
-      "locked": {
-        "lastModified": 1681028828,
-        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
-        "owner": "nix-systems",
-        "repo": "default",
-        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
-        "type": "github"
-      },
-      "original": {
-        "owner": "nix-systems",
-        "repo": "default",
-        "type": "github"
       }
     }
   },

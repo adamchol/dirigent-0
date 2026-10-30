@@ -8,11 +8,11 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::event::{Event, TurnEndReason};
 use crate::history::History;
 use crate::provider::{Accumulator, ContentBlock, Effort, Provider, Request, StopReason};
 use crate::session::Session;
 use crate::tools::{Registry, ToolCtx, ToolOutput};
+use dirigent_protocol::{Event, TurnEndReason};
 
 #[derive(Debug, Clone, Copy)]
 pub struct AgentConfig {
@@ -54,25 +54,29 @@ impl Agent {
     /// Run one session: inputs come from the session, model and tool outcomes
     /// from the tasks this loop spawns. Every handled event is published to
     /// the session; only what the model needs is kept in `history`. Returns
-    /// when the client is gone and no turn is in progress.
-    pub async fn run(&self, session: &mut dyn Session) {
-        let history = match session.load().await {
-            Ok(events) => History::from_events(&events),
-            Err(e) => {
-                warn!("could not load session events, starting empty: {e:#}");
-                History::default()
-            }
-        };
+    /// when the session's inputs end and no turn is in progress.
+    ///
+    /// A turn the log leaves unfinished (the previous player stopped mid-turn)
+    /// is closed first: its tool calls get aborted results and it ends Aborted.
+    pub async fn run(&self, session: &mut dyn Session) -> anyhow::Result<()> {
+        let events = session.load().await?;
         let (tx, mut outcomes) = mpsc::unbounded_channel::<Event>();
         let mut run = Run {
             agent: self,
             session,
-            history,
+            history: History::from_events(&events),
             ctx: Arc::new(ToolCtx::new(self.workdir)),
             turn: None,
             tx,
         };
-        info!("session started");
+        let closing = close_unfinished(&events);
+        if !closing.is_empty() {
+            warn!("the log ends mid-turn; closing that turn");
+        }
+        for ev in &closing {
+            run.record(ev).await;
+        }
+        info!(events = events.len(), "session started");
         let mut client = true;
 
         while client || run.turn.is_some() {
@@ -95,7 +99,60 @@ impl Agent {
             run.handle(ev).await;
         }
         info!("session ended");
+        Ok(())
     }
+}
+
+/// The events that close a turn `events` leave open: an aborted result for each tool call
+/// still waiting for one, then `TurnEnded { Aborted }`. Empty when no turn is open.
+fn close_unfinished(events: &[Event]) -> Vec<Event> {
+    let mut open = false;
+    let mut waiting: Vec<(String, String)> = Vec::new();
+    for ev in events {
+        match ev {
+            Event::UserMessage { .. } => open = true,
+            Event::AssistantMessage {
+                content,
+                stop_reason,
+                ..
+            } => {
+                waiting = if *stop_reason == StopReason::ToolUse {
+                    tool_calls(content)
+                        .into_iter()
+                        .map(|c| (c.id, c.name))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            }
+            Event::ToolResult { call_id, .. } => waiting.retain(|(id, _)| id != call_id),
+            Event::TurnEnded { .. } => {
+                open = false;
+                waiting.clear();
+            }
+            Event::UserInterrupt { .. }
+            | Event::ModelDelta { .. }
+            | Event::ModelCancelled
+            | Event::Error { .. } => {}
+        }
+    }
+    if !open {
+        return Vec::new();
+    }
+    let mut out: Vec<Event> = waiting
+        .into_iter()
+        .map(|(call_id, name)| Event::ToolResult {
+            call_id,
+            name,
+            content: ABORTED_TOOL_RESULT.into(),
+            is_error: true,
+            meta: Value::Null,
+        })
+        .collect();
+    out.push(Event::TurnEnded {
+        reason: TurnEndReason::Aborted,
+    });
+    out
 }
 
 /// Per-session state of [`Agent::run`].
@@ -126,7 +183,7 @@ impl Run<'_> {
                     }
                 }
             }
-            Event::UserInterrupt => {
+            Event::UserInterrupt { .. } => {
                 self.record(&ev).await;
                 if let Some(t) = &mut self.turn {
                     t.interrupted = true;
@@ -373,7 +430,7 @@ async fn run_one(
 fn log_event(ev: &Event) {
     match ev {
         Event::UserMessage { .. } => info!("user message"),
-        Event::UserInterrupt => info!("user interrupt"),
+        Event::UserInterrupt { .. } => info!("user interrupt"),
         Event::AssistantMessage { content, usage, .. } => {
             let text = crate::provider::Message::assistant(content.clone()).text();
             let calls = content
@@ -431,8 +488,10 @@ mod tests {
         effort: None,
     };
 
-    /// In-memory session: inputs from a channel, published events into a Vec.
+    /// In-memory session: a log to resume from, inputs from a channel, published events
+    /// into a Vec.
     struct TestSession {
+        log: Vec<Event>,
         inbox: mpsc::Receiver<Event>,
         published: Arc<Mutex<Vec<Event>>>,
     }
@@ -440,7 +499,7 @@ mod tests {
     #[async_trait]
     impl Session for TestSession {
         async fn load(&mut self) -> anyhow::Result<Vec<Event>> {
-            Ok(Vec::new())
+            Ok(std::mem::take(&mut self.log))
         }
         async fn recv(&mut self) -> Option<Event> {
             self.inbox.recv().await
@@ -456,10 +515,15 @@ mod tests {
         provider: Arc<MockProvider>,
         published: Arc<Mutex<Vec<Event>>>,
         tx: mpsc::Sender<Event>,
-        task: tokio::task::JoinHandle<()>,
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
     }
 
     fn harness() -> Harness {
+        resumed(Vec::new())
+    }
+
+    /// A harness whose session's log already has `log`.
+    fn resumed(log: Vec<Event>) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let workdir: &'static Path =
             Box::leak(dir.path().canonicalize().unwrap().into_boxed_path());
@@ -473,6 +537,7 @@ mod tests {
         };
         let (tx, inbox) = mpsc::channel(8);
         let mut session = TestSession {
+            log,
             inbox,
             published: published.clone(),
         };
@@ -490,13 +555,21 @@ mod tests {
     impl Harness {
         async fn send(&self, text: &str) {
             self.tx
-                .send(Event::UserMessage { text: text.into() })
+                .send(Event::UserMessage {
+                    input_id: format!("in-{text}"),
+                    text: text.into(),
+                })
                 .await
                 .unwrap();
         }
 
         async fn interrupt(&self) {
-            self.tx.send(Event::UserInterrupt).await.unwrap();
+            self.tx
+                .send(Event::UserInterrupt {
+                    input_id: "in-interrupt".into(),
+                })
+                .await
+                .unwrap();
         }
 
         /// Wait until `turns` turns have ended, then disconnect the client.
@@ -518,7 +591,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             drop(self.tx);
-            self.task.await.unwrap();
+            self.task.await.unwrap().unwrap();
             let kinds = render(&self.published.lock().unwrap());
             (kinds, self.provider.requests())
         }
@@ -530,8 +603,8 @@ mod tests {
             .iter()
             .filter(|e| !matches!(e, Event::ModelDelta { .. }))
             .map(|e| match e {
-                Event::UserMessage { text } => format!("user:{text}"),
-                Event::UserInterrupt => "interrupt".into(),
+                Event::UserMessage { text, .. } => format!("user:{text}"),
+                Event::UserInterrupt { .. } => "interrupt".into(),
                 Event::AssistantMessage { content, .. } => {
                     let m = crate::provider::Message::assistant(content.clone());
                     let calls = content
@@ -889,6 +962,144 @@ mod tests {
                 "assistant:+tool",
                 "tool:Bash:err:Command aborted by user interrupt",
                 "end:Aborted",
+            ]
+        );
+    }
+
+    fn logged_user(text: &str) -> Event {
+        Event::UserMessage {
+            input_id: format!("old-{text}"),
+            text: text.into(),
+        }
+    }
+
+    fn logged_call(id: &str, name: &str) -> Event {
+        Event::AssistantMessage {
+            content: vec![ContentBlock::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                input: json!({}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        }
+    }
+
+    fn logged_result(id: &str) -> Event {
+        Event::ToolResult {
+            call_id: id.into(),
+            name: "Read".into(),
+            content: "out".into(),
+            is_error: false,
+            meta: Value::Null,
+        }
+    }
+
+    fn ended(reason: TurnEndReason) -> Event {
+        Event::TurnEnded { reason }
+    }
+
+    #[test]
+    fn a_finished_log_needs_no_closing() {
+        assert!(close_unfinished(&[]).is_empty());
+        assert!(close_unfinished(&[
+            logged_user("a"),
+            logged_call("c1", "Read"),
+            logged_result("c1"),
+            ended(TurnEndReason::Completed),
+        ])
+        .is_empty());
+    }
+
+    #[test]
+    fn an_open_turn_gets_aborted_results_then_ends() {
+        let closing = close_unfinished(&[
+            logged_user("a"),
+            Event::AssistantMessage {
+                content: vec![
+                    ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "Read".into(),
+                        input: json!({}),
+                    },
+                    ContentBlock::ToolCall {
+                        id: "c2".into(),
+                        name: "Bash".into(),
+                        input: json!({}),
+                    },
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+            logged_result("c1"),
+        ]);
+        assert_eq!(
+            render(&closing),
+            vec![
+                format!("tool:Bash:err:{ABORTED_TOOL_RESULT}"),
+                "end:Aborted".to_string()
+            ]
+        );
+        // a turn cut off before any reply just ends
+        assert_eq!(
+            render(&close_unfinished(&[logged_user("a")])),
+            vec!["end:Aborted"]
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_continues_the_logged_conversation() {
+        let h = resumed(vec![
+            logged_user("first"),
+            Event::AssistantMessage {
+                content: vec![ContentBlock::Text { text: "r1".into() }],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+            ended(TurnEndReason::Completed),
+        ]);
+        h.provider.reset([Script::text("r2", Duration::ZERO)]);
+        h.send("second").await;
+        let (kinds, reqs) = h.finish(1).await;
+        assert_eq!(kinds, vec!["user:second", "assistant:r2", "end:Completed"]);
+        let hist: Vec<_> = reqs[0].messages.iter().map(|m| m.text()).collect();
+        assert_eq!(hist, vec!["first", "r1", "second"]);
+    }
+
+    #[tokio::test]
+    async fn resume_mid_tool_call_closes_the_turn_first() {
+        let h = resumed(vec![logged_user("go"), logged_call("c1", "Bash")]);
+        h.provider.reset([Script::text("again", Duration::ZERO)]);
+        h.send("retry").await;
+        let (kinds, reqs) = h.finish(2).await;
+        assert_eq!(
+            kinds,
+            vec![
+                format!("tool:Bash:err:{ABORTED_TOOL_RESULT}"),
+                "end:Aborted".into(),
+                "user:retry".into(),
+                "assistant:again".into(),
+                "end:Completed".into(),
+            ]
+        );
+        // a valid conversation: the call, its aborted result, the marker and the new message
+        let m = &reqs[0].messages;
+        let roles: Vec<_> = m.iter().map(|x| x.role).collect();
+        assert_eq!(roles, vec![Role::User, Role::Assistant, Role::User]);
+        assert_eq!(
+            m[2].content,
+            vec![
+                ContentBlock::ToolResult {
+                    call_id: "c1".into(),
+                    content: ABORTED_TOOL_RESULT.into(),
+                    is_error: true
+                },
+                ContentBlock::Text {
+                    text: ABORT_MARKER.into()
+                },
+                ContentBlock::Text {
+                    text: "retry".into()
+                },
             ]
         );
     }

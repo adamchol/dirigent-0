@@ -1,8 +1,8 @@
 //! The only state the loop keeps across turns: what the next model call
 //! needs. Built from events, live (`push`) or on resume (`from_events`).
 
-use crate::event::{Event, TurnEndReason};
 use crate::provider::{ContentBlock, Message, Role};
+use dirigent_protocol::{Event, TurnEndReason};
 
 pub const ABORT_MARKER: &str =
     "The user interrupted the previous turn. Tools that were running may have partially executed.";
@@ -31,7 +31,7 @@ impl Entry {
     /// The single conversion from events, used live and on resume.
     pub fn from_event(ev: &Event) -> Option<Entry> {
         match ev {
-            Event::UserMessage { text } => Some(Entry::User { text: text.clone() }),
+            Event::UserMessage { text, .. } => Some(Entry::User { text: text.clone() }),
             Event::AssistantMessage { content, .. } => Some(Entry::Assistant {
                 content: content.clone(),
             }),
@@ -48,7 +48,7 @@ impl Entry {
             Event::TurnEnded { reason } => Some(Entry::TurnEnded {
                 aborted: *reason == TurnEndReason::Aborted,
             }),
-            Event::UserInterrupt
+            Event::UserInterrupt { .. }
             | Event::ModelDelta { .. }
             | Event::ModelCancelled
             | Event::Error { .. } => None,
@@ -185,7 +185,16 @@ mod tests {
     use serde_json::{json, Value};
 
     fn user(text: &str) -> Event {
-        Event::UserMessage { text: text.into() }
+        Event::UserMessage {
+            input_id: format!("in-{text}"),
+            text: text.into(),
+        }
+    }
+
+    fn interrupt() -> Event {
+        Event::UserInterrupt {
+            input_id: "in-interrupt".into(),
+        }
     }
 
     fn assistant(content: Vec<ContentBlock>, stop: StopReason) -> Event {
@@ -230,7 +239,7 @@ mod tests {
     fn keeps_only_model_relevant_events() {
         let events = vec![
             user("a"),
-            Event::UserInterrupt,
+            interrupt(),
             Event::ModelDelta {
                 delta: crate::provider::Delta::BlockStop { index: 0 },
             },
@@ -255,7 +264,7 @@ mod tests {
         let events = vec![
             user("go"),
             assistant(vec![call("c1")], StopReason::ToolUse),
-            Event::UserInterrupt,
+            interrupt(),
             result("c1"),
             ended(TurnEndReason::Aborted),
         ];
@@ -338,7 +347,7 @@ mod tests {
         let msgs = messages(&[
             user("go"),
             assistant(vec![call("c1")], StopReason::ToolUse),
-            Event::UserInterrupt,
+            interrupt(),
             Event::ToolResult {
                 call_id: "c1".into(),
                 name: "Bash".into(),

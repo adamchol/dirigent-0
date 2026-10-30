@@ -1,0 +1,16 @@
+# The dev stack's chlive server (`dnvr up`); addresses come as flags, since every process picks
+# its ports on start. Every key and default: chlive's server/chlive.example.toml.
+
+[clickhouse]
+password = "chlive_ro"
+snapshot_password = "chlive_snap"
+# made by scripts/schema.sql
+snapshot_database = "chlive_snapshots"
+
+[cache]
+# stored results; `reset-data` deletes them with the data they point into
+dir = ".dnvr/chlive-cache"
+
+[tables.session_events]
+[tables.session_inputs]
+[tables.session_deltas]

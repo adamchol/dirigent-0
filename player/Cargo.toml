@@ -8,12 +8,12 @@ name = "player"
 path = "src/main.rs"
 
 [dependencies]
+dirigent-protocol = { path = "../protocol" }
 genai = "=0.7.0-beta.22"
+chlive-client = { git = "https://github.com/dialohq/chlive", branch = "all-in" }
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "dynamic-linking"] }
+uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process", "fs", "io-util"] }
-tonic = "0.14"
-tonic-prost = "0.14"
-prost = "0.14"
-tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = "0.7"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -29,10 +29,6 @@ globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 libc = "0.2"
-
-[build-dependencies]
-tonic-prost-build = "0.14"
-protox = "0.9"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,50 +1,65 @@
-//! Temporary terminal client for a dirigent player's gRPC session.
+//! Terminal client for a dirigent session: the session's log and the live deltas come from
+//! chlive, what the user types goes to Kafka as inputs.
 
 mod app;
 
-pub mod pb {
-    tonic::include_proto!("player.v1");
-}
+use std::time::{Duration, SystemTime};
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
+use chlive_client::{Change, ClientOptions, Events, Kind, LiveClient, Status, Subscription};
 use clap::Parser;
 use crossterm::event::{Event as TermEvent, EventStream};
+use dirigent_protocol::rows::{
+    timestamp, DeltaRow, EventRow, InputRow, DELTAS_QUERY, EVENTS_QUERY, INPUTS,
+};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::Streaming;
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::ClientConfig;
 
 use crate::app::{Action, App};
-use crate::pb::player_client::PlayerClient;
 
 #[derive(Parser)]
 #[command(
     name = "dirigent-chat",
-    about = "terminal client for a dirigent player"
+    about = "terminal client for a dirigent session"
 )]
 struct Cli {
-    #[arg(long, env = "DIRIGENT_ADDR", default_value = "http://127.0.0.1:8787")]
-    addr: String,
+    /// The session (a UUID).
+    #[arg(long, env = "DIRIGENT_SESSION")]
+    session: String,
+
+    #[arg(long, env = "CHLIVE_URL", default_value = "ws://127.0.0.1:8080/live")]
+    chlive_url: String,
+
+    #[arg(long, env = "DIRIGENT_KAFKA", default_value = "127.0.0.1:9092")]
+    kafka: String,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-
-    // Connect before taking over the terminal, so a refusal prints normally.
-    let mut client = PlayerClient::connect(cli.addr.clone())
-        .await
-        .with_context(|| format!("could not connect to {}", cli.addr))?;
-    let (input, rx) = mpsc::channel::<pb::Input>(32);
-    let events = client
-        .session(ReceiverStream::new(rx))
-        .await
-        .map_err(|s| anyhow!("session refused ({:?}): {}", s.code(), s.message()))?
-        .into_inner();
+    let session = uuid::Uuid::parse_str(&cli.session)
+        .with_context(|| format!("--session {}: not a UUID", cli.session))?
+        .to_string();
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &cli.kafka)
+        .set("enable.idempotence", "true")
+        .create()
+        .context("creating the Kafka producer")?;
+    let client = LiveClient::new(ClientOptions::new(&cli.chlive_url));
+    let log = client
+        .query(EVENTS_QUERY)
+        .param("session", &session)
+        .raw::<EventRow>();
+    let deltas = client
+        .query(DELTAS_QUERY)
+        .param("session", &session)
+        .inserts::<DeltaRow>();
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, App::new(cli.addr), input, events).await;
+    let app = App::new(session.clone(), cli.chlive_url);
+    let result = run(&mut terminal, app, &session, producer, log, deltas).await;
     ratatui::restore();
     result
 }
@@ -52,40 +67,72 @@ async fn main() -> anyhow::Result<()> {
 async fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
-    input: mpsc::Sender<pb::Input>,
-    mut events: Streaming<pb::Event>,
+    session: &str,
+    producer: FutureProducer,
+    mut log: Subscription<EventRow>,
+    mut deltas: Events<DeltaRow>,
 ) -> anyhow::Result<()> {
     let mut keys = EventStream::new();
-    let mut connected = true;
+    let (mut log_open, mut deltas_open) = (true, true);
     loop {
         terminal.draw(|frame| app.draw(frame))?;
         tokio::select! {
             key = keys.next() => match key {
                 Some(Ok(TermEvent::Key(key))) => {
-                    let kind = match app.on_key(key) {
+                    let input_id = uuid::Uuid::new_v4().to_string();
+                    let ts = timestamp(SystemTime::now());
+                    let row = match app.on_key(key) {
                         None => continue,
                         Some(Action::Quit) => return Ok(()),
-                        Some(Action::Send(text)) => pb::input::Kind::Message(pb::UserMessage { text }),
-                        Some(Action::Interrupt) => pb::input::Kind::Interrupt(pb::Interrupt {}),
+                        Some(Action::Send(text)) => {
+                            app.sent(input_id.clone(), text.clone());
+                            InputRow::message(session, input_id, ts, text)
+                        }
+                        Some(Action::Interrupt) => InputRow::interrupt(session, input_id, ts),
                     };
-                    if !connected || input.send(pb::Input { kind: Some(kind) }).await.is_err() {
-                        app.status = Some("not connected · Ctrl-C quits".into());
+                    let payload = serde_json::to_string(&row).expect("rows serialize");
+                    let record = FutureRecord::to(INPUTS).key(session).payload(&payload);
+                    if let Err((e, _)) = producer.send(record, Duration::from_secs(10)).await {
+                        app.status = Some(format!("could not send: {e}"));
                     }
                 }
                 Some(Ok(_)) => {} // resize etc.: redraw
                 Some(Err(e)) => return Err(e.into()),
                 None => return Ok(()),
             },
-            ev = events.message(), if connected => match ev {
-                Ok(Some(ev)) => app.on_event(ev),
-                Ok(None) => {
-                    connected = false;
-                    app.status = Some("player closed the session · Ctrl-C quits".into());
+            update = log.next(), if log_open => match update {
+                Some(u) => match u.kind {
+                    Kind::Snapshot => {
+                        app.status = None;
+                        app.reset();
+                        for row in u.rows.iter() {
+                            app.on_row(row);
+                        }
+                    }
+                    Kind::Diff => {
+                        for change in &u.changes {
+                            if let Change::Insert { row, .. } = change {
+                                app.on_row(row);
+                            }
+                        }
+                    }
+                    Kind::Disconnected => app.status = Some("chlive disconnected; reconnecting…".into()),
+                    Kind::Error => {
+                        if let Status::Error(e) = &u.status {
+                            app.status = Some(format!("the log subscription failed: {e}"));
+                        }
+                    }
+                    Kind::Subscribed | Kind::Resumed => {}
+                },
+                None => {
+                    log_open = false;
+                    app.status = Some("the log subscription ended · Ctrl-C quits".into());
                 }
-                Err(status) => {
-                    connected = false;
-                    app.status = Some(format!("stream error: {} · Ctrl-C quits", status.message()));
-                }
+            },
+            delta = deltas.next(), if deltas_open => match delta {
+                Some(Ok(row)) => app.on_delta_row(&row),
+                Some(Err(e)) => app.status = Some(format!("the deltas subscription failed: {e}")),
+                None => deltas_open = false,
             },
         }
     }
