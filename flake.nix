@@ -48,7 +48,11 @@
           dnvr.shells.default = import ./nix/shell.nix {
             inherit pkgs presets dnvrState;
             inherit (inputs) continuous-backup;
-            inherit (inputs'.chlive.packages) clickhouse chlive;
+            inherit (inputs'.chlive.packages) clickhouse;
+            # TODO: drop once chlive's package has it; reqwest's native-tls needs OpenSSL on Linux
+            chlive = inputs'.chlive.packages.chlive.overrideAttrs (old: {
+              buildInputs = old.buildInputs ++ [ pkgs.openssl ];
+            });
           };
         };
     };

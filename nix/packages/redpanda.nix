@@ -1,7 +1,7 @@
-# The `redpanda` dnvr process: Redpanda (Kafka API + HTTP proxy) in Docker; `docker` comes from
-# the host. `name` is both the container and its data volume; reset it together with ClickHouse
-# (`reset-data`), since the sink's offsets in ClickHouse must match Kafka's. Picks both ports and
-# publishes `bootstrap`, `proxyUrl` and `topics` once the topics exist.
+# The `redpanda` dnvr process off Linux: Redpanda (Kafka API + HTTP proxy) in Docker; `docker`
+# comes from the host. `name` is both the container and its data volume; reset it together with
+# ClickHouse (`reset-data`), since the sink's offsets in ClickHouse must match Kafka's. Picks both
+# ports and publishes `bootstrap`, `proxyUrl` and `topics` once the topics exist.
 {
   lib,
   writeShellApplication,

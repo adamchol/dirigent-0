@@ -1,6 +1,7 @@
 # The local event system, as dnvr processes, after chlive's own stack (chlive's nix/stack.nix):
-# Redpanda (Docker), ClickHouse with an embedded Keeper, Kafka Connect with one ClickHouse sink
-# connector per topic (exactly once), the pause server, the schema, and the chlive server.
+# Redpanda (native on Linux, Docker elsewhere), ClickHouse with an embedded Keeper, Kafka
+# Connect with one ClickHouse sink connector per topic (exactly once), the pause server, the
+# schema, and the chlive server.
 #
 # Every process picks its own ports (`dnvr-state pick-port`) and publishes its address; the
 # others get it through `dnvr://<process>/<key>` env refs, which also order the start-up.
@@ -24,10 +25,24 @@
 let
   dir = n: ".dnvr/${n}";
 
-  redpanda = pkgs.callPackage ./packages/redpanda.nix {
-    inherit dnvrState topics partitions;
-    name = "dirigent-redpanda";
-  };
+  native = pkgs.stdenv.hostPlatform.isLinux;
+  redpanda =
+    if native then
+      pkgs.callPackage ./packages/redpanda-native.nix {
+        inherit dnvrState topics partitions;
+        name = "dirigent-redpanda";
+        dataDir = dir "redpanda";
+      }
+    else
+      pkgs.callPackage ./packages/redpanda.nix {
+        inherit dnvrState topics partitions;
+        name = "dirigent-redpanda";
+      };
+  resetRedpanda =
+    if native then
+      ''rm -rf "''${DNVR_ROOT:?}/${dir "redpanda"}"''
+    else
+      "docker rm -f dirigent-redpanda >/dev/null 2>&1 || true; docker volume rm dirigent-redpanda >/dev/null 2>&1 || true";
 
   cb = continuous-backup;
   # continuous-backup's binary; `pause-server <config>` is the pause server
@@ -323,8 +338,7 @@ in
       text = ''
         # Kafka (with Connect's own topics) and ClickHouse (with the sink's KeeperMap offsets)
         # go together; chlive's stored results hold cursors into both.
-        docker rm -f dirigent-redpanda >/dev/null 2>&1 || true
-        docker volume rm dirigent-redpanda >/dev/null 2>&1 || true
+        ${resetRedpanda}
         rm -rf "''${DNVR_ROOT:?}/${dir "clickhouse"}" "''${DNVR_ROOT:?}/${cacheDir}"
         echo "removed Redpanda, ClickHouse and chlive cache data; the next \`dnvr up\` starts empty"
       '';

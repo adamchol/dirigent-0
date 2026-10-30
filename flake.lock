@@ -16,11 +16,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1793054447,
-        "narHash": "sha256-KH5ztfgsA7gkSU0OH+jp3b1hlgP5r75ZrYcxSv2iNQ8=",
+        "lastModified": 1793389398,
+        "narHash": "sha256-tvKh+upyr46aeD4jk6vyMhJmoZWqXmbBVDK75ShQiEY=",
         "ref": "all-in",
-        "rev": "016bb7b455d016e949e8a3859bea9d09cf64d154",
-        "revCount": 118,
+        "rev": "c45a8048826e63fe48ff76cf5ad27f8d926c8eb7",
+        "revCount": 119,
         "type": "git",
         "url": "https://github.com/dialohq/chlive"
       },
