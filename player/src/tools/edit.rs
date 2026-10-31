@@ -79,7 +79,7 @@ impl Tool for Edit {
         if let Err(e) = tokio::fs::write(&path, &updated).await {
             return ToolOutput::error(format!("Failed to write file: {e}"));
         }
-        ctx.record_read(&path, false);
+        ctx.record_read(&path);
 
         let replacements = if replace_all { count } else { 1 };
         let snippet = snippet_around(&updated, first, new.len());
@@ -118,7 +118,7 @@ mod tests {
         let (_d, ctx) = ctx();
         let content: String = (1..=12).map(|i| format!("line {i}\n")).collect();
         let p = write(&ctx, "f.txt", &content);
-        ctx.record_read(&p, false);
+        ctx.record_read(&p);
         let out = edit(
             &ctx,
             json!({ "file_path": p, "old_string": "line 7", "new_string": "LINE SEVEN" }),
@@ -148,7 +148,7 @@ mod tests {
         .await;
         assert_eq!(out.content, ERR_NOT_READ);
 
-        ctx.record_read(&p, false);
+        ctx.record_read(&p);
         let out = edit(
             &ctx,
             json!({ "file_path": p, "old_string": "a", "new_string": "c" }),

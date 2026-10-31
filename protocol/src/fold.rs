@@ -54,6 +54,8 @@ impl Fold {
             | Event::AssistantMessage { .. }
             | Event::ModelCancelled
             | Event::Error { .. }
+            | Event::Compacted { .. }
+            | Event::CompactionFailed { .. }
             | Event::ToolResult { .. } => Some(ev.clone()),
         }
     }

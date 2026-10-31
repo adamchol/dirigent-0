@@ -150,6 +150,25 @@ mod tests {
             Event::Error {
                 message: "boom".into(),
                 retry_in_ms: Some(1000),
+                compact: false,
+            },
+            Event::Error {
+                message: "too long".into(),
+                retry_in_ms: None,
+                compact: true,
+            },
+            Event::Compacted {
+                summary: "s".into(),
+                first_kept: "e7".into(),
+                usage: Usage {
+                    input: 1,
+                    output: 2,
+                    cache_read: 3,
+                    cache_write: 4,
+                },
+            },
+            Event::CompactionFailed {
+                message: "empty".into(),
             },
             Event::ToolResult {
                 call_id: "c1".into(),
@@ -200,6 +219,13 @@ mod tests {
             (row.kind.as_str(), row.data.as_str()),
             ("model_cancelled", "")
         );
+        let failed = Event::Error {
+            message: "x".into(),
+            retry_in_ms: None,
+            compact: false,
+        };
+        let row = EventRow::new("s", "e3".into(), PLAYER, &failed);
+        assert_eq!(row.data, r#"{"message":"x"}"#);
     }
 
     #[test]

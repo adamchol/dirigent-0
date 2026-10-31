@@ -8,6 +8,7 @@ use crate::provider::ToolSpec;
 pub const DEFAULT_LIMIT: usize = 2000;
 pub const MAX_LINE_CHARS: usize = 2000;
 pub const MAX_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 
 pub struct Read;
 
@@ -16,7 +17,7 @@ impl Tool for Read {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "Read".into(),
-            description: "Reads a file from the local filesystem. The file_path parameter must be an absolute path. By default it reads up to 2000 lines from the beginning of the file; use offset and limit for long files. Lines longer than 2000 characters are truncated. Results are returned in cat -n format, with line numbers starting at 1. You must read a file before editing or overwriting it. Reading a directory or a binary file fails. Always prefer this tool over cat, head, tail or sed via Bash.".into(),
+            description: "Reads a file from the local filesystem. The file_path parameter must be an absolute path. By default it reads up to 2000 lines from the beginning of the file; use offset and limit for long files. Lines longer than 2000 characters are truncated, and output stops at 50KB; the result then says which offset to continue from. Results are returned in cat -n format, with line numbers starting at 1. You must read a file before editing or overwriting it. Reading a directory or a binary file fails. Always prefer this tool over cat, head, tail or sed via Bash.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -66,7 +67,7 @@ impl Tool for Read {
             Err(e) => return ToolOutput::error(format!("Failed to read file: {e}")),
         };
         if bytes.is_empty() {
-            ctx.record_read(&path, false);
+            ctx.record_read(&path);
             return ToolOutput::ok(
                 "<system-reminder>Warning: the file exists but has empty contents</system-reminder>",
             );
@@ -83,18 +84,25 @@ impl Tool for Read {
             ));
         }
         let end = (offset - 1 + limit).min(total);
-        let shown = all[offset - 1..end].iter().map(|l| {
-            if l.chars().count() > MAX_LINE_CHARS {
+        let mut shown: Vec<String> = Vec::new();
+        let mut size = 0;
+        for l in &all[offset - 1..end] {
+            let line = if l.chars().count() > MAX_LINE_CHARS {
                 let cut = floor_char_boundary(l, MAX_LINE_CHARS);
                 format!("{}…", &l[..cut])
             } else {
                 l.to_string()
+            };
+            // Line number, tab and newline.
+            size += line.len() + 8;
+            if size > MAX_OUTPUT_BYTES && !shown.is_empty() {
+                break;
             }
-        });
-        let shown: Vec<String> = shown.collect();
+            shown.push(line);
+        }
+        let end = offset - 1 + shown.len();
         let mut out = format_lines(shown.iter().map(String::as_str), offset);
-        let partial = offset > 1 || end < total;
-        if partial {
+        if offset > 1 || end < total {
             out.push_str(&format!(
                 "\n[Showing lines {}-{} of {}. Use offset={} to continue.]",
                 offset,
@@ -103,7 +111,7 @@ impl Tool for Read {
                 end + 1
             ));
         }
-        ctx.record_read(&path, partial);
+        ctx.record_read(&path);
         ToolOutput::ok(out).with_meta(json!({ "lines": total, "from": offset, "to": end }))
     }
 }
@@ -137,12 +145,26 @@ mod tests {
             out.content,
             "     4\tl4\n     5\tl5\n\n[Showing lines 4-5 of 10. Use offset=6 to continue.]"
         );
-        assert_eq!(
-            ctx.check_modifiable(&p).unwrap_err(),
-            super::super::ERR_PARTIAL_READ
-        );
+        // A partial read is enough to edit.
+        assert!(ctx.check_modifiable(&p).is_ok());
         let out = read(&ctx, json!({ "file_path": p, "offset": 11 })).await;
         assert!(out.is_error && out.content.contains("beyond the end"));
+    }
+
+    #[tokio::test]
+    async fn output_stops_at_a_line_under_the_byte_cap() {
+        let (_d, ctx) = ctx();
+        let content: String = (0..100).map(|_| "y".repeat(1500) + "\n").collect();
+        let p = write(&ctx, "big.txt", &content);
+        let out = read(&ctx, json!({ "file_path": p })).await;
+        assert!(!out.is_error);
+        assert!(out.content.len() <= MAX_OUTPUT_BYTES + 100);
+        // 33 lines of 1508 bytes fit in 50KB.
+        assert!(out
+            .content
+            .ends_with("\n[Showing lines 1-33 of 100. Use offset=34 to continue.]"));
+        assert!(out.content.contains("    33\t") && !out.content.contains("    34\t"));
+        assert_eq!(out.meta["to"], 33);
     }
 
     #[tokio::test]

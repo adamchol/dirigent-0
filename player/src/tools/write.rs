@@ -53,7 +53,7 @@ impl Tool for Write {
         if let Err(e) = tokio::fs::write(&path, content).await {
             return ToolOutput::error(format!("Failed to write file: {e}"));
         }
-        ctx.record_read(&path, false);
+        ctx.record_read(&path);
         let msg = if existed {
             format!("The file {} has been updated successfully.", path.display())
         } else {
@@ -107,7 +107,7 @@ mod tests {
         assert!(out.is_error);
 
         // Modified behind our back after the read.
-        ctx.record_read(&q, false);
+        ctx.record_read(&q);
         std::fs::write(&q, "changed content").unwrap();
         let out = Write
             .call(

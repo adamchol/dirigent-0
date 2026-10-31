@@ -71,14 +71,11 @@ pub trait Tool: Send + Sync {
 pub const ERR_NOT_READ: &str = "File has not been read yet. Read it first before writing to it.";
 pub const ERR_MODIFIED: &str =
     "File has been unexpectedly modified. Read it again before attempting to write it.";
-pub const ERR_PARTIAL_READ: &str =
-    "File was only partially read. Read the whole file (without offset/limit) before editing it.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadRecord {
     pub mtime: SystemTime,
     pub len: u64,
-    pub partial: bool,
 }
 
 pub struct ToolCtx {
@@ -113,12 +110,11 @@ impl ToolCtx {
         Ok(resolved)
     }
 
-    pub fn record_read(&self, path: &Path, partial: bool) {
+    pub fn record_read(&self, path: &Path) {
         if let Ok(meta) = std::fs::metadata(path) {
             let record = ReadRecord {
                 mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
                 len: meta.len(),
-                partial,
             };
             self.reads
                 .lock()
@@ -127,8 +123,8 @@ impl ToolCtx {
         }
     }
 
-    /// Claude Code's guard: an existing file may only be modified after a
-    /// full read, and only if it has not changed since.
+    /// Claude Code's guard: an existing file may only be modified after it
+    /// was read (whole or in part), and only if it has not changed since.
     pub fn check_modifiable(&self, path: &Path) -> Result<(), String> {
         let Ok(meta) = std::fs::metadata(path) else {
             return Ok(()); // new file
@@ -137,9 +133,6 @@ impl ToolCtx {
         let Some(rec) = reads.get(path) else {
             return Err(ERR_NOT_READ.into());
         };
-        if rec.partial {
-            return Err(ERR_PARTIAL_READ.into());
-        }
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         if mtime != rec.mtime || meta.len() != rec.len {
             return Err(ERR_MODIFIED.into());
@@ -328,9 +321,7 @@ mod tests {
         let (_d, ctx) = ctx();
         let p = write(&ctx, "f.txt", "one");
         assert_eq!(ctx.check_modifiable(&p).unwrap_err(), ERR_NOT_READ);
-        ctx.record_read(&p, true);
-        assert_eq!(ctx.check_modifiable(&p).unwrap_err(), ERR_PARTIAL_READ);
-        ctx.record_read(&p, false);
+        ctx.record_read(&p);
         assert!(ctx.check_modifiable(&p).is_ok());
         std::fs::write(&p, "changed!").unwrap();
         assert_eq!(ctx.check_modifiable(&p).unwrap_err(), ERR_MODIFIED);

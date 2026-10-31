@@ -1,4 +1,5 @@
 mod agent;
+mod compact;
 mod history;
 mod provider;
 mod session;
@@ -59,6 +60,10 @@ struct Cli {
     #[arg(long, value_enum, default_value = "medium")]
     effort: Option<Effort>,
 
+    /// The model's context window in tokens; the context is compacted at 85% of it.
+    #[arg(long, env = "DIRIGENT_CONTEXT_WINDOW", default_value_t = 200_000)]
+    context_window: u64,
+
     #[arg(long, env = "ANTHROPIC_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
 
@@ -101,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
         model: &cli.model,
         system,
         effort: cli.effort,
+        context_window: cli.context_window,
     };
 
     let agent = Agent {

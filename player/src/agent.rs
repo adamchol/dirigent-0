@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,9 +11,11 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::history::History;
+use crate::compact;
+use crate::history::{History, CHARS_PER_TOKEN};
 use crate::provider::{
-    Accumulator, ContentBlock, Effort, Provider, ProviderError, Request, StopReason,
+    Accumulator, Completion, ContentBlock, Delta, Effort, Provider, ProviderError, Request,
+    StopReason,
 };
 use crate::session::Session;
 use crate::tools::{Registry, ToolCtx, ToolOutput};
@@ -24,6 +27,20 @@ pub struct AgentConfig {
     pub model: &'static str,
     pub system: &'static str,
     pub effort: Option<Effort>,
+    /// The model's context window, in tokens.
+    pub context_window: u64,
+}
+
+impl AgentConfig {
+    /// A call whose context is estimated at this many tokens compacts it first.
+    fn trigger(&self) -> u64 {
+        self.context_window / 100 * 85
+    }
+
+    /// The tokens a compaction keeps as they are.
+    fn keep(&self) -> u64 {
+        (self.context_window / 10).min(20_000)
+    }
 }
 
 /// Program-lifetime pieces; each session gets its own history and tool context.
@@ -53,6 +70,8 @@ struct Turn {
     /// A user message arrived during the current model call.
     steered: bool,
     interrupted: bool,
+    /// A compaction ran since the last reply, so another would gain nothing.
+    compacted: bool,
     /// The user interrupt that stopped it, if one did.
     interrupt: Option<String>,
 }
@@ -72,15 +91,17 @@ impl Agent {
     pub async fn run(&self, session: &mut dyn Session) -> anyhow::Result<()> {
         let log = session.load().await?;
         let mut fold = Fold::default();
-        let handled: Vec<Event> = log
+        let handled: Vec<(String, Event)> = log
             .iter()
-            .filter_map(|(id, ev)| fold.apply(id, ev))
+            .filter_map(|(id, ev)| Some((id.clone(), fold.apply(id, ev)?)))
             .collect();
+        let tools = serde_json::to_string(self.tools.specs()).map_or(0, |s| s.len());
         let (tx, mut outcomes) = mpsc::unbounded_channel::<Event>();
         let mut run = Run {
             agent: self,
             session,
             history: History::from_events(&handled),
+            fixed: (self.cfg.system.len() + tools) as u64 / CHARS_PER_TOKEN,
             ctx: Arc::new(ToolCtx::new(self.workdir)),
             turn: None,
             queue: fold.queued().iter().cloned().collect(),
@@ -130,10 +151,10 @@ impl Agent {
 /// The events that close a turn the handled `events` leave open: an aborted result for each
 /// tool call still waiting for one, then `TurnEnded { Aborted }` naming `interrupt`, the
 /// interrupt the log has for it. Empty when no turn is open.
-fn close_unfinished(events: &[Event], interrupt: Option<String>) -> Vec<Event> {
+fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -> Vec<Event> {
     let mut open = false;
     let mut waiting: Vec<(String, String)> = Vec::new();
-    for ev in events {
+    for (_, ev) in events {
         match ev {
             Event::UserMessage { .. } => open = true,
             Event::AssistantMessage {
@@ -160,7 +181,9 @@ fn close_unfinished(events: &[Event], interrupt: Option<String>) -> Vec<Event> {
             | Event::Steered { .. }
             | Event::ModelDelta { .. }
             | Event::ModelCancelled
-            | Event::Error { .. } => {}
+            | Event::Error { .. }
+            | Event::Compacted { .. }
+            | Event::CompactionFailed { .. } => {}
         }
     }
     if !open {
@@ -188,6 +211,8 @@ struct Run<'a> {
     agent: &'a Agent,
     session: &'a mut dyn Session,
     history: History,
+    /// Estimated tokens of the system prompt and tools.
+    fixed: u64,
     ctx: Arc<ToolCtx>,
     turn: Option<Turn>,
     /// Messages waiting for a turn of their own: `(id, text)`.
@@ -205,8 +230,8 @@ impl Run<'_> {
                     return;
                 }
                 info!("user message (steers the turn)");
-                self.session.publish(&Event::Steered { input: id }).await;
-                self.history.push(&Event::UserMessage { text });
+                let id = self.session.publish(&Event::Steered { input: id }).await;
+                self.history.push(&id, &Event::UserMessage { text });
                 if let Some(t) = &mut self.turn {
                     t.steered = true;
                 }
@@ -234,13 +259,14 @@ impl Run<'_> {
         };
         info!("user message (starts a turn)");
         let id = self.session.publish(&Event::TurnStarted { input }).await;
-        self.history.push(&Event::UserMessage { text });
+        self.history.push(&id, &Event::UserMessage { text });
         self.turn = Some(Turn {
             id,
             token: CancellationToken::new(),
             pending: Vec::new(),
             steered: false,
             interrupted: false,
+            compacted: false,
             interrupt: None,
         });
         self.call_model();
@@ -259,9 +285,8 @@ impl Run<'_> {
                 stop_reason,
                 ..
             } => {
-                if self.turn.is_none() {
-                    return;
-                }
+                let Some(t) = &mut self.turn else { return };
+                t.compacted = false;
                 self.record(&ev).await;
                 let calls = tool_calls(content);
                 if *stop_reason == StopReason::ToolUse && !calls.is_empty() {
@@ -278,12 +303,24 @@ impl Run<'_> {
                     self.end_turn(TurnEndReason::Aborted).await;
                 }
             }
-            Event::Error { retry_in_ms, .. } => {
+            Event::Error {
+                retry_in_ms,
+                compact,
+                ..
+            } => {
                 if self.turn.is_some() {
                     self.record(&ev).await;
-                    if retry_in_ms.is_none() {
+                    if *compact {
+                        self.compact();
+                    } else if retry_in_ms.is_none() {
                         self.end_turn(TurnEndReason::Failed).await;
                     }
+                }
+            }
+            Event::Compacted { .. } | Event::CompactionFailed { .. } => {
+                if self.turn.is_some() {
+                    self.record(&ev).await;
+                    self.call_model();
                 }
             }
             Event::ToolResult { call_id, .. } => {
@@ -314,8 +351,8 @@ impl Run<'_> {
     /// Publish to the session and keep what the model needs.
     async fn record(&mut self, ev: &Event) {
         log_event(ev);
-        self.session.publish(ev).await;
-        self.history.push(ev);
+        let id = self.session.publish(ev).await;
+        self.history.push(&id, ev);
     }
 
     async fn end_turn(&mut self, reason: TurnEndReason) {
@@ -323,41 +360,105 @@ impl Run<'_> {
         self.record(&Event::TurnEnded { reason, interrupt }).await;
     }
 
+    /// Call the model on the history, or compact it first when it is near the window.
     fn call_model(&mut self) {
         let Some(t) = &mut self.turn else { return };
         t.steered = false;
-        let cfg = self.agent.cfg;
-        let req = Request {
-            model: cfg.model.to_string(),
-            system: Some(cfg.system.to_string()),
-            messages: self.history.messages(),
-            tools: self.agent.tools.specs().to_vec(),
-            effort: cfg.effort,
-        };
-        let provider = self.agent.provider.clone();
+        let may_compact = !t.compacted;
         let token = t.token.clone();
+        if may_compact && self.history.tokens(self.fixed) >= self.agent.cfg.trigger() {
+            self.compact();
+            return;
+        }
+        let req = self.request();
+        let provider = self.agent.provider.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let send = |ev: Event| {
                 let _ = tx.send(ev);
             };
-            for attempt in 0.. {
-                let Err(e) = stream_reply(&*provider, &req, &token, &send).await else {
-                    return;
-                };
-                let wait = e.retryable().then(|| retry_delay(&e, attempt));
-                send(Event::Error {
+            let delta = |delta: Delta| send(Event::ModelDelta { delta });
+            let reply = with_retries(&token, &send, || {
+                stream_reply(&*provider, &req, &token, &delta)
+            })
+            .await;
+            send(match reply {
+                Ok(Some(c)) => Event::AssistantMessage {
+                    content: c.message.content,
+                    stop_reason: c.stop_reason,
+                    usage: c.usage,
+                },
+                Ok(None) => Event::ModelCancelled,
+                Err(e) => Event::Error {
+                    compact: may_compact && matches!(e, ProviderError::ContextOverflow),
                     message: e.to_string(),
-                    retry_in_ms: wait.map(|d| d.as_millis() as u64),
-                });
-                let Some(wait) = wait else { return };
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => { send(Event::ModelCancelled); return; }
-                    _ = tokio::time::sleep(wait) => {}
-                }
-            }
+                    retry_in_ms: None,
+                },
+            });
         });
+    }
+
+    /// Summarize the history up to where it keeps about `keep` tokens as they are. The
+    /// outcome is `Compacted`, `CompactionFailed`, or `ModelCancelled` on an interrupt.
+    fn compact(&mut self) {
+        let Some(t) = &mut self.turn else { return };
+        t.compacted = true;
+        let token = t.token.clone();
+        let tx = self.tx.clone();
+        let cfg = self.agent.cfg;
+        let Some((first_kept, dropped)) = self.history.cut(cfg.keep()) else {
+            let _ = tx.send(Event::CompactionFailed {
+                message: "there is nothing to compact".into(),
+            });
+            return;
+        };
+        info!(dropped, "compacting the context");
+        let base = self.request();
+        let provider = self.agent.provider.clone();
+        tokio::spawn(async move {
+            let send = |ev: Event| {
+                let _ = tx.send(ev);
+            };
+            let summarize = |req: Request| {
+                let (provider, token, send) = (&provider, &token, &send);
+                async move {
+                    with_retries(token, send, || {
+                        stream_reply(&**provider, &req, token, &|_| {})
+                    })
+                    .await
+                }
+            };
+            let mut reply = summarize(compact::request(&base)).await;
+            if matches!(reply, Err(ProviderError::ContextOverflow)) {
+                warn!("the summary call is too long too; summarizing a clipped transcript");
+                reply = summarize(compact::fallback(&base, cfg.trigger())).await;
+            }
+            send(match reply {
+                Ok(Some(c)) => match compact::summary(&c, dropped) {
+                    Ok(summary) => Event::Compacted {
+                        summary,
+                        first_kept,
+                        usage: c.usage,
+                    },
+                    Err(message) => Event::CompactionFailed { message },
+                },
+                Ok(None) => Event::ModelCancelled,
+                Err(e) => Event::CompactionFailed {
+                    message: e.to_string(),
+                },
+            });
+        });
+    }
+
+    fn request(&self) -> Request {
+        let cfg = self.agent.cfg;
+        Request {
+            model: cfg.model.to_string(),
+            system: Some(cfg.system.to_string()),
+            messages: self.history.messages(),
+            tools: self.agent.tools.specs().to_vec(),
+            effort: cfg.effort,
+        }
     }
 
     /// Read-only tools run concurrently, mutating tools serially in call
@@ -432,38 +533,61 @@ impl Run<'_> {
     }
 }
 
-/// One model call: its deltas, then the reply or `ModelCancelled`; the error if it fails.
+/// Make `call` until it succeeds or fails for good: each retryable failure is sent as an
+/// `Error` and the next try waits for [`retry_delay`]. `Ok(None)` means `token` was cancelled.
+async fn with_retries<T, Fut>(
+    token: &CancellationToken,
+    send: &impl Fn(Event),
+    mut call: impl FnMut() -> Fut,
+) -> Result<Option<T>, ProviderError>
+where
+    Fut: Future<Output = Result<Option<T>, ProviderError>>,
+{
+    let mut attempt = 0;
+    loop {
+        let e = match call().await {
+            Err(e) if e.retryable() => e,
+            done => return done,
+        };
+        let wait = retry_delay(&e, attempt);
+        send(Event::Error {
+            message: e.to_string(),
+            retry_in_ms: Some(wait.as_millis() as u64),
+            compact: false,
+        });
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => return Ok(None),
+            _ = tokio::time::sleep(wait) => {}
+        }
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+/// One model call, its deltas going to `on_delta`. `Ok(None)` means `token` was cancelled.
 async fn stream_reply(
     provider: &dyn Provider,
     req: &Request,
     token: &CancellationToken,
-    send: &impl Fn(Event),
-) -> Result<(), ProviderError> {
+    on_delta: &(dyn Fn(Delta) + Sync),
+) -> Result<Option<Completion>, ProviderError> {
     let mut stream = tokio::select! {
         biased;
-        _ = token.cancelled() => { send(Event::ModelCancelled); return Ok(()); }
+        _ = token.cancelled() => return Ok(None),
         r = provider.stream(req) => r?,
     };
     let mut acc = Accumulator::default();
     loop {
         tokio::select! {
             biased;
-            _ = token.cancelled() => { send(Event::ModelCancelled); return Ok(()); }
+            _ = token.cancelled() => return Ok(None),
             item = stream.next() => match item {
                 Some(delta) => {
                     let delta = delta?;
                     acc.push(delta.clone());
-                    send(Event::ModelDelta { delta });
+                    on_delta(delta);
                 }
-                None => {
-                    let c = acc.finish();
-                    send(Event::AssistantMessage {
-                        content: c.message.content,
-                        stop_reason: c.stop_reason,
-                        usage: c.usage,
-                    });
-                    return Ok(());
-                }
+                None => return Ok(Some(acc.finish())),
             }
         }
     }
@@ -534,8 +658,22 @@ fn log_event(ev: &Event) {
         Event::Error {
             message,
             retry_in_ms: Some(ms),
+            ..
         } => warn!("error: {message}; retrying in {ms} ms"),
+        Event::Error {
+            message,
+            compact: true,
+            ..
+        } => warn!("error: {message}; compacting"),
         Event::Error { message, .. } => warn!("error: {message}"),
+        Event::Compacted { summary, usage, .. } => info!(
+            input = usage.input,
+            cache_read = usage.cache_read,
+            output = usage.output,
+            "context compacted ({} chars of summary)",
+            summary.len()
+        ),
+        Event::CompactionFailed { message } => warn!("compaction failed: {message}"),
         Event::TurnEnded { reason, .. } => match reason {
             TurnEndReason::Completed => info!("turn completed"),
             other => warn!("turn ended: {other:?}"),
@@ -580,6 +718,7 @@ mod tests {
         model: "mock",
         system: "sys",
         effort: None,
+        context_window: 1_000_000,
     };
 
     type Published = Arc<Mutex<Vec<(String, Event)>>>;
@@ -623,6 +762,10 @@ mod tests {
 
     /// A harness whose session's log already has `log`.
     fn resumed(log: Vec<(String, Event)>) -> Harness {
+        resumed_with(log, CFG)
+    }
+
+    fn resumed_with(log: Vec<(String, Event)>, cfg: AgentConfig) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let workdir: &'static Path =
             Box::leak(dir.path().canonicalize().unwrap().into_boxed_path());
@@ -630,7 +773,7 @@ mod tests {
         let published = Arc::new(Mutex::new(Vec::new()));
         let agent = Agent {
             provider: provider.clone(),
-            cfg: CFG,
+            cfg,
             tools: Arc::new(Registry::default_set()),
             workdir,
         };
@@ -754,8 +897,16 @@ mod tests {
                 Event::Error {
                     message,
                     retry_in_ms: Some(ms),
+                    ..
                 } => format!("retry:{ms}:{message}"),
+                Event::Error {
+                    message,
+                    compact: true,
+                    ..
+                } => format!("overflow:{message}"),
                 Event::Error { message, .. } => format!("error:{message}"),
+                Event::Compacted { summary, .. } => format!("compacted:{summary}"),
+                Event::CompactionFailed { message } => format!("compaction-failed:{message}"),
                 Event::TurnEnded { reason, .. } => format!("end:{reason:?}"),
                 Event::ModelDelta { .. } => unreachable!("filtered"),
             })
@@ -1256,12 +1407,12 @@ mod tests {
     fn a_finished_log_needs_no_closing() {
         assert!(close_unfinished(&[], None).is_empty());
         assert!(close_unfinished(
-            &[
+            &by_player(vec![
                 logged_user("a"),
                 logged_call("c1", "Read"),
                 logged_result("c1"),
                 ended(TurnEndReason::Completed),
-            ],
+            ]),
             None
         )
         .is_empty());
@@ -1270,7 +1421,7 @@ mod tests {
     #[test]
     fn an_open_turn_gets_aborted_results_then_ends() {
         let closing = close_unfinished(
-            &[
+            &by_player(vec![
                 logged_user("a"),
                 Event::AssistantMessage {
                     content: vec![
@@ -1289,7 +1440,7 @@ mod tests {
                     usage: Usage::default(),
                 },
                 logged_result("c1"),
-            ],
+            ]),
             None,
         );
         assert_eq!(
@@ -1301,7 +1452,7 @@ mod tests {
         );
         // a turn cut off before any reply just ends, naming the interrupt it got
         assert_eq!(
-            close_unfinished(&[logged_user("a")], Some("i1".into())),
+            close_unfinished(&by_player(vec![logged_user("a")]), Some("i1".into())),
             vec![Event::TurnEnded {
                 reason: TurnEndReason::Aborted,
                 interrupt: Some("i1".into())
@@ -1407,5 +1558,225 @@ mod tests {
         );
         let hist: Vec<_> = reqs[1].messages.iter().map(|m| m.text()).collect();
         assert_eq!(hist, vec!["first", "r1", "one", "r2", "two"]);
+    }
+
+    /// Compacts at 8.5k tokens and keeps 1k.
+    const SMALL: AgentConfig = AgentConfig {
+        context_window: 10_000,
+        ..CFG
+    };
+
+    const FIRST: &str = "the first message, which a compaction drops. ";
+
+    fn too_long() -> Script {
+        Script::Fail {
+            delay: Duration::ZERO,
+            error: ProviderError::ContextOverflow,
+        }
+    }
+
+    /// A first turn that a compaction can drop, then a second whose model call reads a file of
+    /// `len` characters and goes on with `then`. Returns the rendered Read result.
+    async fn read_after_a_turn(h: &Harness, len: usize, then: Vec<Script>) -> String {
+        let line = "x".repeat(99);
+        let file = h.workdir.join("big.txt");
+        std::fs::write(&file, format!("{line}\n").repeat(len / 100)).unwrap();
+        let mut scripts = vec![
+            Script::text("r1", Duration::ZERO),
+            tool_script(&[("c1", "Read", json!({ "file_path": file }))]),
+        ];
+        scripts.extend(then);
+        h.provider.reset(scripts);
+        h.send(&FIRST.repeat(10)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        h.send("read it").await;
+        format!("tool:Read:ok:     1\t{line}")
+    }
+
+    #[tokio::test]
+    async fn a_context_near_the_window_is_compacted_before_the_call() {
+        let h = resumed_with(Vec::new(), SMALL);
+        let read = read_after_a_turn(
+            &h,
+            40_000,
+            vec![
+                Script::text("SUMMARY", Duration::ZERO),
+                Script::text("done", Duration::ZERO),
+            ],
+        )
+        .await;
+        let published = h.published.clone();
+        let (kinds, reqs) = h.finish(2).await;
+        assert_eq!(
+            kinds[3..],
+            [
+                "user:read it",
+                "assistant:+tool",
+                &read,
+                "compacted:SUMMARY",
+                "assistant:done",
+                "end:Completed"
+            ]
+        );
+        // The summary call is the next call with the instruction appended.
+        assert_eq!(reqs.len(), 4);
+        let summary_call = &reqs[2];
+        assert_eq!(summary_call.tools, reqs[1].tools);
+        assert_eq!(summary_call.messages[..3], reqs[1].messages[..]);
+        assert_eq!(summary_call.messages.len(), 5);
+        assert!(summary_call.messages[4].text().contains("## Goal"));
+        // It streams nothing to the log.
+        let streamed_summary = published.lock().unwrap().iter().any(|(_, e)| {
+            matches!(e, Event::ModelDelta { delta: Delta::Text { text, .. } } if text == "SUMMARY")
+        });
+        assert!(!streamed_summary);
+        // The next call starts from the summary and keeps the read with its call.
+        let m = &reqs[3].messages;
+        assert_eq!(m.len(), 3);
+        assert!(m[0].text().contains("<summary>\nSUMMARY\n</summary>"));
+        assert!(!m[0].text().contains(FIRST));
+        assert!(matches!(m[1].content[0], ContentBlock::ToolCall { .. }));
+        assert!(matches!(m[2].content[0], ContentBlock::ToolResult { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_call_too_long_for_the_window_compacts_and_calls_again() {
+        let h = resumed_with(Vec::new(), SMALL);
+        let read = read_after_a_turn(
+            &h,
+            5_000,
+            vec![
+                too_long(),
+                Script::text("SUMMARY", Duration::ZERO),
+                Script::text("done", Duration::ZERO),
+            ],
+        )
+        .await;
+        let (kinds, reqs) = h.finish(2).await;
+        assert_eq!(
+            kinds[3..],
+            [
+                "user:read it",
+                "assistant:+tool",
+                &read,
+                "overflow:context window exceeded",
+                "compacted:SUMMARY",
+                "assistant:done",
+                "end:Completed"
+            ]
+        );
+        assert!(reqs[4].messages[0].text().contains("SUMMARY"));
+    }
+
+    #[tokio::test]
+    async fn a_call_still_too_long_after_a_compaction_fails_the_turn() {
+        let h = resumed_with(Vec::new(), SMALL);
+        let read = read_after_a_turn(
+            &h,
+            5_000,
+            vec![
+                too_long(),
+                Script::text("SUMMARY", Duration::ZERO),
+                too_long(),
+            ],
+        )
+        .await;
+        let (kinds, reqs) = h.finish(2).await;
+        assert_eq!(
+            kinds[3..],
+            [
+                "user:read it",
+                "assistant:+tool",
+                &read,
+                "overflow:context window exceeded",
+                "compacted:SUMMARY",
+                "error:context window exceeded",
+                "end:Failed"
+            ]
+        );
+        assert_eq!(reqs.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_is_no_summary_fails_the_compaction_and_the_call_goes_ahead() {
+        let h = resumed_with(Vec::new(), SMALL);
+        let read = read_after_a_turn(
+            &h,
+            5_000,
+            vec![
+                too_long(),
+                tool_script(&[("c2", "Bash", json!({ "command": "ls" }))]),
+                Script::text("done", Duration::ZERO),
+            ],
+        )
+        .await;
+        let (kinds, _) = h.finish(2).await;
+        assert_eq!(
+            kinds[3..],
+            [
+                "user:read it",
+                "assistant:+tool",
+                &read,
+                "overflow:context window exceeded",
+                "compaction-failed:the summary call asked for tools",
+                "assistant:done",
+                "end:Completed"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_during_a_compaction_aborts_the_turn() {
+        let h = resumed_with(Vec::new(), SMALL);
+        let read = read_after_a_turn(
+            &h,
+            5_000,
+            vec![too_long(), Script::text("SUMMARY", Duration::from_secs(5))],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        h.interrupt().await;
+        let (kinds, _) = h.finish(2).await;
+        assert_eq!(
+            kinds[3..],
+            [
+                "user:read it",
+                "assistant:+tool",
+                &read,
+                "overflow:context window exceeded",
+                "cancelled",
+                "end:Aborted"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_continues_from_the_logged_summary() {
+        let mut log = vec![sent("first"), started("first")];
+        log.extend(by_player(vec![
+            logged_reply("r1"),
+            ended(TurnEndReason::Completed),
+        ]));
+        log.extend([sent("second"), started("second")]);
+        log.extend(by_player(vec![
+            logged_reply("r2"),
+            ended(TurnEndReason::Completed),
+            Event::Compacted {
+                summary: "SUMMARY".into(),
+                first_kept: "t-second".into(),
+                usage: Usage::default(),
+            },
+        ]));
+        let h = resumed(log);
+        h.provider.reset([Script::text("r3", Duration::ZERO)]);
+        h.send("third").await;
+        let (_, reqs) = h.finish(1).await;
+        let m = &reqs[0].messages;
+        assert_eq!(m.len(), 3);
+        assert!(m[0].text().contains("<summary>\nSUMMARY\n</summary>"));
+        assert!(m[0].text().ends_with("second"));
+        assert!(!m[0].text().contains("first"));
+        assert_eq!(m[1].text(), "r2");
+        assert_eq!(m[2].text(), "third");
     }
 }

@@ -116,12 +116,25 @@ pub enum Event {
     /// From the model task: the call was cancelled before it finished.
     ModelCancelled,
     /// From the model task: the call failed. With `retry_in_ms`, the task calls again after that
-    /// long and the turn goes on; without, the turn fails.
+    /// long and the turn goes on; with `compact`, the context was too long and the player
+    /// compacts it before calling again; with neither, the turn fails.
     Error {
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_in_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        compact: bool,
     },
+    /// From the player: `summary` replaces the conversation before the handled event
+    /// `first_kept`, which is kept as it was along with everything after it. `usage` is the
+    /// summary call's.
+    Compacted {
+        summary: String,
+        first_kept: String,
+        usage: Usage,
+    },
+    /// From the player: no summary came of the context; the turn goes on without one.
+    CompactionFailed { message: String },
     /// From the tools task.
     ToolResult {
         call_id: String,

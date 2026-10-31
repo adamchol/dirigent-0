@@ -115,6 +115,7 @@ impl App {
             Event::Error {
                 message,
                 retry_in_ms,
+                compact,
             } => {
                 self.live.clear();
                 self.push(match retry_in_ms {
@@ -123,8 +124,27 @@ impl App {
                         ms as f64 / 1000.0
                     ))
                     .yellow(),
+                    None if compact => {
+                        Line::from(format!("error: {message} · compacting")).yellow()
+                    }
                     None => Line::from(format!("error: {message}")).red(),
                 });
+            }
+            Event::Compacted { summary, usage, .. } => {
+                self.turn_usage.input += usage.input;
+                self.turn_usage.output += usage.output;
+                self.turn_usage.cache_read += usage.cache_read;
+                self.turn_usage.cache_write += usage.cache_write;
+                self.push(
+                    Line::from(format!(
+                        "context compacted · summary {} tokens · kept from here",
+                        tokens(summary.len() as u64 / 4)
+                    ))
+                    .dim(),
+                );
+            }
+            Event::CompactionFailed { message } => {
+                self.push(Line::from(format!("compaction failed: {message}")).yellow());
             }
             Event::ToolResult {
                 name,
@@ -495,6 +515,7 @@ mod tests {
                 Event::Error {
                     message: "boom".into(),
                     retry_in_ms: None,
+                    compact: false,
                 },
                 Event::TurnEnded {
                     reason: TurnEndReason::Aborted,

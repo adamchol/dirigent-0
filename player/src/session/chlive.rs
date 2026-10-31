@@ -173,6 +173,7 @@ mod e2e {
                 model: "mock",
                 system: "sys",
                 effort: None,
+                context_window: 1_000_000,
             },
             tools: Arc::new(Registry::default_set()),
             workdir,
