@@ -1,36 +1,28 @@
 -- ClickHouse schema, applied by the dnvr `schema` process on every start (idempotent).
--- Ingestion is Kafka Connect's ClickHouse sink, one connector per topic, exactly once: each
--- message is one row of the table of the same name. Every topic is keyed by session_id.
+-- Ingestion is Kafka Connect's ClickHouse sink, exactly once: each message is one row of the
+-- table of the same name. The topic is keyed by session_id, so a session stays in one partition.
 
--- A session's log, written only by its player: every event it handled, in order (`seq`).
--- `kind` is the event's type and `data` its fields, as JSON.
+-- A session: everything its users and its player write, in the order Kafka took it (`offset`).
+-- `offset`, `partition` and `ts` are the message's, added by the sink's InsertField transform
+-- (nix/shell.nix); `id` is set by the writer, `kind` is the event's type and `data` its fields.
+-- Streaming deltas are for live display only, so they expire after a day.
 CREATE TABLE IF NOT EXISTS default.session_events (
-  session_id UUID, seq UInt64, ts DateTime64(3), kind LowCardinality(String), data String
-) ENGINE = MergeTree ORDER BY (session_id, seq);
+  session_id UUID,
+  offset UInt64,
+  partition UInt32,
+  ts DateTime64(3),
+  id UUID,
+  author LowCardinality(String),
+  kind LowCardinality(String),
+  data String
+) ENGINE = MergeTree ORDER BY (session_id, offset)
+TTL toDateTime(ts) + INTERVAL 1 DAY DELETE WHERE kind = 'model_delta';
 
--- What users send to a session (`kind`: message or interrupt). The player logs each one it
--- takes, with its input_id, so on resume it knows which are left.
-CREATE TABLE IF NOT EXISTS default.session_inputs (
-  session_id UUID, input_id UUID, ts DateTime64(3), kind LowCardinality(String), text String
-) ENGINE = MergeTree ORDER BY (session_id, ts);
-
--- Streaming deltas of model replies, for live display only. `after_seq` is the seq of the last
--- logged event when the delta was sent, which ties it to the model call it belongs to.
-CREATE TABLE IF NOT EXISTS default.session_deltas (
-  session_id UUID, after_seq UInt64, ts DateTime64(3), data String
-) ENGINE = MergeTree ORDER BY (session_id, ts) TTL toDateTime(ts) + INTERVAL 1 DAY;
-
--- The sink's exactly-once state (the connectors' `zkDatabase` / `zkPath`), as continuous-backup
+-- The sink's exactly-once state (the connector's `zkDatabase` / `zkPath`), as continuous-backup
 -- creates it: per partition (`<topic>-<p>`), the offsets of the last insert and its state.
 CREATE TABLE IF NOT EXISTS default.dirigent_sink_session_events_state
   (key String, minOffset Int64, maxOffset Int64, state String)
   ENGINE = KeeperMap('/dirigent-sink/session_events') PRIMARY KEY key;
-CREATE TABLE IF NOT EXISTS default.dirigent_sink_session_inputs_state
-  (key String, minOffset Int64, maxOffset Int64, state String)
-  ENGINE = KeeperMap('/dirigent-sink/session_inputs') PRIMARY KEY key;
-CREATE TABLE IF NOT EXISTS default.dirigent_sink_session_deltas_state
-  (key String, minOffset Int64, maxOffset Int64, state String)
-  ENGINE = KeeperMap('/dirigent-sink/session_deltas') PRIMARY KEY key;
 
 -- The chlive server's users: chlive_ro reads (history, from snapshots), chlive_snap makes the
 -- snapshots (clones, with CREATE TABLE … AS + ATTACH PARTITION ALL FROM).

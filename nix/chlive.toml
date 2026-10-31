@@ -12,5 +12,8 @@ snapshot_database = "chlive_snapshots"
 dir = ".dnvr/chlive-cache"
 
 [tables.session_events]
-[tables.session_inputs]
-[tables.session_deltas]
+[tables.session_events.columns]
+# stored by the sink connector's InsertField transform (nix/shell.nix)
+offset = { kafka = "offset" }
+partition = { kafka = "partition" }
+ts = { kafka = "timestamp" }

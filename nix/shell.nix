@@ -19,14 +19,19 @@ let
       clickhouse
       chlive
       ;
-    topics = [
-      "session_events"
-      "session_inputs"
-      "session_deltas"
-    ];
+    topics = [ "session_events" ];
     schemaFile = "scripts/schema.sql";
     serverConfig = "nix/chlive.toml";
     cacheDir = ".dnvr/chlive-cache";
+    # each row also stores its message's partition, offset and timestamp (scripts/schema.sql),
+    # which chlive reads from the messages for live rows (nix/chlive.toml)
+    connectorSettings.session_events = {
+      transforms = "kafka";
+      "transforms.kafka.type" = "org.apache.kafka.connect.transforms.InsertField$Value";
+      "transforms.kafka.partition.field" = "partition";
+      "transforms.kafka.offset.field" = "offset";
+      "transforms.kafka.timestamp.field" = "ts";
+    };
   };
 
   # For scripts run in the shell: the running stack's addresses; a value already set wins.

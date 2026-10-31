@@ -21,6 +21,8 @@
   serverConfig,
   # the chlive server's result store (`cache.dir` in its config), for `reset-data`
   cacheDir,
+  # per topic, more settings for its sink connector (e.g. transforms)
+  connectorSettings ? { },
 }:
 let
   dir = n: ".dnvr/${n}";
@@ -65,28 +67,31 @@ let
       c = sinkConnector topic;
     in
     pkgs.writeText "${c.name}.json" (
-      builtins.toJSON {
-        "connector.class" = "com.clickhouse.kafka.connect.ClickHouseSinkConnector";
-        "tasks.max" = "1";
-        topics = topic;
-        topic2TableMap = "${topic}=${topic}";
-        ssl = "false";
-        database = "default";
-        username = "default";
-        password = "";
-        exactlyOnce = "true";
-        "consumer.override.isolation.level" = "read_committed";
-        "errors.tolerance" = "all";
-        "errors.deadletterqueue.topic.name" = "dirigent-deadletterqueue";
-        "errors.deadletterqueue.topic.replication.factor" = "1";
-        "errors.deadletterqueue.context.headers.enable" = "true";
-        bufferCount = "0";
-        zkPath = c.keeperPath;
-        zkDatabase = c.stateTable;
-        "value.converter" = "org.apache.kafka.connect.json.JsonConverter";
-        "value.converter.schemas.enable" = "false";
-        clickhouseSettings = "async_insert=0,insert_deduplicate=1";
-      }
+      builtins.toJSON (
+        {
+          "connector.class" = "com.clickhouse.kafka.connect.ClickHouseSinkConnector";
+          "tasks.max" = "1";
+          topics = topic;
+          topic2TableMap = "${topic}=${topic}";
+          ssl = "false";
+          database = "default";
+          username = "default";
+          password = "";
+          exactlyOnce = "true";
+          "consumer.override.isolation.level" = "read_committed";
+          "errors.tolerance" = "all";
+          "errors.deadletterqueue.topic.name" = "dirigent-deadletterqueue";
+          "errors.deadletterqueue.topic.replication.factor" = "1";
+          "errors.deadletterqueue.context.headers.enable" = "true";
+          bufferCount = "0";
+          zkPath = c.keeperPath;
+          zkDatabase = c.stateTable;
+          "value.converter" = "org.apache.kafka.connect.json.JsonConverter";
+          "value.converter.schemas.enable" = "false";
+          clickhouseSettings = "async_insert=0,insert_deduplicate=1";
+        }
+        // (connectorSettings.${topic} or { })
+      )
     );
   # `bootstrap.servers` and `listeners` are appended at runtime.
   connectProperties = pkgs.writeText "dirigent-connect.properties" ''
@@ -227,7 +232,8 @@ in
         } > "$props"
         ${supervise {
           name = "Kafka Connect";
-          start = ''${pkgs.apacheKafka}/bin/connect-distributed.sh "$props"'';
+          # one small sink connector: 512 MiB is plenty (its default is a 2 GiB heap)
+          start = ''${pkgs.coreutils}/bin/env KAFKA_HEAP_OPTS="-Xms128M -Xmx512M" ${pkgs.apacheKafka}/bin/connect-distributed.sh "$props"'';
           readyWhen = ''${pkgs.curl}/bin/curl -fs "http://127.0.0.1:$port/connector-plugins" >/dev/null'';
           onReady = ''
             dnvr-state set url "http://127.0.0.1:$port"

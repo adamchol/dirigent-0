@@ -1,6 +1,8 @@
-//! What every component of dirigent shares: a session's events, and how they're kept in the
-//! event system (Kafka topics ingested into ClickHouse tables, read back through chlive).
+//! What every component of dirigent shares: a session's events, how they're kept in the event
+//! system (one Kafka topic ingested into a ClickHouse table, read back through chlive), and how
+//! a log of them reads.
 
+pub mod fold;
 pub mod rows;
 
 use serde::{Deserialize, Serialize};
@@ -89,16 +91,21 @@ pub enum TurnEndReason {
     Failed,
 }
 
-/// Everything a player handles. It publishes every event it handles, in the order it handles
-/// them, plus the `TurnEnded` it derives; that published stream is the session log.
+/// One event of a session's log. Users write messages and interrupts; the player writes the
+/// rest, recording which messages it took and how each turn ended. Ids are other rows' `id`s
+/// (see [`rows::EventRow`]); a turn's id is its `TurnStarted`'s.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Event {
-    /// From a user; `input_id` is the input it came as.
-    UserMessage { input_id: String, text: String },
     /// From a user.
-    UserInterrupt { input_id: String },
-    /// From the model task: one streaming delta, for live display only; never kept in history.
+    UserMessage { text: String },
+    /// From a user: stop the turn `turn`, the one they saw running.
+    UserInterrupt { turn: String },
+    /// From the player: a turn on the message `input`.
+    TurnStarted { input: String },
+    /// From the player: the message `input` joins the running turn.
+    Steered { input: String },
+    /// From the model task: one streaming delta of the call in flight, for live display only.
     ModelDelta { delta: Delta },
     /// From the model task: the finished reply.
     AssistantMessage {
@@ -119,6 +126,10 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Value::is_null")]
         meta: Value,
     },
-    /// From the player itself.
-    TurnEnded { reason: TurnEndReason },
+    /// From the player; `interrupt` is the user interrupt that ended it, if one did.
+    TurnEnded {
+        reason: TurnEndReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interrupt: Option<String>,
+    },
 }

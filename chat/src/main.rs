@@ -1,17 +1,16 @@
-//! Terminal client for a dirigent session: the session's log and the live deltas come from
-//! chlive, what the user types goes to Kafka as inputs.
+//! Terminal client for a dirigent session: the session's log comes from chlive, and what the
+//! user types is appended to it through Kafka.
 
 mod app;
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::Context;
-use chlive_client::{Change, ClientOptions, Events, Kind, LiveClient, Status, Subscription};
+use chlive_client::{Change, ClientOptions, Kind, LiveClient, Status, Subscription};
 use clap::Parser;
 use crossterm::event::{Event as TermEvent, EventStream};
-use dirigent_protocol::rows::{
-    timestamp, DeltaRow, EventRow, InputRow, DELTAS_QUERY, EVENTS_QUERY, INPUTS,
-};
+use dirigent_protocol::rows::{EventRow, EVENTS, SESSION_QUERY, USER};
+use dirigent_protocol::Event;
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -49,17 +48,13 @@ async fn main() -> anyhow::Result<()> {
         .context("creating the Kafka producer")?;
     let client = LiveClient::new(ClientOptions::new(&cli.chlive_url));
     let log = client
-        .query(EVENTS_QUERY)
+        .query(SESSION_QUERY)
         .param("session", &session)
         .raw::<EventRow>();
-    let deltas = client
-        .query(DELTAS_QUERY)
-        .param("session", &session)
-        .inserts::<DeltaRow>();
 
     let mut terminal = ratatui::init();
     let app = App::new(session.clone(), cli.chlive_url);
-    let result = run(&mut terminal, app, &session, producer, log, deltas).await;
+    let result = run(&mut terminal, app, &session, producer, log).await;
     ratatui::restore();
     result
 }
@@ -70,31 +65,34 @@ async fn run(
     session: &str,
     producer: FutureProducer,
     mut log: Subscription<EventRow>,
-    mut deltas: Events<DeltaRow>,
 ) -> anyhow::Result<()> {
     let mut keys = EventStream::new();
-    let (mut log_open, mut deltas_open) = (true, true);
+    let mut log_open = true;
     loop {
         terminal.draw(|frame| app.draw(frame))?;
         tokio::select! {
             key = keys.next() => match key {
                 Some(Ok(TermEvent::Key(key))) => {
-                    let input_id = uuid::Uuid::new_v4().to_string();
-                    let ts = timestamp(SystemTime::now());
-                    let row = match app.on_key(key) {
+                    let event = match app.on_key(key) {
                         None => continue,
                         Some(Action::Quit) => return Ok(()),
-                        Some(Action::Send(text)) => {
-                            app.sent(input_id.clone(), text.clone());
-                            InputRow::message(session, input_id, ts, text)
-                        }
-                        Some(Action::Interrupt) => InputRow::interrupt(session, input_id, ts),
+                        Some(Action::Send(text)) => Event::UserMessage { text },
+                        Some(Action::Interrupt) => match app.turn() {
+                            Some(turn) => Event::UserInterrupt { turn },
+                            None => {
+                                app.status = Some("no turn is running".into());
+                                continue;
+                            }
+                        },
                     };
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let row = EventRow::new(session, id, USER, &event);
                     let payload = serde_json::to_string(&row).expect("rows serialize");
-                    let record = FutureRecord::to(INPUTS).key(session).payload(&payload);
-                    if let Err((e, _)) = producer.send(record, Duration::from_secs(10)).await {
-                        app.status = Some(format!("could not send: {e}"));
-                    }
+                    let record = FutureRecord::to(EVENTS).key(session).payload(&payload);
+                    app.status = match producer.send(record, Duration::from_secs(10)).await {
+                        Ok(_) => None,
+                        Err((e, _)) => Some(format!("could not send: {e}")),
+                    };
                 }
                 Some(Ok(_)) => {} // resize etc.: redraw
                 Some(Err(e)) => return Err(e.into()),
@@ -128,11 +126,6 @@ async fn run(
                     log_open = false;
                     app.status = Some("the log subscription ended · Ctrl-C quits".into());
                 }
-            },
-            delta = deltas.next(), if deltas_open => match delta {
-                Some(Ok(row)) => app.on_delta_row(&row),
-                Some(Err(e)) => app.status = Some(format!("the deltas subscription failed: {e}")),
-                None => deltas_open = false,
             },
         }
     }

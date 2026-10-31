@@ -312,7 +312,7 @@ dependencies = [
 [[package]]
 name = "chlive-client"
 version = "0.1.0"
-source = "git+https://github.com/dialohq/chlive?branch=all-in#016bb7b455d016e949e8a3859bea9d09cf64d154"
+source = "git+https://github.com/dialohq/chlive?branch=master#c724fc1a3f23ef291308744aa3cd3bb99274d63d"
 dependencies = [
  "chlive-protocol",
  "futures",
@@ -326,7 +326,7 @@ dependencies = [
 [[package]]
 name = "chlive-protocol"
 version = "0.1.0"
-source = "git+https://github.com/dialohq/chlive?branch=all-in#016bb7b455d016e949e8a3859bea9d09cf64d154"
+source = "git+https://github.com/dialohq/chlive?branch=master#c724fc1a3f23ef291308744aa3cd3bb99274d63d"
 dependencies = [
  "serde",
  "serde_json",
@@ -810,7 +810,6 @@ dependencies = [
 name = "dirigent-protocol"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -3152,7 +3151,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

@@ -16,7 +16,7 @@
     };
     # the chlive server (`chlive`) and its ClickHouse build
     chlive = {
-      url = "git+https://github.com/dialohq/chlive?ref=all-in";
+      url = "git+https://github.com/dialohq/chlive?ref=master";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-parts.follows = "flake-parts";
       inputs.dnvr.follows = "dnvr";

@@ -1,5 +1,6 @@
 //! The only state the loop keeps across turns: what the next model call
-//! needs. Built from events, live (`push`) or on resume (`from_events`).
+//! needs. Built from handled events (see `dirigent_protocol::fold`), live (`push`) or on resume
+//! (`from_events`).
 
 use crate::provider::{ContentBlock, Message, Role};
 use dirigent_protocol::{Event, TurnEndReason};
@@ -45,10 +46,12 @@ impl Entry {
                 content: content.clone(),
                 is_error: *is_error,
             }),
-            Event::TurnEnded { reason } => Some(Entry::TurnEnded {
+            Event::TurnEnded { reason, .. } => Some(Entry::TurnEnded {
                 aborted: *reason == TurnEndReason::Aborted,
             }),
             Event::UserInterrupt { .. }
+            | Event::TurnStarted { .. }
+            | Event::Steered { .. }
             | Event::ModelDelta { .. }
             | Event::ModelCancelled
             | Event::Error { .. } => None,
@@ -185,16 +188,11 @@ mod tests {
     use serde_json::{json, Value};
 
     fn user(text: &str) -> Event {
-        Event::UserMessage {
-            input_id: format!("in-{text}"),
-            text: text.into(),
-        }
+        Event::UserMessage { text: text.into() }
     }
 
     fn interrupt() -> Event {
-        Event::UserInterrupt {
-            input_id: "in-interrupt".into(),
-        }
+        Event::UserInterrupt { turn: "t1".into() }
     }
 
     fn assistant(content: Vec<ContentBlock>, stop: StopReason) -> Event {
@@ -224,7 +222,10 @@ mod tests {
     }
 
     fn ended(reason: TurnEndReason) -> Event {
-        Event::TurnEnded { reason }
+        Event::TurnEnded {
+            reason,
+            interrupt: None,
+        }
     }
 
     fn text(t: &str) -> ContentBlock {

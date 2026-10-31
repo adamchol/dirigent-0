@@ -39,11 +39,11 @@ struct Cli {
     #[arg(long, env = "DIRIGENT_SESSION")]
     session: Option<String>,
 
-    /// chlive's WebSocket, where the session's log and inputs are read.
+    /// chlive's WebSocket, where the session's log is read.
     #[arg(long, env = "CHLIVE_URL", default_value = "ws://127.0.0.1:8080/live")]
     chlive_url: String,
 
-    /// Kafka bootstrap servers, where the session's events are written.
+    /// Kafka bootstrap servers, where the session's log is appended to.
     #[arg(long, env = "DIRIGENT_KAFKA", default_value = "127.0.0.1:9092")]
     kafka: String,
 

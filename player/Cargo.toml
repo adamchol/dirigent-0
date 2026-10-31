@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 dirigent-protocol = { path = "../protocol" }
 genai = "=0.7.0-beta.22"
-chlive-client = { git = "https://github.com/dialohq/chlive", branch = "all-in" }
+chlive-client = { git = "https://github.com/dialohq/chlive", branch = "master" }
 rdkafka = { version = "0.39", default-features = false, features = ["tokio", "dynamic-linking"] }
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process", "fs", "io-util"] }

@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use dirigent_protocol::rows::{DeltaRow, EventRow};
+use dirigent_protocol::fold::Fold;
+use dirigent_protocol::rows::EventRow;
 use dirigent_protocol::{ContentBlock, Delta, Event, TurnEndReason, Usage};
 use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::{Color, Style, Stylize};
@@ -31,13 +32,11 @@ pub struct App {
     cursor: usize,
     working: bool,
     turn_usage: Usage,
-    /// The seq of the last event that ended a model call; deltas sent before it are done.
-    call_ended: Option<u64>,
-    /// Replies being streamed, by the `after_seq` of their deltas, then by block index;
-    /// replaced by the finished `AssistantMessage` (or dropped on cancel or error).
-    live: BTreeMap<u64, BTreeMap<usize, ContentBlock>>,
-    /// Messages sent that the player hasn't logged yet, by input id.
-    sent: Vec<(String, String)>,
+    /// The log read so far: the running turn, and the messages waiting for one.
+    fold: Fold,
+    /// The reply being streamed, by block index; replaced by the finished `AssistantMessage`
+    /// (or dropped on cancel or error).
+    live: BTreeMap<usize, ContentBlock>,
     pub status: Option<String>,
 }
 
@@ -52,43 +51,43 @@ impl App {
             cursor: 0,
             working: false,
             turn_usage: Usage::default(),
-            call_ended: None,
+            fold: Fold::default(),
             live: BTreeMap::new(),
-            sent: Vec::new(),
             status: None,
         }
     }
 
-    /// Forget the transcript, before a snapshot of the log replaces it.
+    /// Forget the log, before a snapshot of it replaces it.
     pub fn reset(&mut self) {
         self.lines.clear();
         self.working = false;
         self.turn_usage = Usage::default();
-        self.call_ended = None;
+        self.fold = Fold::default();
+        self.live.clear();
     }
 
     pub fn on_row(&mut self, row: &EventRow) {
         match row.event() {
-            Ok(ev) => self.on_event(row.seq, ev),
-            Err(e) => self.push(Line::from(format!("unreadable event {}: {e}", row.seq)).red()),
+            Ok(ev) => self.on_logged(&row.id, ev),
+            Err(e) => self.push(Line::from(format!("unreadable row {}: {e}", row.offset)).red()),
         }
     }
 
-    pub fn on_delta_row(&mut self, row: &DeltaRow) {
-        if let Ok(delta) = row.delta() {
-            self.on_delta(row.after_seq, delta);
+    /// The log's next event, with its id.
+    pub fn on_logged(&mut self, id: &str, ev: Event) {
+        if let Some(handled) = self.fold.apply(id, &ev) {
+            self.on_handled(handled);
         }
     }
 
-    /// A message the user sent, shown as waiting until the player logs it.
-    pub fn sent(&mut self, input_id: String, text: String) {
-        self.sent.push((input_id, text));
+    /// The running turn's id, which an interrupt names.
+    pub fn turn(&self) -> Option<String> {
+        self.fold.open().map(|t| t.id.clone())
     }
 
-    pub fn on_event(&mut self, seq: u64, ev: Event) {
+    fn on_handled(&mut self, ev: Event) {
         match ev {
-            Event::UserMessage { input_id, text } => {
-                self.sent.retain(|(id, _)| *id != input_id);
+            Event::UserMessage { text } => {
                 if !self.working {
                     self.working = true;
                     self.turn_usage = Usage::default();
@@ -98,10 +97,9 @@ impl App {
                     self.push(Line::from(format!("{prefix}{line}")).bold().cyan());
                 }
             }
-            Event::UserInterrupt { .. } => self.push(Line::from("⏸ interrupted").magenta()),
-            Event::ModelDelta { delta } => self.on_delta(seq, delta),
+            Event::ModelDelta { delta } => self.on_delta(delta),
             Event::AssistantMessage { content, usage, .. } => {
-                self.call_ended(seq);
+                self.live.clear();
                 self.turn_usage.input += usage.input;
                 self.turn_usage.output += usage.output;
                 self.turn_usage.cache_read += usage.cache_read;
@@ -111,11 +109,11 @@ impl App {
                 }
             }
             Event::ModelCancelled => {
-                self.call_ended(seq);
+                self.live.clear();
                 self.push(Line::from("model call cancelled").dim());
             }
             Event::Error { message, .. } => {
-                self.call_ended(seq);
+                self.live.clear();
                 self.push(Line::from(format!("error: {message}")).red());
             }
             Event::ToolResult {
@@ -124,8 +122,12 @@ impl App {
                 is_error,
                 ..
             } => self.tool_result(&name, &content, is_error),
-            Event::TurnEnded { reason } => {
+            Event::TurnEnded { reason, interrupt } => {
+                self.live.clear();
                 self.working = false;
+                if interrupt.is_some() {
+                    self.push(Line::from("⏸ interrupted").magenta());
+                }
                 let (label, color) = match reason {
                     TurnEndReason::Completed => ("turn completed", Color::DarkGray),
                     TurnEndReason::Aborted => ("turn aborted", Color::Magenta),
@@ -143,20 +145,14 @@ impl App {
                 );
                 self.push(Line::default());
             }
+            // the fold keeps these
+            Event::UserInterrupt { .. } | Event::TurnStarted { .. } | Event::Steered { .. } => {}
         }
     }
 
-    fn call_ended(&mut self, seq: u64) {
-        self.call_ended = Some(self.call_ended.map_or(seq, |s| s.max(seq)));
-        self.live.retain(|after, _| *after >= seq);
-    }
-
-    /// One streaming delta of the model call that follows the log's event `after_seq`.
-    pub fn on_delta(&mut self, after_seq: u64, delta: Delta) {
-        if self.call_ended.is_some_and(|ended| after_seq < ended) {
-            return; // its call is over
-        }
-        let blocks = self.live.entry(after_seq).or_default();
+    /// One streaming delta of the model call in flight.
+    fn on_delta(&mut self, delta: Delta) {
+        let blocks = &mut self.live;
         match delta {
             Delta::BlockStart { index, block } => {
                 blocks.insert(index, block);
@@ -275,15 +271,13 @@ impl App {
             .unwrap_or(self.input.len())
     }
 
-    /// The transcript, then the replies being streamed, then the messages not logged yet.
+    /// The transcript, then the reply being streamed, then the messages waiting for a turn.
     fn screen(&self) -> Vec<Line<'static>> {
         let mut lines = self.lines.clone();
-        for blocks in self.live.values() {
-            for block in blocks.values() {
-                lines.extend(block_lines(block));
-            }
+        for block in self.live.values() {
+            lines.extend(block_lines(block));
         }
-        for (_, text) in &self.sent {
+        for (_, text) in self.fold.queued() {
             for (i, line) in text.lines().enumerate() {
                 let prefix = if i == 0 { "› " } else { "  " };
                 lines.push(Line::from(format!("{prefix}{line}")).cyan().dim());
@@ -316,7 +310,7 @@ impl App {
             None if self.working => {
                 Line::from("working… Enter steers · Esc interrupts · Ctrl-C quits").yellow()
             }
-            None if !self.sent.is_empty() => {
+            None if !self.fold.queued().is_empty() => {
                 Line::from("sent; waiting for the player · Esc interrupts · Ctrl-C quits").yellow()
             }
             None => Line::from("idle · Enter sends · ↑/↓ PgUp/PgDn scroll · Ctrl-C quits").dim(),
@@ -416,11 +410,21 @@ mod tests {
         app.screen().iter().map(|l| l.to_string()).collect()
     }
 
-    fn user(text: &str) -> Event {
-        Event::UserMessage {
-            input_id: format!("in-{text}"),
-            text: text.into(),
+    /// Log the player's `events`, with ids nothing refers to.
+    fn log(app: &mut App, events: impl IntoIterator<Item = Event>) {
+        for ev in events {
+            app.on_logged("p", ev);
         }
+    }
+
+    /// A user's message `text` (id `m-<text>`) and the turn the player starts on it (`t-<text>`).
+    fn turn(app: &mut App, text: &str) {
+        app.on_logged(
+            &format!("m-{text}"),
+            Event::UserMessage { text: text.into() },
+        );
+        let input = format!("m-{text}");
+        app.on_logged(&format!("t-{text}"), Event::TurnStarted { input });
     }
 
     fn reply(content: Vec<ContentBlock>, usage: Usage) -> Event {
@@ -435,63 +439,58 @@ mod tests {
         ContentBlock::Text { text: t.into() }
     }
 
+    fn delta(d: Delta) -> Event {
+        Event::ModelDelta { delta: d }
+    }
+
     #[test]
     fn renders_a_turn_with_tools() {
         let mut app = app();
-        app.on_event(0, user("fix it"));
+        turn(&mut app, "fix it");
         assert!(app.working);
-        app.on_event(
-            1,
-            reply(
-                vec![
-                    ContentBlock::Thinking {
-                        text: "a\nb\nc\nd".into(),
-                        provider_data: Value::Null,
+        log(
+            &mut app,
+            [
+                reply(
+                    vec![
+                        ContentBlock::Thinking {
+                            text: "a\nb\nc\nd".into(),
+                            provider_data: Value::Null,
+                        },
+                        text("Looking."),
+                        ContentBlock::ToolCall {
+                            id: "c1".into(),
+                            name: "Bash".into(),
+                            input: json!({"command": "cargo test\n--quiet"}),
+                        },
+                    ],
+                    Usage {
+                        input: 1500,
+                        output: 20,
+                        cache_read: 0,
+                        cache_write: 0,
                     },
-                    text("Looking."),
-                    ContentBlock::ToolCall {
-                        id: "c1".into(),
-                        name: "Bash".into(),
-                        input: json!({"command": "cargo test\n--quiet"}),
-                    },
-                ],
-                Usage {
-                    input: 1500,
-                    output: 20,
-                    cache_read: 0,
-                    cache_write: 0,
+                ),
+                Event::ToolResult {
+                    call_id: "c1".into(),
+                    name: "Bash".into(),
+                    content: "1\n2\n3\n4\n5\n6".into(),
+                    is_error: true,
+                    meta: Value::Null,
                 },
-            ),
-        );
-        app.on_event(
-            2,
-            Event::ToolResult {
-                call_id: "c1".into(),
-                name: "Bash".into(),
-                content: "1\n2\n3\n4\n5\n6".into(),
-                is_error: true,
-                meta: Value::Null,
-            },
-        );
-        app.on_event(
-            3,
-            Event::UserInterrupt {
-                input_id: "i".into(),
-            },
-        );
-        app.on_event(4, Event::ModelCancelled);
-        app.on_event(
-            5,
-            Event::Error {
-                message: "boom".into(),
-                retryable: false,
-            },
-        );
-        app.on_event(
-            6,
-            Event::TurnEnded {
-                reason: TurnEndReason::Aborted,
-            },
+                Event::UserInterrupt {
+                    turn: "t-fix it".into(),
+                },
+                Event::ModelCancelled,
+                Event::Error {
+                    message: "boom".into(),
+                    retryable: false,
+                },
+                Event::TurnEnded {
+                    reason: TurnEndReason::Aborted,
+                    interrupt: Some("i".into()),
+                },
+            ],
         );
         assert!(!app.working);
         assert_eq!(
@@ -510,9 +509,9 @@ mod tests {
                 "    3",
                 "    4",
                 "    … 2 more lines",
-                "⏸ interrupted",
                 "model call cancelled",
                 "error: boom",
+                "⏸ interrupted",
                 "── turn aborted · in 1.5k out 20 cache 0 ──",
                 "",
             ]
@@ -522,52 +521,47 @@ mod tests {
     #[test]
     fn deltas_stream_live_and_the_finished_message_replaces_them() {
         let mut app = app();
-        app.on_event(0, user("go"));
-        app.on_delta(
-            0,
-            Delta::BlockStart {
-                index: 0,
-                block: text(""),
-            },
-        );
-        app.on_delta(
-            0,
-            Delta::Text {
-                index: 0,
-                text: "Hel".into(),
-            },
+        turn(&mut app, "go");
+        log(
+            &mut app,
+            [
+                delta(Delta::BlockStart {
+                    index: 0,
+                    block: text(""),
+                }),
+                delta(Delta::Text {
+                    index: 0,
+                    text: "Hel".into(),
+                }),
+            ],
         );
         assert_eq!(screen(&app), vec!["› go", "Hel"]);
-        app.on_delta(
-            0,
-            Delta::Text {
-                index: 0,
-                text: "lo".into(),
-            },
-        );
-        app.on_delta(
-            0,
-            Delta::BlockStart {
-                index: 1,
-                block: ContentBlock::ToolCall {
-                    id: "c1".into(),
-                    name: "Read".into(),
-                    input: Value::Null,
-                },
-            },
-        );
-        app.on_delta(
-            0,
-            Delta::ToolCallArgs {
-                index: 1,
-                json: r#"{"file_path":"/a.rs"}"#.into(),
-            },
+        log(
+            &mut app,
+            [
+                delta(Delta::Text {
+                    index: 0,
+                    text: "lo".into(),
+                }),
+                delta(Delta::BlockStart {
+                    index: 1,
+                    block: ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "Read".into(),
+                        input: Value::Null,
+                    },
+                }),
+                delta(Delta::ToolCallArgs {
+                    index: 1,
+                    json: r#"{"file_path":"/a.rs"}"#.into(),
+                }),
+            ],
         );
         assert_eq!(screen(&app), vec!["› go", "Hello", "▶ Read  /a.rs"]);
 
-        app.on_event(
-            1,
-            reply(
+        log(
+            &mut app,
+            [reply(
                 vec![
                     text("Hello"),
                     ContentBlock::ToolCall {
@@ -577,30 +571,22 @@ mod tests {
                     },
                 ],
                 Usage::default(),
-            ),
+            )],
         );
         assert!(app.live.is_empty());
         assert_eq!(screen(&app), vec!["› go", "Hello", "▶ Read  /a.rs"]);
 
-        // a late delta of the finished call is ignored
-        app.on_delta(
-            0,
-            Delta::Text {
-                index: 0,
-                text: "late".into(),
-            },
-        );
-        assert!(app.live.is_empty());
-
         // a cancelled call drops what it streamed
-        app.on_delta(
-            1,
-            Delta::Text {
-                index: 0,
-                text: "partial".into(),
-            },
+        log(
+            &mut app,
+            [
+                delta(Delta::Text {
+                    index: 0,
+                    text: "partial".into(),
+                }),
+                Event::ModelCancelled,
+            ],
         );
-        app.on_event(2, Event::ModelCancelled);
         assert_eq!(
             screen(&app),
             vec!["› go", "Hello", "▶ Read  /a.rs", "model call cancelled"]
@@ -608,38 +594,43 @@ mod tests {
     }
 
     #[test]
-    fn deltas_of_the_next_call_survive_the_previous_reply_arriving_late() {
+    fn a_message_waits_until_a_turn_takes_it() {
         let mut app = app();
-        app.on_event(0, user("go"));
-        // the next call's deltas (after the reply at seq 1 and its tool result at 2) arrive
-        // before the log has the reply
-        app.on_delta(
-            2,
-            Delta::Text {
-                index: 0,
-                text: "next".into(),
+        app.on_logged("m-hi", Event::UserMessage { text: "hi".into() });
+        assert!(transcript(&app).is_empty());
+        assert_eq!(screen(&app), vec!["› hi"]);
+        app.on_logged(
+            "t-hi",
+            Event::TurnStarted {
+                input: "m-hi".into(),
             },
         );
-        app.on_event(1, reply(vec![text("first")], Usage::default()));
-        assert_eq!(screen(&app), vec!["› go", "first", "next"]);
+        assert_eq!(transcript(&app), vec!["› hi"]);
+        assert_eq!(screen(&app), vec!["› hi"]);
     }
 
     #[test]
-    fn sent_messages_wait_for_the_log() {
+    fn an_interrupt_names_the_running_turn() {
         let mut app = app();
-        app.sent("in-hi".into(), "hi".into());
-        assert_eq!(screen(&app), vec!["› hi"]);
-        app.on_event(0, user("hi"));
-        assert!(app.sent.is_empty());
-        assert_eq!(screen(&app), vec!["› hi"]);
+        assert_eq!(app.turn(), None);
+        turn(&mut app, "go");
+        assert_eq!(app.turn().as_deref(), Some("t-go"));
+        log(
+            &mut app,
+            [Event::TurnEnded {
+                reason: TurnEndReason::Completed,
+                interrupt: None,
+            }],
+        );
+        assert_eq!(app.turn(), None);
     }
 
     #[test]
     fn a_new_snapshot_replaces_the_transcript() {
         let mut app = app();
-        app.on_event(0, user("a"));
+        turn(&mut app, "a");
         app.reset();
-        app.on_event(0, user("a"));
+        turn(&mut app, "a");
         assert_eq!(transcript(&app), vec!["› a"]);
     }
 

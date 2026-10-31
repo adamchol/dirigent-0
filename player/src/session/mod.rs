@@ -1,6 +1,6 @@
-//! The loop's connection to the event system. The loop receives inputs from a session,
-//! publishes every event to it, and on start loads past events from it to rebuild the model
-//! history. The loop itself stores none of the published events.
+//! The loop's connection to the event system: a session's log, which users and the player all
+//! append to. The loop reads the log on start to rebuild its state, then receives what users
+//! append, and appends every event it handles or produces. The loop stores none of the log.
 
 pub mod chlive;
 
@@ -10,13 +10,13 @@ use dirigent_protocol::Event;
 
 #[async_trait]
 pub trait Session: Send {
-    /// Events published earlier for this conversation, oldest first (resume).
-    async fn load(&mut self) -> anyhow::Result<Vec<Event>>;
+    /// The log so far, oldest first: each event with its id (resume).
+    async fn load(&mut self) -> anyhow::Result<Vec<(String, Event)>>;
 
-    /// Next input: `UserMessage` or `UserInterrupt`. `None` means no more inputs will come.
+    /// The next event users append, with its id. `None` means no more will come.
     /// Must be cancel-safe: the loop polls it inside `select!`.
-    async fn recv(&mut self) -> Option<Event>;
+    async fn recv(&mut self) -> Option<(String, Event)>;
 
-    /// Hand over an event the loop handled or produced. Best effort.
-    async fn publish(&mut self, event: &Event);
+    /// Append an event; returns its id. Best effort.
+    async fn publish(&mut self, event: &Event) -> String;
 }

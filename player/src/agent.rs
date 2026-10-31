@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ use crate::history::History;
 use crate::provider::{Accumulator, ContentBlock, Effort, Provider, Request, StopReason};
 use crate::session::Session;
 use crate::tools::{Registry, ToolCtx, ToolOutput};
+use dirigent_protocol::fold::Fold;
 use dirigent_protocol::{Event, TurnEndReason};
 
 #[derive(Debug, Clone, Copy)]
@@ -40,72 +42,92 @@ struct Call {
 
 /// The turn in progress. `None` in the loop means idle.
 struct Turn {
+    /// Its `TurnStarted`'s id, which interrupts name.
+    id: String,
     token: CancellationToken,
     /// Tool calls still waiting for a result.
     pending: Vec<String>,
     /// A user message arrived during the current model call.
     steered: bool,
     interrupted: bool,
+    /// The user interrupt that stopped it, if one did.
+    interrupt: Option<String>,
 }
 
 type Tx = mpsc::UnboundedSender<Event>;
 
 impl Agent {
-    /// Run one session: inputs come from the session, model and tool outcomes
-    /// from the tasks this loop spawns. Every handled event is published to
-    /// the session; only what the model needs is kept in `history`. Returns
-    /// when the session's inputs end and no turn is in progress.
+    /// Run one session: user events come from the session, model and tool outcomes from the
+    /// tasks this loop spawns. Every event the loop produces is published to the session; only
+    /// what the model needs is kept in `history`. Returns when the session's events end and no
+    /// turn is in progress.
     ///
-    /// A turn the log leaves unfinished (the previous player stopped mid-turn)
-    /// is closed first: its tool calls get aborted results and it ends Aborted.
+    /// A message starts a turn when the loop is idle and steers the running one otherwise;
+    /// messages the log leaves queued get a turn each. A turn the log leaves unfinished (the
+    /// previous player stopped mid-turn) is closed first: its tool calls get aborted results and
+    /// it ends Aborted.
     pub async fn run(&self, session: &mut dyn Session) -> anyhow::Result<()> {
-        let events = session.load().await?;
+        let log = session.load().await?;
+        let mut fold = Fold::default();
+        let handled: Vec<Event> = log
+            .iter()
+            .filter_map(|(id, ev)| fold.apply(id, ev))
+            .collect();
         let (tx, mut outcomes) = mpsc::unbounded_channel::<Event>();
         let mut run = Run {
             agent: self,
             session,
-            history: History::from_events(&events),
+            history: History::from_events(&handled),
             ctx: Arc::new(ToolCtx::new(self.workdir)),
             turn: None,
+            queue: fold.queued().iter().cloned().collect(),
             tx,
         };
-        let closing = close_unfinished(&events);
+        let closing = close_unfinished(&handled, fold.open().and_then(|t| t.interrupt.clone()));
         if !closing.is_empty() {
             warn!("the log ends mid-turn; closing that turn");
         }
         for ev in &closing {
             run.record(ev).await;
         }
-        info!(events = events.len(), "session started");
+        info!(
+            events = log.len(),
+            queued = run.queue.len(),
+            "session started"
+        );
         let mut client = true;
 
-        while client || run.turn.is_some() {
-            let ev = tokio::select! {
+        loop {
+            run.next_turn().await;
+            if !client && run.turn.is_none() {
+                break;
+            }
+            tokio::select! {
                 biased;
-                Some(ev) = outcomes.recv() => ev,
+                Some(ev) = outcomes.recv() => run.handle(ev).await,
                 ev = run.session.recv(), if client => match ev {
-                    Some(ev) => ev,
+                    Some((id, ev)) => run.input(id, ev).await,
                     None => {
                         client = false;
+                        run.queue.clear();
                         // Nobody is listening: stop the work and let it drain.
                         if let Some(t) = &mut run.turn {
                             t.interrupted = true;
                             t.token.cancel();
                         }
-                        continue;
                     }
                 },
-            };
-            run.handle(ev).await;
+            }
         }
         info!("session ended");
         Ok(())
     }
 }
 
-/// The events that close a turn `events` leave open: an aborted result for each tool call
-/// still waiting for one, then `TurnEnded { Aborted }`. Empty when no turn is open.
-fn close_unfinished(events: &[Event]) -> Vec<Event> {
+/// The events that close a turn the handled `events` leave open: an aborted result for each
+/// tool call still waiting for one, then `TurnEnded { Aborted }` naming `interrupt`, the
+/// interrupt the log has for it. Empty when no turn is open.
+fn close_unfinished(events: &[Event], interrupt: Option<String>) -> Vec<Event> {
     let mut open = false;
     let mut waiting: Vec<(String, String)> = Vec::new();
     for ev in events {
@@ -131,6 +153,8 @@ fn close_unfinished(events: &[Event]) -> Vec<Event> {
                 waiting.clear();
             }
             Event::UserInterrupt { .. }
+            | Event::TurnStarted { .. }
+            | Event::Steered { .. }
             | Event::ModelDelta { .. }
             | Event::ModelCancelled
             | Event::Error { .. } => {}
@@ -151,6 +175,7 @@ fn close_unfinished(events: &[Event]) -> Vec<Event> {
         .collect();
     out.push(Event::TurnEnded {
         reason: TurnEndReason::Aborted,
+        interrupt,
     });
     out
 }
@@ -162,34 +187,65 @@ struct Run<'a> {
     history: History,
     ctx: Arc<ToolCtx>,
     turn: Option<Turn>,
+    /// Messages waiting for a turn of their own: `(id, text)`.
+    queue: VecDeque<(String, String)>,
     tx: Tx,
 }
 
 impl Run<'_> {
-    async fn handle(&mut self, ev: Event) {
-        match &ev {
-            Event::UserMessage { .. } => {
-                self.record(&ev).await;
-                match &mut self.turn {
-                    Some(t) => t.steered = true,
-                    None => {
-                        self.turn = Some(Turn {
-                            token: CancellationToken::new(),
-                            pending: Vec::new(),
-                            steered: false,
-                            interrupted: false,
-                        });
-                        self.call_model();
-                    }
+    /// An event a user appended, with its id.
+    async fn input(&mut self, id: String, ev: Event) {
+        match ev {
+            Event::UserMessage { text } => {
+                if self.turn.is_none() {
+                    self.queue.push_back((id, text));
+                    return;
+                }
+                info!("user message (steers the turn)");
+                self.session.publish(&Event::Steered { input: id }).await;
+                self.history.push(&Event::UserMessage { text });
+                if let Some(t) = &mut self.turn {
+                    t.steered = true;
                 }
             }
-            Event::UserInterrupt { .. } => {
-                self.record(&ev).await;
-                if let Some(t) = &mut self.turn {
+            Event::UserInterrupt { turn } => match &mut self.turn {
+                Some(t) if t.id == turn && t.interrupt.is_none() => {
+                    info!("user interrupt");
+                    t.interrupt = Some(id);
                     t.interrupted = true;
                     t.token.cancel();
                 }
-            }
+                _ => info!("ignoring an interrupt for a turn that isn't running"),
+            },
+            other => warn!(?other, "ignoring an event users don't send"),
+        }
+    }
+
+    /// Start a turn on the next queued message, if idle.
+    async fn next_turn(&mut self) {
+        if self.turn.is_some() {
+            return;
+        }
+        let Some((input, text)) = self.queue.pop_front() else {
+            return;
+        };
+        info!("user message (starts a turn)");
+        let id = self.session.publish(&Event::TurnStarted { input }).await;
+        self.history.push(&Event::UserMessage { text });
+        self.turn = Some(Turn {
+            id,
+            token: CancellationToken::new(),
+            pending: Vec::new(),
+            steered: false,
+            interrupted: false,
+            interrupt: None,
+        });
+        self.call_model();
+    }
+
+    /// An outcome of the model or tools tasks.
+    async fn handle(&mut self, ev: Event) {
+        match &ev {
             Event::ModelDelta { .. } => {
                 if self.turn.is_some() {
                     self.session.publish(&ev).await;
@@ -241,8 +297,12 @@ impl Run<'_> {
                     self.call_model();
                 }
             }
-            // Produced by this loop, never received.
-            Event::TurnEnded { .. } => {}
+            // Users' events and the loop's own decisions; never outcomes.
+            Event::UserMessage { .. }
+            | Event::UserInterrupt { .. }
+            | Event::TurnStarted { .. }
+            | Event::Steered { .. }
+            | Event::TurnEnded { .. } => {}
         }
     }
 
@@ -254,8 +314,8 @@ impl Run<'_> {
     }
 
     async fn end_turn(&mut self, reason: TurnEndReason) {
-        self.record(&Event::TurnEnded { reason }).await;
-        self.turn = None;
+        let interrupt = self.turn.take().and_then(|t| t.interrupt);
+        self.record(&Event::TurnEnded { reason, interrupt }).await;
     }
 
     fn call_model(&mut self) {
@@ -429,8 +489,6 @@ async fn run_one(
 
 fn log_event(ev: &Event) {
     match ev {
-        Event::UserMessage { .. } => info!("user message"),
-        Event::UserInterrupt { .. } => info!("user interrupt"),
         Event::AssistantMessage { content, usage, .. } => {
             let text = crate::provider::Message::assistant(content.clone()).text();
             let calls = content
@@ -447,11 +505,16 @@ fn log_event(ev: &Event) {
         }
         Event::ModelCancelled => info!("model call cancelled"),
         Event::Error { message, .. } => warn!("error: {message}"),
-        Event::TurnEnded { reason } => match reason {
+        Event::TurnEnded { reason, .. } => match reason {
             TurnEndReason::Completed => info!("turn completed"),
             other => warn!("turn ended: {other:?}"),
         },
-        Event::ToolResult { .. } | Event::ModelDelta { .. } => {}
+        Event::UserMessage { .. }
+        | Event::UserInterrupt { .. }
+        | Event::TurnStarted { .. }
+        | Event::Steered { .. }
+        | Event::ToolResult { .. }
+        | Event::ModelDelta { .. } => {}
     }
 }
 
@@ -488,24 +551,29 @@ mod tests {
         effort: None,
     };
 
-    /// In-memory session: a log to resume from, inputs from a channel, published events
-    /// into a Vec.
+    type Published = Arc<Mutex<Vec<(String, Event)>>>;
+
+    /// In-memory session: a log to resume from, user events from a channel, published events
+    /// (with the ids they got, `p0`, `p1`, …) into a Vec.
     struct TestSession {
-        log: Vec<Event>,
-        inbox: mpsc::Receiver<Event>,
-        published: Arc<Mutex<Vec<Event>>>,
+        log: Vec<(String, Event)>,
+        inbox: mpsc::Receiver<(String, Event)>,
+        published: Published,
     }
 
     #[async_trait]
     impl Session for TestSession {
-        async fn load(&mut self) -> anyhow::Result<Vec<Event>> {
+        async fn load(&mut self) -> anyhow::Result<Vec<(String, Event)>> {
             Ok(std::mem::take(&mut self.log))
         }
-        async fn recv(&mut self) -> Option<Event> {
+        async fn recv(&mut self) -> Option<(String, Event)> {
             self.inbox.recv().await
         }
-        async fn publish(&mut self, event: &Event) {
-            self.published.lock().unwrap().push(event.clone());
+        async fn publish(&mut self, event: &Event) -> String {
+            let mut published = self.published.lock().unwrap();
+            let id = format!("p{}", published.len());
+            published.push((id.clone(), event.clone()));
+            id
         }
     }
 
@@ -513,8 +581,8 @@ mod tests {
         _dir: tempfile::TempDir,
         workdir: &'static Path,
         provider: Arc<MockProvider>,
-        published: Arc<Mutex<Vec<Event>>>,
-        tx: mpsc::Sender<Event>,
+        published: Published,
+        tx: mpsc::Sender<(String, Event)>,
         task: tokio::task::JoinHandle<anyhow::Result<()>>,
     }
 
@@ -523,7 +591,7 @@ mod tests {
     }
 
     /// A harness whose session's log already has `log`.
-    fn resumed(log: Vec<Event>) -> Harness {
+    fn resumed(log: Vec<(String, Event)>) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let workdir: &'static Path =
             Box::leak(dir.path().canonicalize().unwrap().into_boxed_path());
@@ -553,31 +621,39 @@ mod tests {
     }
 
     impl Harness {
+        /// A user message, whose id is `in-<text>`.
         async fn send(&self, text: &str) {
-            self.tx
-                .send(Event::UserMessage {
-                    input_id: format!("in-{text}"),
-                    text: text.into(),
-                })
-                .await
-                .unwrap();
+            let ev = Event::UserMessage { text: text.into() };
+            self.tx.send((format!("in-{text}"), ev)).await.unwrap();
         }
 
+        /// A user interrupt for the turn started last.
         async fn interrupt(&self) {
-            self.tx
-                .send(Event::UserInterrupt {
-                    input_id: "in-interrupt".into(),
-                })
-                .await
-                .unwrap();
+            let turn = self
+                .published
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(_, e)| matches!(e, Event::TurnStarted { .. }))
+                .map_or("no-turn".to_string(), |(id, _)| id.clone());
+            self.interrupt_turn(&turn).await;
+        }
+
+        async fn interrupt_turn(&self, turn: &str) {
+            let ev = Event::UserInterrupt { turn: turn.into() };
+            self.tx.send(("in-interrupt".into(), ev)).await.unwrap();
+        }
+
+        fn events(&self) -> Vec<Event> {
+            let published = self.published.lock().unwrap();
+            published.iter().map(|(_, e)| e.clone()).collect()
         }
 
         /// Wait until `turns` turns have ended, then disconnect the client.
         async fn finish(self, turns: usize) -> (Vec<String>, Vec<Request>) {
             let ended = || {
-                self.published
-                    .lock()
-                    .unwrap()
+                self.events()
                     .iter()
                     .filter(|e| matches!(e, Event::TurnEnded { .. }))
                     .count()
@@ -590,21 +666,41 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            drop(self.tx);
-            self.task.await.unwrap().unwrap();
-            let kinds = render(&self.published.lock().unwrap());
-            (kinds, self.provider.requests())
+            let Harness {
+                tx,
+                task,
+                published,
+                provider,
+                ..
+            } = self;
+            drop(tx);
+            task.await.unwrap().unwrap();
+            let events: Vec<_> = published
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, e)| e.clone())
+                .collect();
+            (render(&events), provider.requests())
         }
     }
 
-    /// Compact rendering of the published events: `kind:detail`.
+    /// The text of a message whose id is `<prefix>-<text>`, as the tests make them.
+    fn text_of(input: &str) -> &str {
+        input.split_once('-').map_or(input, |(_, text)| text)
+    }
+
+    /// Compact rendering of the published events: `kind:detail`. A turn's start shows the
+    /// message it took, as `user:<text>`.
     fn render(events: &[Event]) -> Vec<String> {
         events
             .iter()
             .filter(|e| !matches!(e, Event::ModelDelta { .. }))
             .map(|e| match e {
-                Event::UserMessage { text, .. } => format!("user:{text}"),
+                Event::UserMessage { text } => format!("user:{text}"),
                 Event::UserInterrupt { .. } => "interrupt".into(),
+                Event::TurnStarted { input } => format!("user:{}", text_of(input)),
+                Event::Steered { input } => format!("steer:{}", text_of(input)),
                 Event::AssistantMessage { content, .. } => {
                     let m = crate::provider::Message::assistant(content.clone());
                     let calls = content
@@ -625,7 +721,7 @@ mod tests {
                     content.lines().next().unwrap_or("")
                 ),
                 Event::Error { message, .. } => format!("error:{message}"),
-                Event::TurnEnded { reason } => format!("end:{reason:?}"),
+                Event::TurnEnded { reason, .. } => format!("end:{reason:?}"),
                 Event::ModelDelta { .. } => unreachable!("filtered"),
             })
             .collect()
@@ -673,7 +769,12 @@ mod tests {
         h.send("hi").await;
         let published = h.published.clone();
         let (_, _) = h.finish(1).await;
-        let events = published.lock().unwrap();
+        let events: Vec<_> = published
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect();
         let deltas: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
@@ -711,7 +812,7 @@ mod tests {
             kinds,
             vec![
                 "user:m1",
-                "user:m2",
+                "steer:m2",
                 "assistant:r1",
                 "assistant:r2",
                 "end:Completed"
@@ -861,12 +962,18 @@ mod tests {
         h.interrupt().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         h.send("b").await;
+        let published = h.published.clone();
         let (kinds, reqs) = h.finish(2).await;
+        // the turn's end names the interrupt that ended it
+        assert!(published.lock().unwrap().iter().any(|(_, e)| *e
+            == Event::TurnEnded {
+                reason: TurnEndReason::Aborted,
+                interrupt: Some("in-interrupt".into())
+            }));
         assert_eq!(
             kinds,
             vec![
                 "user:a",
-                "interrupt",
                 "cancelled",
                 "end:Aborted",
                 "user:b",
@@ -909,7 +1016,6 @@ mod tests {
             vec![
                 "user:go",
                 "assistant:+tool",
-                "interrupt",
                 "tool:Bash:err:Command aborted by user interrupt",
                 "end:Aborted",
                 "user:next",
@@ -929,15 +1035,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupt_while_idle_is_published_and_ignored() {
+    async fn an_interrupt_for_another_turn_is_ignored() {
         let h = harness();
-        h.provider.reset([Script::text("r", Duration::ZERO)]);
+        h.provider.reset([
+            Script::text("r1", Duration::ZERO),
+            Script::text("r2", Duration::from_millis(200)),
+        ]);
         h.interrupt().await;
         h.send("a").await;
-        let (kinds, _) = h.finish(1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        h.send("b").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // the first turn's, arriving while the second runs
+        h.interrupt_turn("p0").await;
+        let (kinds, _) = h.finish(2).await;
         assert_eq!(
             kinds,
-            vec!["interrupt", "user:a", "assistant:r", "end:Completed"]
+            vec![
+                "user:a",
+                "assistant:r1",
+                "end:Completed",
+                "user:b",
+                "assistant:r2",
+                "end:Completed"
+            ]
         );
     }
 
@@ -967,10 +1088,7 @@ mod tests {
     }
 
     fn logged_user(text: &str) -> Event {
-        Event::UserMessage {
-            input_id: format!("old-{text}"),
-            text: text.into(),
-        }
+        Event::UserMessage { text: text.into() }
     }
 
     fn logged_call(id: &str, name: &str) -> Event {
@@ -995,44 +1113,81 @@ mod tests {
         }
     }
 
+    fn logged_reply(text: &str) -> Event {
+        Event::AssistantMessage {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        }
+    }
+
     fn ended(reason: TurnEndReason) -> Event {
-        Event::TurnEnded { reason }
+        Event::TurnEnded {
+            reason,
+            interrupt: None,
+        }
+    }
+
+    /// A message a user logged, with the id `old-<text>`.
+    fn sent(text: &str) -> (String, Event) {
+        (format!("old-{text}"), logged_user(text))
+    }
+
+    /// The player taking the message `text` for a turn whose id is `t-<text>`.
+    fn started(text: &str) -> (String, Event) {
+        let input = format!("old-{text}");
+        (format!("t-{text}"), Event::TurnStarted { input })
+    }
+
+    /// The player's other logged events, with ids of their own.
+    fn by_player(events: Vec<Event>) -> Vec<(String, Event)> {
+        events
+            .into_iter()
+            .enumerate()
+            .map(|(n, e)| (format!("old-player-{n}"), e))
+            .collect()
     }
 
     #[test]
     fn a_finished_log_needs_no_closing() {
-        assert!(close_unfinished(&[]).is_empty());
-        assert!(close_unfinished(&[
-            logged_user("a"),
-            logged_call("c1", "Read"),
-            logged_result("c1"),
-            ended(TurnEndReason::Completed),
-        ])
+        assert!(close_unfinished(&[], None).is_empty());
+        assert!(close_unfinished(
+            &[
+                logged_user("a"),
+                logged_call("c1", "Read"),
+                logged_result("c1"),
+                ended(TurnEndReason::Completed),
+            ],
+            None
+        )
         .is_empty());
     }
 
     #[test]
     fn an_open_turn_gets_aborted_results_then_ends() {
-        let closing = close_unfinished(&[
-            logged_user("a"),
-            Event::AssistantMessage {
-                content: vec![
-                    ContentBlock::ToolCall {
-                        id: "c1".into(),
-                        name: "Read".into(),
-                        input: json!({}),
-                    },
-                    ContentBlock::ToolCall {
-                        id: "c2".into(),
-                        name: "Bash".into(),
-                        input: json!({}),
-                    },
-                ],
-                stop_reason: StopReason::ToolUse,
-                usage: Usage::default(),
-            },
-            logged_result("c1"),
-        ]);
+        let closing = close_unfinished(
+            &[
+                logged_user("a"),
+                Event::AssistantMessage {
+                    content: vec![
+                        ContentBlock::ToolCall {
+                            id: "c1".into(),
+                            name: "Read".into(),
+                            input: json!({}),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "c2".into(),
+                            name: "Bash".into(),
+                            input: json!({}),
+                        },
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage::default(),
+                },
+                logged_result("c1"),
+            ],
+            None,
+        );
         assert_eq!(
             render(&closing),
             vec![
@@ -1040,24 +1195,24 @@ mod tests {
                 "end:Aborted".to_string()
             ]
         );
-        // a turn cut off before any reply just ends
+        // a turn cut off before any reply just ends, naming the interrupt it got
         assert_eq!(
-            render(&close_unfinished(&[logged_user("a")])),
-            vec!["end:Aborted"]
+            close_unfinished(&[logged_user("a")], Some("i1".into())),
+            vec![Event::TurnEnded {
+                reason: TurnEndReason::Aborted,
+                interrupt: Some("i1".into())
+            }]
         );
     }
 
     #[tokio::test]
     async fn resume_continues_the_logged_conversation() {
-        let h = resumed(vec![
-            logged_user("first"),
-            Event::AssistantMessage {
-                content: vec![ContentBlock::Text { text: "r1".into() }],
-                stop_reason: StopReason::EndTurn,
-                usage: Usage::default(),
-            },
+        let mut log = vec![sent("first"), started("first")];
+        log.extend(by_player(vec![
+            logged_reply("r1"),
             ended(TurnEndReason::Completed),
-        ]);
+        ]));
+        let h = resumed(log);
         h.provider.reset([Script::text("r2", Duration::ZERO)]);
         h.send("second").await;
         let (kinds, reqs) = h.finish(1).await;
@@ -1068,9 +1223,18 @@ mod tests {
 
     #[tokio::test]
     async fn resume_mid_tool_call_closes_the_turn_first() {
-        let h = resumed(vec![logged_user("go"), logged_call("c1", "Bash")]);
+        let mut log = vec![sent("go"), started("go")];
+        log.extend(by_player(vec![logged_call("c1", "Bash")]));
+        log.push((
+            "old-interrupt".into(),
+            Event::UserInterrupt {
+                turn: "t-go".into(),
+            },
+        ));
+        let h = resumed(log);
         h.provider.reset([Script::text("again", Duration::ZERO)]);
         h.send("retry").await;
+        let published = h.published.clone();
         let (kinds, reqs) = h.finish(2).await;
         assert_eq!(
             kinds,
@@ -1081,6 +1245,14 @@ mod tests {
                 "assistant:again".into(),
                 "end:Completed".into(),
             ]
+        );
+        // the closing end names the interrupt the log had for that turn
+        assert_eq!(
+            published.lock().unwrap()[1].1,
+            Event::TurnEnded {
+                reason: TurnEndReason::Aborted,
+                interrupt: Some("old-interrupt".into())
+            }
         );
         // a valid conversation: the call, its aborted result, the marker and the new message
         let m = &reqs[0].messages;
@@ -1102,5 +1274,34 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn messages_the_log_left_queued_get_a_turn_each() {
+        let mut log = vec![sent("first"), started("first")];
+        log.extend(by_player(vec![
+            logged_reply("r1"),
+            ended(TurnEndReason::Completed),
+        ]));
+        log.extend([sent("one"), sent("two")]);
+        let h = resumed(log);
+        h.provider.reset([
+            Script::text("r2", Duration::ZERO),
+            Script::text("r3", Duration::ZERO),
+        ]);
+        let (kinds, reqs) = h.finish(2).await;
+        assert_eq!(
+            kinds,
+            vec![
+                "user:one",
+                "assistant:r2",
+                "end:Completed",
+                "user:two",
+                "assistant:r3",
+                "end:Completed"
+            ]
+        );
+        let hist: Vec<_> = reqs[1].messages.iter().map(|m| m.text()).collect();
+        assert_eq!(hist, vec!["first", "r1", "one", "r2", "two"]);
     }
 }

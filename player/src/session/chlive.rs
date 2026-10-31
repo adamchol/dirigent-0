@@ -1,26 +1,25 @@
-//! A session in the event system: the log and the inputs are read through chlive, every event is
-//! written to Kafka, keyed by the session id (see `dirigent_protocol::rows`).
+//! A session in the event system: the log is read through chlive, and every event is appended
+//! to Kafka, keyed by the session id (see `dirigent_protocol::rows`).
 //!
-//! - `load` reads the log (chlive's snapshot is everything in Kafka at subscribe time), then
-//!   subscribes to the inputs: those the log doesn't have yet come first, then new ones.
-//! - `publish` logs each event with the next `seq`, waiting for Kafka's ack. Deltas go to their
-//!   own topic without waiting, tagged with the seq of the last logged event.
+//! - `load` subscribes to the log: chlive's snapshot is everything in Kafka at subscribe time,
+//!   and the subscription goes on with what's appended after it.
+//! - `recv` passes on what users append; the player's own rows coming back are dropped by id,
+//!   since the loop already applied them.
+//! - `publish` waits for Kafka's ack, except for deltas, which aren't read back.
 
-use std::collections::{HashSet, VecDeque};
-use std::time::{Duration, SystemTime};
+use std::collections::HashSet;
+use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use chlive_client::{ClientOptions, Events, LiveClient, Query};
+use chlive_client::{ClientOptions, Events, LiveClient};
 use futures::StreamExt;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::ClientConfig;
 use tracing::{error, warn};
 
 use super::Session;
-use dirigent_protocol::rows::{
-    timestamp, DeltaRow, EventRow, InputRow, DELTAS, EVENTS, EVENTS_QUERY, INPUTS_QUERY,
-};
+use dirigent_protocol::rows::{EventRow, EVENTS, LOG_QUERY, PLAYER};
 use dirigent_protocol::Event;
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -29,13 +28,10 @@ pub struct ChliveSession {
     id: String,
     client: LiveClient,
     producer: FutureProducer,
-    next_seq: u64,
-    /// Inputs already in the log.
-    handled: HashSet<String>,
-    /// Inputs sent before `load` that the log doesn't have, oldest first.
-    pending: VecDeque<Event>,
-    /// Inputs sent after `load`; `None` before it and once they've ended.
-    inputs: Option<Events<InputRow>>,
+    /// Rows this player appended that haven't come back yet.
+    own: HashSet<String>,
+    /// The log after `load`; `None` before it and once it's ended.
+    log: Option<Events<EventRow>>,
 }
 
 impl ChliveSession {
@@ -52,119 +48,75 @@ impl ChliveSession {
             id: id.to_string(),
             client: LiveClient::new(ClientOptions::new(chlive_url)),
             producer,
-            next_seq: 0,
-            handled: HashSet::new(),
-            pending: VecDeque::new(),
-            inputs: None,
+            own: HashSet::new(),
+            log: None,
         })
-    }
-
-    fn query(&self, sql: &str) -> Query {
-        self.client.query(sql).param("session", &self.id)
-    }
-
-    /// The event for an input the log doesn't have yet.
-    fn input(&self, row: &InputRow) -> Option<Event> {
-        if self.handled.contains(&row.input_id) {
-            return None;
-        }
-        match row.event() {
-            Ok(ev) => Some(ev),
-            Err(e) => {
-                warn!(input = row.input_id, "skipping input: {e}");
-                None
-            }
-        }
-    }
-
-    fn record<'a>(&'a self, topic: &'a str, payload: &'a str) -> FutureRecord<'a, str, str> {
-        FutureRecord::to(topic)
-            .key(self.id.as_str())
-            .payload(payload)
     }
 }
 
 #[async_trait]
 impl Session for ChliveSession {
-    async fn load(&mut self) -> anyhow::Result<Vec<Event>> {
-        let log = self
-            .query(EVENTS_QUERY)
-            .fetch::<EventRow>()
+    async fn load(&mut self) -> anyhow::Result<Vec<(String, Event)>> {
+        let (rows, live) = self
+            .client
+            .query(LOG_QUERY)
+            .param("session", &self.id)
+            .history::<EventRow>()
             .await
-            .context("reading the session's log")?;
-        let mut events = Vec::with_capacity(log.len());
-        for row in log.iter() {
+            .context("subscribing to the session's log")?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
             let ev = row
                 .event()
-                .with_context(|| format!("event {} of the log", row.seq))?;
-            if let Event::UserMessage { input_id, .. } | Event::UserInterrupt { input_id } = &ev {
-                self.handled.insert(input_id.clone());
-            }
-            events.push(ev);
+                .with_context(|| format!("the log's row at offset {}", row.offset))?;
+            events.push((row.id.clone(), ev));
         }
-        self.next_seq = log.last().map_or(0, |r| r.seq + 1);
-
-        let (sent, new) = self
-            .query(INPUTS_QUERY)
-            .history::<InputRow>()
-            .await
-            .context("subscribing to the session's inputs")?;
-        let pending: Vec<Event> = sent.iter().filter_map(|row| self.input(row)).collect();
-        self.pending.extend(pending);
-        self.inputs = Some(new);
+        self.log = Some(live);
         Ok(events)
     }
 
-    async fn recv(&mut self) -> Option<Event> {
+    async fn recv(&mut self) -> Option<(String, Event)> {
         loop {
-            if let Some(ev) = self.pending.pop_front() {
-                return Some(ev);
-            }
-            let row = match self.inputs.as_mut()?.next().await {
+            let row = match self.log.as_mut()?.next().await {
                 Some(Ok(row)) => row,
                 Some(Err(e)) => {
-                    error!("the inputs subscription failed: {e}");
-                    self.inputs = None;
+                    error!("the log subscription failed: {e}");
+                    self.log = None;
                     return None;
                 }
                 None => {
-                    self.inputs = None;
+                    self.log = None;
                     return None;
                 }
             };
-            if let Some(ev) = self.input(&row) {
-                return Some(ev);
+            if self.own.remove(&row.id) {
+                continue;
+            }
+            match row.event() {
+                Ok(ev) => return Some((row.id.clone(), ev)),
+                Err(e) => warn!(offset = row.offset, "skipping a row: {e}"),
             }
         }
     }
 
-    async fn publish(&mut self, event: &Event) {
-        let ts = timestamp(SystemTime::now());
-        if let Event::ModelDelta { delta } = event {
-            let row = DeltaRow::new(&self.id, self.next_seq.saturating_sub(1), ts, delta);
-            let payload = serde_json::to_string(&row).expect("rows serialize");
-            if let Err((e, _)) = self.producer.send_result(self.record(DELTAS, &payload)) {
+    async fn publish(&mut self, event: &Event) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = EventRow::new(&self.id, id.clone(), PLAYER, event);
+        let payload = serde_json::to_string(&row).expect("rows serialize");
+        let record = FutureRecord::to(EVENTS)
+            .key(self.id.as_str())
+            .payload(&payload);
+        if let Event::ModelDelta { .. } = event {
+            if let Err((e, _)) = self.producer.send_result(record) {
                 warn!("dropping a delta: {e}");
             }
-            return;
+            return id;
         }
-        if let Event::UserMessage { input_id, .. } | Event::UserInterrupt { input_id } = event {
-            self.handled.insert(input_id.clone());
+        self.own.insert(id.clone());
+        if let Err((e, _)) = self.producer.send(record, SEND_TIMEOUT).await {
+            error!(kind = row.kind, "could not append an event: {e}");
         }
-        let row = EventRow::new(&self.id, self.next_seq, ts, event);
-        self.next_seq += 1;
-        let payload = serde_json::to_string(&row).expect("rows serialize");
-        if let Err((e, _)) = self
-            .producer
-            .send(self.record(EVENTS, &payload), SEND_TIMEOUT)
-            .await
-        {
-            error!(
-                seq = row.seq,
-                kind = row.kind,
-                "could not log an event: {e}"
-            );
-        }
+        id
     }
 }
 
@@ -176,7 +128,7 @@ mod e2e {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use dirigent_protocol::rows::{InputRow, INPUTS};
+    use dirigent_protocol::rows::USER;
     use dirigent_protocol::{ContentBlock, TurnEndReason};
     use tokio::task::JoinHandle;
 
@@ -200,7 +152,7 @@ mod e2e {
         })
     }
 
-    fn new_session() -> String {
+    fn new_id() -> String {
         uuid::Uuid::new_v4().to_string()
     }
 
@@ -251,11 +203,12 @@ mod e2e {
             }
         }
 
-        async fn send(&self, row: InputRow) {
+        async fn send(&self, event: Event) {
+            let row = EventRow::new(&self.session, new_id(), USER, &event);
             let payload = serde_json::to_string(&row).unwrap();
             self.producer
                 .send(
-                    FutureRecord::to(INPUTS)
+                    FutureRecord::to(EVENTS)
                         .key(&self.session)
                         .payload(&payload),
                     SEND_TIMEOUT,
@@ -266,20 +219,11 @@ mod e2e {
         }
 
         async fn say(&self, text: &str) {
-            let ts = timestamp(SystemTime::now());
-            self.send(InputRow::message(
-                &self.session,
-                new_session(),
-                ts,
-                text.into(),
-            ))
-            .await;
+            self.send(Event::UserMessage { text: text.into() }).await;
         }
 
-        async fn interrupt(&self) {
-            let ts = timestamp(SystemTime::now());
-            self.send(InputRow::interrupt(&self.session, new_session(), ts))
-                .await;
+        async fn interrupt(&self, turn: &str) {
+            self.send(Event::UserInterrupt { turn: turn.into() }).await;
         }
     }
 
@@ -291,7 +235,7 @@ mod e2e {
     ) -> Vec<EventRow> {
         let client = LiveClient::new(ClientOptions::new(&stack.chlive));
         let mut rows = client
-            .query(EVENTS_QUERY)
+            .query(LOG_QUERY)
             .param("session", session)
             .rows::<EventRow>();
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -318,7 +262,7 @@ mod e2e {
     fn kinds(rows: &[EventRow]) -> Vec<String> {
         rows.iter()
             .map(|r| match r.event().unwrap() {
-                Event::UserMessage { text, .. } => format!("user:{text}"),
+                Event::UserMessage { text } => format!("user:{text}"),
                 Event::AssistantMessage { content, .. } => {
                     let calls = content
                         .iter()
@@ -333,20 +277,26 @@ mod e2e {
                 Event::ToolResult { is_error, .. } => {
                     format!("tool:{}", if is_error { "err" } else { "ok" })
                 }
-                Event::TurnEnded { reason } => format!("end:{reason:?}"),
+                Event::TurnEnded { reason, .. } => format!("end:{reason:?}"),
                 _ => r.kind.clone(),
             })
             .collect()
     }
 
-    fn seqs(rows: &[EventRow]) -> Vec<u64> {
-        rows.iter().map(|r| r.seq).collect()
+    /// Every row has the Kafka fields, in offset order, also when it came live.
+    fn assert_kafka_fields(rows: &[EventRow]) {
+        assert!(
+            rows.windows(2).all(|w| w[0].offset < w[1].offset),
+            "offsets out of order: {:?}",
+            rows.iter().map(|r| r.offset).collect::<Vec<_>>()
+        );
+        assert!(rows.iter().all(|r| !r.ts.is_empty()), "a row has no ts");
     }
 
     #[tokio::test]
     async fn e2e_a_reply_then_a_resumed_player_continues() {
         let Some(stack) = stack() else { return };
-        let session = new_session();
+        let session = new_id();
         let user = User::new(&stack, &session);
 
         let first = start(&stack, &session);
@@ -356,25 +306,27 @@ mod e2e {
             kinds(&log),
             vec![
                 "user:hello there",
+                "turn_started",
                 "assistant:mock reply #1 to: hello there",
                 "end:Completed"
             ]
         );
-        assert_eq!(seqs(&log), vec![0, 1, 2]);
+        assert_kafka_fields(&log);
         first.task.abort();
 
         let second = start(&stack, &session);
         user.say("again").await;
         let log = log_until(&stack, &session, |r| turns_ended(r) == 2).await;
-        assert_eq!(seqs(&log), (0..6).collect::<Vec<_>>());
         assert_eq!(
-            kinds(&log)[3..],
+            kinds(&log)[4..],
             [
                 "user:again",
+                "turn_started",
                 "assistant:mock reply #1 to: again",
                 "end:Completed"
             ]
         );
+        assert_kafka_fields(&log);
         // the resumed player's model saw the first exchange
         let reqs = second.provider.requests();
         let texts: Vec<_> = reqs[0].messages.iter().map(|m| m.text()).collect();
@@ -386,18 +338,24 @@ mod e2e {
     }
 
     #[tokio::test]
-    async fn e2e_inputs_sent_before_the_player_starts_are_taken() {
+    async fn e2e_messages_sent_before_the_player_starts_get_a_turn_each() {
         let Some(stack) = stack() else { return };
-        let session = new_session();
+        let session = new_id();
         let user = User::new(&stack, &session);
-        user.say("early").await;
+        user.say("one").await;
+        user.say("two").await;
         let player = start(&stack, &session);
-        let log = log_until(&stack, &session, |r| turns_ended(r) == 1).await;
+        let log = log_until(&stack, &session, |r| turns_ended(r) == 2).await;
         assert_eq!(
             kinds(&log),
             vec![
-                "user:early",
-                "assistant:mock reply #1 to: early",
+                "user:one",
+                "user:two",
+                "turn_started",
+                "assistant:mock reply #1 to: one",
+                "end:Completed",
+                "turn_started",
+                "assistant:mock reply #2 to: two",
                 "end:Completed"
             ]
         );
@@ -407,23 +365,25 @@ mod e2e {
     #[tokio::test]
     async fn e2e_an_interrupt_aborts_a_running_command() {
         let Some(stack) = stack() else { return };
-        let session = new_session();
+        let session = new_id();
         let user = User::new(&stack, &session);
         let player = start(&stack, &session);
         user.say("!sleep 30").await;
-        log_until(&stack, &session, |r| {
+        let log = log_until(&stack, &session, |r| {
             r.iter().any(|r| r.kind == "assistant_message")
         })
         .await;
+        let turn = log.iter().find(|r| r.kind == "turn_started").unwrap();
         let started = Instant::now();
-        user.interrupt().await;
+        user.interrupt(&turn.id).await;
         let log = log_until(&stack, &session, |r| turns_ended(r) == 1).await;
         assert!(started.elapsed() < Duration::from_secs(20));
-        let last = log.last().unwrap().event().unwrap();
+        let interrupt = log.iter().find(|r| r.kind == "user_interrupt").unwrap();
         assert_eq!(
-            last,
+            log.last().unwrap().event().unwrap(),
             Event::TurnEnded {
-                reason: TurnEndReason::Aborted
+                reason: TurnEndReason::Aborted,
+                interrupt: Some(interrupt.id.clone()),
             }
         );
         assert!(kinds(&log).contains(&"tool:err".to_string()));

@@ -6,7 +6,7 @@ description = "Terminal client for a dirigent session"
 
 [dependencies]
 dirigent-protocol = { path = "../protocol" }
-chlive-client = { git = "https://github.com/dialohq/chlive", branch = "all-in" }
+chlive-client = { git = "https://github.com/dialohq/chlive", branch = "master" }
 rdkafka = { version = "0.39", default-features = false, features = ["tokio", "dynamic-linking"] }
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
