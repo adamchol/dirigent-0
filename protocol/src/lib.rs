@@ -115,8 +115,13 @@ pub enum Event {
     },
     /// From the model task: the call was cancelled before it finished.
     ModelCancelled,
-    /// From the model task: the call failed.
-    Error { message: String, retryable: bool },
+    /// From the model task: the call failed. With `retry_in_ms`, the task calls again after that
+    /// long and the turn goes on; without, the turn fails.
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_in_ms: Option<u64>,
+    },
     /// From the tools task.
     ToolResult {
         call_id: String,

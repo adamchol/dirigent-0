@@ -112,9 +112,19 @@ impl App {
                 self.live.clear();
                 self.push(Line::from("model call cancelled").dim());
             }
-            Event::Error { message, .. } => {
+            Event::Error {
+                message,
+                retry_in_ms,
+            } => {
                 self.live.clear();
-                self.push(Line::from(format!("error: {message}")).red());
+                self.push(match retry_in_ms {
+                    Some(ms) => Line::from(format!(
+                        "error: {message} · retrying in {:.1}s",
+                        ms as f64 / 1000.0
+                    ))
+                    .yellow(),
+                    None => Line::from(format!("error: {message}")).red(),
+                });
             }
             Event::ToolResult {
                 name,
@@ -484,7 +494,7 @@ mod tests {
                 Event::ModelCancelled,
                 Event::Error {
                     message: "boom".into(),
-                    retryable: false,
+                    retry_in_ms: None,
                 },
                 Event::TurnEnded {
                     reason: TurnEndReason::Aborted,

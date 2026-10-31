@@ -247,7 +247,7 @@ mod tests {
             Event::ModelCancelled,
             Event::Error {
                 message: "x".into(),
-                retryable: true,
+                retry_in_ms: None,
             },
             ended(TurnEndReason::Failed),
         ];
@@ -282,7 +282,7 @@ mod tests {
             user("a"),
             Event::Error {
                 message: "x".into(),
-                retryable: true,
+                retry_in_ms: None,
             },
             ended(TurnEndReason::Failed),
             user("b"),

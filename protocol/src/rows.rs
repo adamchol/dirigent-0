@@ -149,7 +149,7 @@ mod tests {
             Event::ModelCancelled,
             Event::Error {
                 message: "boom".into(),
-                retryable: true,
+                retry_in_ms: Some(1000),
             },
             Event::ToolResult {
                 call_id: "c1".into(),

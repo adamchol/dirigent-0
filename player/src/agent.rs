@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::Value;
@@ -10,7 +11,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::history::History;
-use crate::provider::{Accumulator, ContentBlock, Effort, Provider, Request, StopReason};
+use crate::provider::{
+    Accumulator, ContentBlock, Effort, Provider, ProviderError, Request, StopReason,
+};
 use crate::session::Session;
 use crate::tools::{Registry, ToolCtx, ToolOutput};
 use dirigent_protocol::fold::Fold;
@@ -275,10 +278,12 @@ impl Run<'_> {
                     self.end_turn(TurnEndReason::Aborted).await;
                 }
             }
-            Event::Error { .. } => {
+            Event::Error { retry_in_ms, .. } => {
                 if self.turn.is_some() {
                     self.record(&ev).await;
-                    self.end_turn(TurnEndReason::Failed).await;
+                    if retry_in_ms.is_none() {
+                        self.end_turn(TurnEndReason::Failed).await;
+                    }
                 }
             }
             Event::ToolResult { call_id, .. } => {
@@ -336,45 +341,20 @@ impl Run<'_> {
             let send = |ev: Event| {
                 let _ = tx.send(ev);
             };
-            let opened = tokio::select! {
-                biased;
-                _ = token.cancelled() => { send(Event::ModelCancelled); return; }
-                r = provider.stream(&req) => r,
-            };
-            let mut stream = match opened {
-                Ok(s) => s,
-                Err(e) => {
-                    send(Event::Error {
-                        message: e.to_string(),
-                        retryable: e.retryable(),
-                    });
+            for attempt in 0.. {
+                let Err(e) = stream_reply(&*provider, &req, &token, &send).await else {
                     return;
-                }
-            };
-            let mut acc = Accumulator::default();
-            loop {
+                };
+                let wait = e.retryable().then(|| retry_delay(&e, attempt));
+                send(Event::Error {
+                    message: e.to_string(),
+                    retry_in_ms: wait.map(|d| d.as_millis() as u64),
+                });
+                let Some(wait) = wait else { return };
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => { send(Event::ModelCancelled); return; }
-                    item = stream.next() => match item {
-                        Some(Ok(delta)) => {
-                            acc.push(delta.clone());
-                            send(Event::ModelDelta { delta });
-                        }
-                        Some(Err(e)) => {
-                            send(Event::Error { message: e.to_string(), retryable: e.retryable() });
-                            return;
-                        }
-                        None => {
-                            let c = acc.finish();
-                            send(Event::AssistantMessage {
-                                content: c.message.content,
-                                stop_reason: c.stop_reason,
-                                usage: c.usage,
-                            });
-                            return;
-                        }
-                    }
+                    _ = tokio::time::sleep(wait) => {}
                 }
             }
         });
@@ -452,6 +432,53 @@ impl Run<'_> {
     }
 }
 
+/// One model call: its deltas, then the reply or `ModelCancelled`; the error if it fails.
+async fn stream_reply(
+    provider: &dyn Provider,
+    req: &Request,
+    token: &CancellationToken,
+    send: &impl Fn(Event),
+) -> Result<(), ProviderError> {
+    let mut stream = tokio::select! {
+        biased;
+        _ = token.cancelled() => { send(Event::ModelCancelled); return Ok(()); }
+        r = provider.stream(req) => r?,
+    };
+    let mut acc = Accumulator::default();
+    loop {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => { send(Event::ModelCancelled); return Ok(()); }
+            item = stream.next() => match item {
+                Some(delta) => {
+                    let delta = delta?;
+                    acc.push(delta.clone());
+                    send(Event::ModelDelta { delta });
+                }
+                None => {
+                    let c = acc.finish();
+                    send(Event::AssistantMessage {
+                        content: c.message.content,
+                        stop_reason: c.stop_reason,
+                        usage: c.usage,
+                    });
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// The provider's retry-after when it gave one, else 1s doubling per attempt up to a minute.
+fn retry_delay(e: &ProviderError, attempt: u32) -> Duration {
+    match e {
+        ProviderError::RateLimited {
+            retry_after: Some(d),
+        } => *d,
+        _ => Duration::from_secs(1 << attempt.min(6)).min(Duration::from_secs(60)),
+    }
+}
+
 fn tool_calls(content: &[ContentBlock]) -> Vec<Call> {
     content
         .iter()
@@ -504,6 +531,10 @@ fn log_event(ev: &Event) {
             );
         }
         Event::ModelCancelled => info!("model call cancelled"),
+        Event::Error {
+            message,
+            retry_in_ms: Some(ms),
+        } => warn!("error: {message}; retrying in {ms} ms"),
         Event::Error { message, .. } => warn!("error: {message}"),
         Event::TurnEnded { reason, .. } => match reason {
             TurnEndReason::Completed => info!("turn completed"),
@@ -720,6 +751,10 @@ mod tests {
                     if *is_error { "err" } else { "ok" },
                     content.lines().next().unwrap_or("")
                 ),
+                Event::Error {
+                    message,
+                    retry_in_ms: Some(ms),
+                } => format!("retry:{ms}:{message}"),
                 Event::Error { message, .. } => format!("error:{message}"),
                 Event::TurnEnded { reason, .. } => format!("end:{reason:?}"),
                 Event::ModelDelta { .. } => unreachable!("filtered"),
@@ -848,6 +883,75 @@ mod tests {
         assert_eq!(reqs[1].messages.len(), 3);
     }
 
+    fn overloaded() -> Script {
+        Script::Fail {
+            delay: Duration::ZERO,
+            error: ProviderError::Api {
+                status: 529,
+                message: "overloaded".into(),
+                retryable: true,
+            },
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retryable_errors_are_retried_with_backoff_until_a_reply() {
+        let h = harness();
+        h.provider.reset([
+            overloaded(),
+            Script::Fail {
+                delay: Duration::ZERO,
+                error: ProviderError::RateLimited {
+                    retry_after: Some(Duration::from_secs(7)),
+                },
+            },
+            overloaded(),
+            Script::text("ok now", Duration::ZERO),
+        ]);
+        h.send("a").await;
+        let (k, reqs) = h.finish(1).await;
+        assert_eq!(
+            k,
+            vec![
+                "user:a",
+                "retry:1000:api error 529: overloaded",
+                "retry:7000:rate limited (retry after Some(7s))",
+                "retry:4000:api error 529: overloaded",
+                "assistant:ok now",
+                "end:Completed",
+            ]
+        );
+        assert_eq!(reqs.len(), 4);
+        assert!(reqs.iter().all(|r| r.messages == reqs[0].messages));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupt_while_waiting_to_retry_aborts_the_turn() {
+        let h = harness();
+        h.provider.reset([overloaded()]);
+        h.send("a").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        h.interrupt().await;
+        let (k, reqs) = h.finish(1).await;
+        assert_eq!(
+            k,
+            vec![
+                "user:a",
+                "retry:1000:api error 529: overloaded",
+                "cancelled",
+                "end:Aborted",
+            ]
+        );
+        assert_eq!(reqs.len(), 1);
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_a_minute() {
+        let e = ProviderError::Stream("cut".into());
+        let delays: Vec<u64> = (0..9).map(|n| retry_delay(&e, n).as_secs()).collect();
+        assert_eq!(delays, vec![1, 2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+
     #[tokio::test]
     async fn provider_error_fails_turn_and_loop_continues() {
         let h = harness();
@@ -857,7 +961,7 @@ mod tests {
                 error: ProviderError::Api {
                     status: 500,
                     message: "boom".into(),
-                    retryable: true,
+                    retryable: false,
                 },
             },
             Script::text("ok now", Duration::ZERO),

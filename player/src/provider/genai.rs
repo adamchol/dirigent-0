@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use ::genai::chat::{
-    ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart, MessageContent,
-    ReasoningEffort, StopReason as GStop, StreamEnd, Tool, ToolCall, ToolResponse, Usage as GUsage,
+    CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart,
+    MessageContent, ReasoningEffort, StopReason as GStop, StreamEnd, Tool, ToolCall, ToolResponse,
+    Usage as GUsage,
 };
 use ::genai::resolver::{AuthData, Endpoint};
 use ::genai::{Client, ServiceTarget};
@@ -67,20 +68,41 @@ impl Provider for GenaiProvider {
 // Request mapping
 // ---------------------------------------------------------------------------
 
+/// Prompt cache breakpoints: the end of the static prefix (the tools, then the system prompt), the
+/// last message, and the message the previous call ended on (the one before the last reply), so
+/// the prefix that call cached is read back however many blocks were added since.
 pub fn to_chat_request(req: &Request) -> (ChatRequest, ChatOptions) {
+    let last = req.messages.len().checked_sub(1);
+    let previous = req
+        .messages
+        .iter()
+        .rposition(|m| m.role == Role::Assistant)
+        .and_then(|i| i.checked_sub(1));
     let mut messages: Vec<ChatMessage> = Vec::new();
-    for msg in &req.messages {
-        messages.extend(to_chat_messages(msg));
+    if let Some(system) = &req.system {
+        messages.push(ChatMessage::system(system.clone()).with_options(CacheControl::Ephemeral));
+    }
+    for (i, msg) in req.messages.iter().enumerate() {
+        let mut chat = to_chat_messages(msg);
+        if Some(i) == last || Some(i) == previous {
+            if let Some(m) = chat.last_mut() {
+                m.options = Some(CacheControl::Ephemeral.into());
+            }
+        }
+        messages.extend(chat);
     }
     let mut chat = ChatRequest::new(messages);
-    if let Some(system) = &req.system {
-        chat = chat.with_system(system.clone());
-    }
     if !req.tools.is_empty() {
-        chat = chat.with_tools(req.tools.iter().map(|t| {
-            Tool::new(t.name.clone())
+        let last_tool = req.tools.len() - 1;
+        chat = chat.with_tools(req.tools.iter().enumerate().map(|(i, t)| {
+            let tool = Tool::new(t.name.clone())
                 .with_description(t.description.clone())
-                .with_schema(t.input_schema.clone())
+                .with_schema(t.input_schema.clone());
+            if req.system.is_none() && i == last_tool {
+                tool.with_cache_control(CacheControl::Ephemeral)
+            } else {
+                tool
+            }
         }));
     }
     let opts = ChatOptions::default()
@@ -369,6 +391,22 @@ pub fn to_stop_reason(s: GStop) -> StopReason {
 // ---------------------------------------------------------------------------
 
 pub fn classify_error(e: ::genai::Error) -> ProviderError {
+    // A streaming call's HTTP error comes wrapped as a stream error.
+    let e = match e {
+        ::genai::Error::WebStream {
+            model_iden,
+            cause,
+            error,
+        } => match error.downcast::<::genai::Error>() {
+            Ok(inner) => *inner,
+            Err(error) => ::genai::Error::WebStream {
+                model_iden,
+                cause,
+                error,
+            },
+        },
+        e => e,
+    };
     let status = e.status().map(|s| s.as_u16());
     let text = e.to_string();
     let lower = text.to_ascii_lowercase();
@@ -453,7 +491,10 @@ mod tests {
             effort: Some(Effort::High),
         };
         let (chat, opts) = to_chat_request(&req);
-        assert_eq!(chat.system.as_deref(), Some("be terse"));
+        assert_eq!(
+            chat.messages[0].content.joined_texts().as_deref(),
+            Some("be terse")
+        );
         let tools = chat.tools.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name.as_str(), "Read");
@@ -461,14 +502,89 @@ mod tests {
         assert_eq!(opts.max_tokens, None); // genai fills in the model maximum
         assert!(matches!(opts.reasoning_effort, Some(ReasoningEffort::High)));
         assert_eq!(opts.capture_reasoning_content, Some(true));
-        assert_eq!(chat.messages.len(), 1);
-        assert!(matches!(chat.messages[0].role, ChatRole::User));
+        let roles: Vec<_> = chat.messages.iter().map(|m| m.role.clone()).collect();
+        assert!(matches!(
+            roles.as_slice(),
+            [ChatRole::System, ChatRole::User]
+        ));
 
         let (_, opts) = to_chat_request(&Request {
             effort: None,
             ..req
         });
         assert!(matches!(opts.reasoning_effort, Some(ReasoningEffort::Zero)));
+    }
+
+    fn cached(chat: &ChatRequest) -> Vec<bool> {
+        chat.messages
+            .iter()
+            .map(|m| {
+                m.options
+                    .as_ref()
+                    .is_some_and(|o| o.cache_control == Some(CacheControl::Ephemeral))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cache_breakpoints_end_the_system_prompt_the_last_call_and_this_one() {
+        let call = |id: &str| ContentBlock::ToolCall {
+            id: id.into(),
+            name: "Bash".into(),
+            input: json!({"command": "ls"}),
+        };
+        let result = |id: &str| Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                call_id: id.into(),
+                content: "ok".into(),
+                is_error: false,
+            }],
+        };
+        let mut req = Request {
+            model: "claude-sonnet-5".into(),
+            system: Some("sys".into()),
+            messages: vec![Message::user("go")],
+            tools: vec![],
+            effort: None,
+        };
+        assert_eq!(cached(&to_chat_request(&req).0), [true, true]);
+
+        req.messages.extend([
+            Message::assistant(vec![call("c1")]),
+            result("c1"),
+            Message::assistant(vec![call("c2")]),
+            result("c2"),
+        ]);
+        // system, go, c1 call, c1 result (the previous call's end), c2 call, c2 result
+        assert_eq!(
+            cached(&to_chat_request(&req).0),
+            [true, false, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn without_a_system_prompt_the_last_tool_ends_the_cached_prefix() {
+        let spec = |name: &str| ToolSpec {
+            name: name.into(),
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+        };
+        let req = Request {
+            model: "claude-sonnet-5".into(),
+            system: None,
+            messages: vec![Message::user("go")],
+            tools: vec![spec("Read"), spec("Bash")],
+            effort: None,
+        };
+        let (chat, _) = to_chat_request(&req);
+        let marked: Vec<_> = chat
+            .tools
+            .unwrap()
+            .iter()
+            .map(|t| t.cache_control.is_some())
+            .collect();
+        assert_eq!(marked, [false, true]);
     }
 
     #[test]
@@ -734,5 +850,44 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn http_errors_of_a_streaming_call_are_classified_by_their_status() {
+        let streamed = |e: ::genai::Error| ::genai::Error::WebStream {
+            model_iden: ::genai::ModelIden::new(::genai::adapter::AdapterKind::Anthropic, "m"),
+            cause: "HTTP error.".into(),
+            error: Box::new(e),
+        };
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", HeaderValue::from_static("7"));
+        assert!(matches!(
+            classify_error(streamed(http(429, "slow down", h))),
+            ProviderError::RateLimited {
+                retry_after: Some(d)
+            } if d == Duration::from_secs(7)
+        ));
+        assert!(matches!(
+            classify_error(streamed(http(400, "bad request", HeaderMap::new()))),
+            ProviderError::Api {
+                status: 400,
+                retryable: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_error(streamed(http(
+                400,
+                "prompt is too long: 1000001 tokens",
+                HeaderMap::new()
+            ))),
+            ProviderError::ContextOverflow
+        ));
+        let cut = ::genai::Error::WebStream {
+            model_iden: ::genai::ModelIden::new(::genai::adapter::AdapterKind::Anthropic, "m"),
+            cause: "connection reset".into(),
+            error: "connection reset".into(),
+        };
+        assert!(matches!(classify_error(cut), ProviderError::Stream(_)));
     }
 }
