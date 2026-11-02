@@ -4,12 +4,16 @@
 [clickhouse]
 password = "chlive_ro"
 snapshot_password = "chlive_snap"
-# made by scripts/schema.sql
+# made by the migrations (db/clickhouse)
 snapshot_database = "chlive_snapshots"
 
 [cache]
 # stored results; `reset-data` deletes them with the data they point into
 dir = ".dnvr/chlive-cache"
+
+[tables]
+# made by the migrations (db/clickhouse)
+database = "dirigent"
 
 [tables.session_events]
 [tables.session_events.columns]

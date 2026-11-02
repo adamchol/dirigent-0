@@ -1,0 +1,30 @@
+# The migrations of dirigent's databases: the schema is declared in db/<engine>/schema (HCL), and
+# `openmig generate <name>` writes the versioned SQL in db/<engine>/migrations that deployments run
+# (`openmig deploy`). dirigent owns only its own namespace in each server, so it can share one:
+# what's outside `schemas`, and roles it doesn't declare, are never planned or reported as drift.
+# Users and passwords are the deployer's (in dev: scripts/clickhouse-dev-access.sql).
+
+[databases.clickhouse]
+engine = "clickhouse"
+schema = ["db/clickhouse/schema"]
+migrations = "db/clickhouse/migrations"
+url = "${DIRIGENT_CLICKHOUSE_URL}"
+schemas = ["dirigent", "chlive_snapshots"]
+# chlive's snapshots come and go while it runs: the database is ours, its tables are chlive's
+exclude = ["table:chlive_snapshots.*"]
+default_database = "dirigent"
+history_table = "dirigent_migrations.history"
+
+[databases.postgres]
+engine = "postgres"
+schema = ["db/postgres/schema"]
+migrations = "db/postgres/migrations"
+url = "${DIRIGENT_POSTGRES_URL}"
+version = 17
+schemas = ["dirigent"]
+default_schema = "dirigent"
+history_table = "dirigent_migrations.history"
+
+[databases.postgres.scratch]
+# initdb refuses root: started as root (e.g. a dev VM), the scratch server runs as this user
+run_as = "nobody"

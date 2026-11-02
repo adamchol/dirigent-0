@@ -104,13 +104,40 @@
         "type": "github"
       }
     },
+    "openmig": {
+      "inputs": {
+        "dnvr": [
+          "dnvr"
+        ],
+        "flake-parts": [
+          "flake-parts"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793587148,
+        "narHash": "sha256-ETmXBMtkMO+S59iJKtWV85rRRelz9eznmoMcZ1NV9nM=",
+        "owner": "adamchol",
+        "repo": "openmig",
+        "rev": "6e59cb11d85b25d6663de54aad4d0bb88f491a2c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "adamchol",
+        "repo": "openmig",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "chlive": "chlive",
         "continuous-backup": "continuous-backup",
         "dnvr": "dnvr",
         "flake-parts": "flake-parts",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "openmig": "openmig"
       }
     }
   },

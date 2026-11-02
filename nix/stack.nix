@@ -1,7 +1,7 @@
 # The local event system, as dnvr processes, after chlive's own stack (chlive's nix/stack.nix):
 # Redpanda (native on Linux, Docker elsewhere), ClickHouse with an embedded Keeper, Kafka
 # Connect with one ClickHouse sink connector per topic (exactly once), the pause server, the
-# schema, and the chlive server.
+# chlive server, and Postgres; both databases get their migrations (openmig.toml) on start.
 #
 # Every process picks its own ports (`dnvr-state pick-port`) and publishes its address; the
 # others get it through `dnvr://<process>/<key>` env refs, which also order the start-up.
@@ -12,11 +12,18 @@
   continuous-backup,
   clickhouse,
   chlive,
+  openmig,
+  postgresql,
   topics,
   # per topic; a session's events are keyed by its id, so they stay in one partition
   partitions ? 3,
-  # applied on every start, relative to DNVR_ROOT
-  schemaFile,
+  # the ClickHouse database the topics' tables are in (made by the migrations)
+  database,
+  # after the ClickHouse migrations, what a deployer would do: chlive's users, with passwords and
+  # settings, given the migrations' roles; relative to DNVR_ROOT
+  accessFile,
+  # Postgres' port, fixed (the preset doesn't pick one)
+  postgresPort ? 54320,
   # the chlive server's config file, relative to DNVR_ROOT (addresses come as flags)
   serverConfig,
   # the chlive server's result store (`cache.dir` in its config), for `reset-data`
@@ -74,7 +81,7 @@ let
           topics = topic;
           topic2TableMap = "${topic}=${topic}";
           ssl = "false";
-          database = "default";
+          inherit database;
           username = "default";
           password = "";
           exactlyOnce = "true";
@@ -121,7 +128,7 @@ let
         in
         {
           connector = c.name;
-          database = "default";
+          inherit database;
           state_table = c.stateTable;
           keeper_path = c.keeperPath;
           table = topic;
@@ -205,15 +212,50 @@ in
       '';
     };
 
-    # Idempotent; reruns on every start, then idles so its `ready` key stays live.
-    schema = {
-      env.CH_TCP_PORT = "dnvr://clickhouse/tcpPort";
-      env.CH_DATABASE = "dnvr://clickhouse/database";
+    # The pending migrations (openmig.toml), as ClickHouse's admin, then chlive's users
+    # (accessFile); both are no-ops when done. Then idles so its `ready` key stays live.
+    migrate-clickhouse = {
+      env = {
+        CH_TCP_PORT = "dnvr://clickhouse/tcpPort";
+        CH_HTTP_URL = "dnvr://clickhouse/httpUrl";
+        CH_DATABASE = "dnvr://clickhouse/database";
+      };
       command = ''
         cd "$DNVR_ROOT"
-        ${chClient ''"$CH_TCP_PORT"''} --multiquery < ${schemaFile}
+        DIRIGENT_CLICKHOUSE_URL="''${CH_HTTP_URL/:\/\//://default:@}" \
+          ${openmig}/bin/openmig -d clickhouse deploy --wait-for-db 1m
+        ${chClient ''"$CH_TCP_PORT"''} --multiquery < ${accessFile}
         dnvr-state set ready 1
-        echo "[schema] applied ${schemaFile}"
+        echo "[migrate-clickhouse] migrated, and applied ${accessFile}"
+        exec tail -f /dev/null
+      '';
+    };
+
+    # Where the control plane's state will live; logical WAL for chlive's grants (CDC).
+    # Publishes `url` and `database` once the database exists.
+    postgres = {
+      imports = [ presets.postgres ];
+      package = postgresql;
+      database = "dirigent";
+      port = postgresPort;
+      dataDir = dir "postgres";
+      # initdb refuses root: started as root (e.g. a dev VM), it runs as this user
+      runAsUser = "postgres";
+      settings = {
+        wal_level = "logical";
+        max_replication_slots = 10;
+        max_wal_senders = 10;
+      };
+    };
+
+    # The pending migrations (openmig.toml), as Postgres' superuser; then idles.
+    migrate-postgres = {
+      env.DIRIGENT_POSTGRES_URL = "dnvr://postgres/url";
+      command = ''
+        cd "$DNVR_ROOT"
+        ${openmig}/bin/openmig -d postgres deploy --wait-for-db 1m
+        dnvr-state set ready 1
+        echo "[migrate-postgres] migrated"
         exec tail -f /dev/null
       '';
     };
@@ -247,7 +289,7 @@ in
     connectors = {
       env = {
         CONNECT_URL = "dnvr://connect/url";
-        SCHEMA_READY = "dnvr://schema/ready";
+        MIGRATED = "dnvr://migrate-clickhouse/ready";
         TOPICS = "dnvr://redpanda/topics";
         CH_HOST = "dnvr://clickhouse/host";
         CH_HTTP_PORT = "dnvr://clickhouse/httpPort";
@@ -339,14 +381,20 @@ in
       runtimeInputs = [ dnvrState ];
       text = ''exec ${chClient ''"$(dnvr-state get clickhouse.tcpPort)"''} "$@"'';
     };
+    psql = {
+      description = "psql connected to the local Postgres (the dirigent database)";
+      runtimeInputs = [ dnvrState ];
+      text = ''exec ${postgresql}/bin/psql "$(dnvr-state get postgres.url)" "$@"'';
+    };
     reset-data = {
-      description = "Delete the local Redpanda, ClickHouse and chlive cache data (run while `dnvr up` is stopped)";
+      description = "Delete the local Redpanda, ClickHouse, Postgres and chlive cache data (run while `dnvr up` is stopped)";
       text = ''
         # Kafka (with Connect's own topics) and ClickHouse (with the sink's KeeperMap offsets)
         # go together; chlive's stored results hold cursors into both.
         ${resetRedpanda}
-        rm -rf "''${DNVR_ROOT:?}/${dir "clickhouse"}" "''${DNVR_ROOT:?}/${cacheDir}"
-        echo "removed Redpanda, ClickHouse and chlive cache data; the next \`dnvr up\` starts empty"
+        rm -rf "''${DNVR_ROOT:?}/${dir "clickhouse"}" "''${DNVR_ROOT:?}/${cacheDir}" \
+          "''${DNVR_ROOT:?}/${dir "postgres"}"
+        echo "removed Redpanda, ClickHouse, Postgres and chlive cache data; the next \`dnvr up\` starts empty"
       '';
     };
   };

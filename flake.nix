@@ -22,6 +22,13 @@
       inputs.dnvr.follows = "dnvr";
       inputs.continuous-backup.follows = "continuous-backup";
     };
+    # schema migrations for ClickHouse and Postgres (openmig.toml, db/)
+    openmig = {
+      url = "github:adamchol/openmig";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-parts.follows = "flake-parts";
+      inputs.dnvr.follows = "dnvr";
+    };
   };
 
   outputs =
@@ -37,18 +44,56 @@
       perSystem =
         {
           pkgs,
+          lib,
           presets,
           dnvrState,
           inputs',
           ...
         }:
+        let
+          inherit (inputs'.chlive.packages) clickhouse;
+          inherit (inputs'.openmig.packages) openmig;
+          postgresql = pkgs.postgresql_17;
+        in
         {
           formatter = pkgs.nixfmt;
 
+          # The migrations match the schema: `openmig check` replays them into scratch servers.
+          checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            migrations =
+              pkgs.runCommand "dirigent-migrations-check"
+                {
+                  nativeBuildInputs = [
+                    openmig
+                    postgresql
+                    clickhouse
+                  ];
+                  src = lib.fileset.toSource {
+                    root = ./.;
+                    fileset = lib.fileset.unions [
+                      ./openmig.toml
+                      ./db
+                    ];
+                  };
+                }
+                ''
+                  export HOME=$TMPDIR XDG_CACHE_HOME=$TMPDIR/cache
+                  cd $src
+                  openmig check --all
+                  touch $out
+                '';
+          };
+
           dnvr.shells.default = import ./nix/shell.nix {
-            inherit pkgs presets dnvrState;
+            inherit
+              pkgs
+              presets
+              dnvrState
+              clickhouse
+              openmig
+              postgresql
+              ;
             inherit (inputs) continuous-backup;
-            inherit (inputs'.chlive.packages) clickhouse;
             # TODO: drop once chlive's package has it; reqwest's native-tls needs OpenSSL on Linux
             chlive = inputs'.chlive.packages.chlive.overrideAttrs (old: {
               buildInputs = old.buildInputs ++ [ pkgs.openssl ];

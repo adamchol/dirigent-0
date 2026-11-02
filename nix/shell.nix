@@ -8,6 +8,8 @@
   continuous-backup,
   clickhouse,
   chlive,
+  openmig,
+  postgresql,
 }:
 let
   stack = import ./stack.nix {
@@ -18,9 +20,12 @@ let
       continuous-backup
       clickhouse
       chlive
+      openmig
+      postgresql
       ;
     topics = [ "session_events" ];
-    schemaFile = "scripts/schema.sql";
+    database = "dirigent";
+    accessFile = "scripts/clickhouse-dev-access.sql";
     serverConfig = "nix/chlive.toml";
     cacheDir = ".dnvr/chlive-cache";
     # each row also stores its message's partition, offset and timestamp (scripts/schema.sql),
@@ -38,6 +43,8 @@ let
   stackEnv = ''
     export CHLIVE_URL="''${CHLIVE_URL:-$(dnvr-state get chlive.url)}"
     export DIRIGENT_KAFKA="''${DIRIGENT_KAFKA:-$(dnvr-state get redpanda.bootstrap)}"
+    export DIRIGENT_CLICKHOUSE_URL="''${DIRIGENT_CLICKHOUSE_URL:-$(dnvr-state get clickhouse.httpUrl | sed 's|://|://default:@|')}"
+    export DIRIGENT_POSTGRES_URL="''${DIRIGENT_POSTGRES_URL:-$(dnvr-state get postgres.url)}"
   '';
 in
 { ... }:
@@ -60,6 +67,10 @@ in
     curl
     nixfmt
     dnvrState
+    # migrations (openmig.toml); its scratch servers run these, the same majors as the stack's
+    openmig
+    postgresql
+    clickhouse
   ];
 
   env = {
