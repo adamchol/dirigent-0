@@ -94,8 +94,10 @@
               postgresql
               ;
             inherit (inputs) continuous-backup;
-            # TODO: drop once chlive's package has it; reqwest's native-tls needs OpenSSL on Linux
+            # TODO: drop once chlive's package has them: its fileset misses the `wasm` workspace
+            # member (cargo can't load the workspace), and reqwest's native-tls needs OpenSSL
             chlive = inputs'.chlive.packages.chlive.overrideAttrs (old: {
+              src = inputs.chlive;
               buildInputs = old.buildInputs ++ [ pkgs.openssl ];
             });
           };

@@ -50,7 +50,8 @@ impl Fold {
                 self.open = None;
                 Some(ev.clone())
             }
-            Event::ModelDelta { .. }
+            Event::PlayerAttached { .. }
+            | Event::ModelDelta { .. }
             | Event::AssistantMessage { .. }
             | Event::ModelCancelled
             | Event::Error { .. }

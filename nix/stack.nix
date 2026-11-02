@@ -231,7 +231,7 @@ in
       '';
     };
 
-    # Where the control plane's state will live; logical WAL for chlive's grants (CDC).
+    # The control plane's state (db/postgres); logical WAL for chlive's grants (CDC).
     # Publishes `url` and `database` once the database exists.
     postgres = {
       imports = [ presets.postgres ];
@@ -357,11 +357,14 @@ in
     };
 
     # Publishes `url` (the WebSocket) and `httpUrl` (/debug, /healthz, …).
+    # Its grants come from Postgres (the config's `pg` provider), as the `dirigent_chlive` role.
     chlive = {
       env = {
         PAUSE_SERVER_URL = "dnvr://pause-server/url";
         CH_HTTP_URL = "dnvr://clickhouse/httpUrl";
         KAFKA_BROKERS = "dnvr://redpanda/bootstrap";
+        PG_URL = "dnvr://postgres/url";
+        MIGRATED = "dnvr://migrate-postgres/ready";
       };
       command = ''
         cd "$DNVR_ROOT"
@@ -370,7 +373,8 @@ in
         dnvr-state set httpUrl "http://127.0.0.1:$port"
         exec ${chlive}/bin/chlive --config ${serverConfig} \
           --listen "127.0.0.1:$port" --clickhouse-url "$CH_HTTP_URL" \
-          --kafka "$KAFKA_BROKERS" --pause-server "$PAUSE_SERVER_URL"
+          --kafka "$KAFKA_BROKERS" --pause-server "$PAUSE_SERVER_URL" \
+          --set "security.providers.pg.url=''${PG_URL/:\/\/*@/://dirigent_chlive@}"
       '';
     };
   };

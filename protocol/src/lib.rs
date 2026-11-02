@@ -1,7 +1,8 @@
 //! What every component of dirigent shares: a session's events, how they're kept in the event
-//! system (one Kafka topic ingested into a ClickHouse table, read back through chlive), and how
-//! a log of them reads.
+//! system (one Kafka topic ingested into a ClickHouse table, read back through chlive), how a
+//! log of them reads, and how a player holds a session (`control`).
 
+pub mod control;
 pub mod fold;
 pub mod rows;
 
@@ -97,6 +98,9 @@ pub enum TurnEndReason {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Event {
+    /// From the player, before it reads the log: it holds the session's lease, as the `epoch`th
+    /// player to (see `control`).
+    PlayerAttached { epoch: i64 },
     /// From a user.
     UserMessage { text: String },
     /// From a user: stop the turn `turn`, the one they saw running.

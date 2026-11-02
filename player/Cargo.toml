@@ -11,7 +11,7 @@ path = "src/main.rs"
 dirigent-protocol = { path = "../protocol" }
 genai = "=0.7.0-beta.22"
 chlive-client = { git = "https://github.com/dialohq/chlive", branch = "master" }
-rdkafka = { version = "0.39", default-features = false, features = ["tokio", "dynamic-linking"] }
+tokio-tungstenite = "0.30"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process", "fs", "io-util"] }
 tokio-util = "0.7"
@@ -31,5 +31,6 @@ grep-searcher = "0.1"
 libc = "0.2"
 
 [dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 tempfile = "3"
 http = "1"

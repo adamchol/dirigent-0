@@ -13,14 +13,15 @@
         ],
         "nixpkgs": [
           "nixpkgs"
-        ]
+        ],
+        "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1793470985,
-        "narHash": "sha256-lxn0lnHOHV2jeyXdpT80ThpDuYvU3N+j7/zLFYCFM2Q=",
+        "lastModified": 1793625078,
+        "narHash": "sha256-UkdA7C0iJLClzZ0m3FmBQdfsZ8JbJEUU8cF3pQaks0Y=",
         "ref": "master",
-        "rev": "c724fc1a3f23ef291308744aa3cd3bb99274d63d",
-        "revCount": 122,
+        "rev": "6f4a0000ffa5a7f029281d0f3b5584a4f8889067",
+        "revCount": 128,
         "type": "git",
         "url": "https://github.com/dialohq/chlive"
       },
@@ -138,6 +139,27 @@
         "flake-parts": "flake-parts",
         "nixpkgs": "nixpkgs",
         "openmig": "openmig"
+      }
+    },
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "chlive",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793523538,
+        "narHash": "sha256-vHPjEGxtV+StSLW9DJpa3c3gt0UD0s1q4nC98AZ0N0c=",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "c85ccd343087c57da6021cafa1647142ad03e32e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "type": "github"
       }
     }
   },

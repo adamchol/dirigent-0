@@ -176,7 +176,8 @@ fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -> Ve
                 open = false;
                 waiting.clear();
             }
-            Event::UserInterrupt { .. }
+            Event::PlayerAttached { .. }
+            | Event::UserInterrupt { .. }
             | Event::TurnStarted { .. }
             | Event::Steered { .. }
             | Event::ModelDelta { .. }
@@ -340,7 +341,8 @@ impl Run<'_> {
                 }
             }
             // Users' events and the loop's own decisions; never outcomes.
-            Event::UserMessage { .. }
+            Event::PlayerAttached { .. }
+            | Event::UserMessage { .. }
             | Event::UserInterrupt { .. }
             | Event::TurnStarted { .. }
             | Event::Steered { .. }
@@ -678,7 +680,8 @@ fn log_event(ev: &Event) {
             TurnEndReason::Completed => info!("turn completed"),
             other => warn!("turn ended: {other:?}"),
         },
-        Event::UserMessage { .. }
+        Event::PlayerAttached { .. }
+        | Event::UserMessage { .. }
         | Event::UserInterrupt { .. }
         | Event::TurnStarted { .. }
         | Event::Steered { .. }
@@ -871,6 +874,7 @@ mod tests {
             .iter()
             .filter(|e| !matches!(e, Event::ModelDelta { .. }))
             .map(|e| match e {
+                Event::PlayerAttached { epoch } => format!("attached:{epoch}"),
                 Event::UserMessage { text } => format!("user:{text}"),
                 Event::UserInterrupt { .. } => "interrupt".into(),
                 Event::TurnStarted { input } => format!("user:{}", text_of(input)),

@@ -21,3 +21,31 @@ database = "dirigent"
 offset = { kafka = "offset" }
 partition = { kafka = "partition" }
 ts = { kafka = "timestamp" }
+
+# Who a connection is: whoever its `hello` says (dev only; deployments verify credentials).
+[auth]
+mode = "declared"
+
+# Who may read and insert a session's events: its subjects in control's `session_access` (its
+# users, and the player holding its lease), followed from Postgres (db/postgres). `url` comes
+# as a flag.
+[security]
+default = "deny"
+
+[security.providers.pg]
+kind = "postgres"
+schema = "dirigent"
+publication = "dirigent_chlive"
+slot = "chlive_dev"
+
+[tables.session_events.security]
+provider = "pg"
+column = "session_id"
+grants = "SELECT session_id FROM session_access WHERE subject = {subject:String}"
+
+[tables.session_events.insert]
+# set by chlive, to who inserts
+user = "author"
+# a session's events stay in one partition
+key = "session_id"
+rows = { column = "session_id", provider = "pg", grants = "SELECT session_id FROM session_access WHERE subject = {subject:String}" }

@@ -3,6 +3,7 @@
 //! append, and appends every event it handles or produces. The loop stores none of the log.
 
 pub mod chlive;
+pub mod control;
 
 use async_trait::async_trait;
 

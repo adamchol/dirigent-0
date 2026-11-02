@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["protocol", "player", "chat"]
+members = ["protocol", "player", "chat", "control"]

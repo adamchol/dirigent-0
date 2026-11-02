@@ -16,7 +16,9 @@ use tracing::info;
 use crate::agent::{Agent, AgentConfig};
 use crate::provider::{Effort, Provider};
 use crate::session::chlive::ChliveSession;
+use crate::session::control::Lease;
 use crate::tools::Registry;
+use dirigent_protocol::control::player_subject;
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
@@ -36,17 +38,27 @@ const HELP_STYLES: Styles = Styles::styled()
     styles = HELP_STYLES
 )]
 struct Cli {
-    /// The session to run (a UUID); a new one when absent.
+    /// The session to run (a UUID), made through control; the player waits for it to exist and
+    /// for any other player holding it to let go.
     #[arg(long, env = "DIRIGENT_SESSION")]
-    session: Option<String>,
+    session: String,
 
-    /// chlive's WebSocket, where the session's log is read.
+    /// Who this player is (a UUID; a new one when absent): to control, which leases it the
+    /// session, and to chlive, as `player:<id>`.
+    #[arg(long, env = "DIRIGENT_PLAYER_ID")]
+    player_id: Option<String>,
+
+    /// Control's WebSocket for players, where the session is leased.
+    #[arg(
+        long,
+        env = "DIRIGENT_CONTROL_URL",
+        default_value = "ws://127.0.0.1:8090/player"
+    )]
+    control_url: String,
+
+    /// chlive's WebSocket, where the session's log is read and appended to.
     #[arg(long, env = "CHLIVE_URL", default_value = "ws://127.0.0.1:8080/live")]
     chlive_url: String,
-
-    /// Kafka bootstrap servers, where the session's log is appended to.
-    #[arg(long, env = "DIRIGENT_KAFKA", default_value = "127.0.0.1:9092")]
-    kafka: String,
 
     #[arg(long, env = "MOCK")]
     mock: bool,
@@ -116,17 +128,25 @@ async fn main() -> anyhow::Result<()> {
         workdir,
     };
 
-    let id = match &cli.session {
-        Some(id) => uuid::Uuid::parse_str(id)
-            .with_context(|| format!("--session {id}: not a UUID"))?
-            .to_string(),
+    let id = uuid(&cli.session, "--session")?;
+    let player = match &cli.player_id {
+        Some(p) => uuid(p, "--player-id")?,
         None => uuid::Uuid::new_v4().to_string(),
     };
-    let mut session = ChliveSession::new(&id, &cli.chlive_url, &cli.kafka)?;
     info!(
         session = id,
+        player,
+        control = cli.control_url,
+        "acquiring the session"
+    );
+    let lease = Lease::acquire(&cli.control_url, &id, &player).await;
+    let mut session =
+        ChliveSession::new(&id, lease.epoch, &cli.chlive_url, &player_subject(&player));
+    info!(
+        session = id,
+        player,
+        epoch = lease.epoch,
         chlive = cli.chlive_url,
-        kafka = cli.kafka,
         provider = provider.name(),
         model = cfg.model,
         workdir = %workdir.display(),
@@ -134,9 +154,17 @@ async fn main() -> anyhow::Result<()> {
     );
     tokio::select! {
         r = agent.run(&mut session) => r?,
-        _ = tokio::signal::ctrl_c() => info!("shutting down"),
+        _ = stopped() => info!("shutting down"),
+        _ = lease.lost() => anyhow::bail!("the session's lease is lost to another player"),
     }
+    lease.release().await;
     Ok(())
+}
+
+fn uuid(s: &str, what: &str) -> anyhow::Result<String> {
+    Ok(uuid::Uuid::parse_str(s)
+        .with_context(|| format!("{what} {s}: not a UUID"))?
+        .to_string())
 }
 
 fn build_system_prompt(workdir: &Path) -> String {
@@ -161,4 +189,17 @@ fn build_system_prompt(workdir: &Path) -> String {
     }
     prompt.push_str(&format!("\n\nWorking directory: {}\n", workdir.display()));
     prompt
+}
+
+/// Ctrl-C, SIGTERM (how process managers and Kubernetes stop it) or SIGHUP (its terminal
+/// closing).
+async fn stopped() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("SIGTERM can be handled");
+    let mut hup = signal(SignalKind::hangup()).expect("SIGHUP can be handled");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+        _ = hup.recv() => {}
+    }
 }

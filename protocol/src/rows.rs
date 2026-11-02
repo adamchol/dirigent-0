@@ -1,6 +1,7 @@
-//! How a session lives in the event system: one Kafka topic keyed by the session id (so a
-//! session stays in one partition), each message one row of the ClickHouse table of the same
-//! name (see `scripts/schema.sql`), read back with chlive queries in offset order.
+//! How a session lives in the event system: rows inserted through chlive into one Kafka topic,
+//! keyed by the session id (so a session stays in one partition), each message one row of the
+//! ClickHouse table of the same name (see `db/clickhouse`), read back with chlive queries in
+//! offset order.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
@@ -8,11 +9,6 @@ use serde_json::{Map, Value};
 use crate::Event;
 
 pub const EVENTS: &str = "session_events";
-
-/// The `author` of rows users write.
-pub const USER: &str = "user";
-/// The `author` of rows the player writes.
-pub const PLAYER: &str = "player";
 
 /// A session's log without its streaming deltas, in order (chlive dialect; `session` is the
 /// session id).
@@ -32,7 +28,9 @@ pub struct RowError {
 
 /// One row of the log: `kind` is the event's type, `data` its fields as JSON (empty for none).
 /// `offset`, `partition` and `ts` are the Kafka message's, added on ingestion (and by chlive on
-/// live rows), so a writer never sends them.
+/// live rows), and `author` is who inserted it (chlive's subject: `user:<name>`,
+/// `player:<id>`), set by chlive; so a writer never sends them, and a row serializes to what
+/// is inserted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventRow {
     pub session_id: String,
@@ -43,6 +41,7 @@ pub struct EventRow {
     #[serde(default, skip_serializing, deserialize_with = "string_lenient")]
     pub ts: String,
     pub id: String,
+    #[serde(default, skip_serializing)]
     pub author: String,
     pub kind: String,
     pub data: String,
@@ -50,7 +49,7 @@ pub struct EventRow {
 
 impl EventRow {
     /// A row to send; `id` must be new (a UUID).
-    pub fn new(session_id: &str, id: String, author: &str, event: &Event) -> Self {
+    pub fn new(session_id: &str, id: String, event: &Event) -> Self {
         let Value::Object(mut v) = serde_json::to_value(event).expect("events serialize") else {
             unreachable!("events serialize to objects")
         };
@@ -65,7 +64,7 @@ impl EventRow {
             partition: 0,
             ts: String::new(),
             id,
-            author: author.to_string(),
+            author: String::new(),
             kind,
             data,
         }
@@ -117,6 +116,7 @@ mod tests {
     fn every_event() -> Vec<Event> {
         vec![
             Event::UserMessage { text: "hi".into() },
+            Event::PlayerAttached { epoch: 3 },
             Event::UserInterrupt { turn: "t1".into() },
             Event::TurnStarted { input: "m1".into() },
             Event::Steered { input: "m2".into() },
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn every_event_round_trips_through_a_row() {
         for (n, ev) in every_event().into_iter().enumerate() {
-            let row = EventRow::new("s", n.to_string(), PLAYER, &ev);
+            let row = EventRow::new("s", n.to_string(), &ev);
             let wire = serde_json::to_string(&row).unwrap();
             let back: EventRow = serde_json::from_str(&wire).unwrap();
             assert_eq!(back.event().unwrap(), ev, "{wire}");
@@ -211,10 +211,10 @@ mod tests {
             reason: TurnEndReason::Completed,
             interrupt: None,
         };
-        let row = EventRow::new("s", "e1".into(), PLAYER, &ended);
+        let row = EventRow::new("s", "e1".into(), &ended);
         assert_eq!(row.kind, "turn_ended");
         assert_eq!(row.data, r#"{"reason":"completed"}"#);
-        let row = EventRow::new("s", "e2".into(), PLAYER, &Event::ModelCancelled);
+        let row = EventRow::new("s", "e2".into(), &Event::ModelCancelled);
         assert_eq!(
             (row.kind.as_str(), row.data.as_str()),
             ("model_cancelled", "")
@@ -224,20 +224,15 @@ mod tests {
             retry_in_ms: None,
             compact: false,
         };
-        let row = EventRow::new("s", "e3".into(), PLAYER, &failed);
+        let row = EventRow::new("s", "e3".into(), &failed);
         assert_eq!(row.data, r#"{"message":"x"}"#);
     }
 
     #[test]
-    fn the_kafka_fields_are_read_but_never_sent() {
-        let row = EventRow::new(
-            "s",
-            "e1".into(),
-            USER,
-            &Event::UserMessage { text: "a".into() },
-        );
+    fn the_kafka_fields_and_the_author_are_read_but_never_sent() {
+        let row = EventRow::new("s", "e1".into(), &Event::UserMessage { text: "a".into() });
         let sent = serde_json::to_value(&row).unwrap();
-        for field in ["offset", "partition", "ts"] {
+        for field in ["offset", "partition", "ts", "author"] {
             assert!(sent.get(field).is_none(), "{field} sent: {sent}");
         }
         let read: EventRow = serde_json::from_value(json!({
@@ -247,8 +242,13 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            (read.offset, read.partition, read.ts.as_str()),
-            (u64::MAX, 2, "2026-10-31 12:00:00.123")
+            (
+                read.offset,
+                read.partition,
+                read.ts.as_str(),
+                read.author.as_str()
+            ),
+            (u64::MAX, 2, "2026-10-31 12:00:00.123", "user")
         );
     }
 }

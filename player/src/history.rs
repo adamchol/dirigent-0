@@ -100,7 +100,8 @@ impl Entry {
             }),
             // Applied by `History::push`.
             Event::Compacted { .. } => None,
-            Event::UserInterrupt { .. }
+            Event::PlayerAttached { .. }
+            | Event::UserInterrupt { .. }
             | Event::TurnStarted { .. }
             | Event::Steered { .. }
             | Event::ModelDelta { .. }

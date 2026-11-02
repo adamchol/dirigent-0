@@ -87,6 +87,9 @@ impl App {
 
     fn on_handled(&mut self, ev: Event) {
         match ev {
+            Event::PlayerAttached { epoch } => {
+                self.push(Line::from(format!("player attached · epoch {epoch}")).dim());
+            }
             Event::UserMessage { text } => {
                 if !self.working {
                     self.working = true;
