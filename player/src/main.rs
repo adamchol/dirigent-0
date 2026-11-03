@@ -10,19 +10,22 @@ mod workspace;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::builder::styling::{AnsiColor, Styles};
 use clap::Parser;
 use tracing::{info, warn};
 
-use crate::agent::{Agent, AgentConfig};
+use crate::agent::{Agent, AgentConfig, Detach};
 use crate::checkpoints::Checkpoints;
 use crate::provider::Provider;
 use crate::session::chlive::ChliveSession;
 use crate::session::control::Lease;
+use crate::session::Session;
 use crate::tools::Registry;
 use dirigent_protocol::control::{player_subject, SessionSpec};
+use dirigent_protocol::Event;
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
@@ -42,8 +45,8 @@ const HELP_STYLES: Styles = Styles::styled()
     styles = HELP_STYLES
 )]
 struct Cli {
-    /// The session to run (a UUID), made through control; the player waits for it to exist and
-    /// for any other player holding it to let go.
+    /// The session to run (a UUID), made through control; if another player holds it, this one
+    /// stops.
     #[arg(long, env = "DIRIGENT_SESSION")]
     session: String,
 
@@ -52,11 +55,15 @@ struct Cli {
     #[arg(long, env = "DIRIGENT_PLAYER_ID")]
     player_id: Option<String>,
 
-    /// Control's WebSocket for players, where the session is leased.
+    /// The lease control reserved for this player (it started it): resumed, not taken anew.
+    #[arg(long, hide = true)]
+    epoch: Option<i64>,
+
+    /// Control's gRPC service for players, where the session is leased.
     #[arg(
         long,
         env = "DIRIGENT_CONTROL_URL",
-        default_value = "ws://127.0.0.1:8090/player"
+        default_value = "http://127.0.0.1:8091"
     )]
     control_url: String,
 
@@ -100,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "player=info,genai=warn".into()),
         )
+        // colored only on a terminal: control writes it to a file
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
     let cli: &'static Cli = Box::leak(Box::new(Cli::parse()));
 
@@ -156,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
         control = cli.control_url,
         "acquiring the session"
     );
-    let lease = Lease::acquire(&cli.control_url, &id, &player).await;
+    let lease = Lease::acquire(&cli.control_url, &id, &player, cli.epoch).await?;
     let spec: &'static SessionSpec = Box::leak(Box::new(lease.spec.clone()));
     let mut session =
         ChliveSession::new(&id, lease.epoch, &cli.chlive_url, &player_subject(&player));
@@ -187,15 +196,30 @@ async fn main() -> anyhow::Result<()> {
             workdir = %workdir.display(),
             "running the session"
         );
-        agent.run(&mut session, log).await
+        let detach = Detach {
+            epoch: lease.epoch,
+            when: lease.detach(),
+        };
+        agent.run(&mut session, log, detach).await
     };
-    tokio::select! {
-        r = run => r?,
-        _ = stopped() => info!("shutting down"),
+    let result = tokio::select! {
+        r = run => r,
+        _ = stopped() => {
+            info!("shutting down");
+            Ok(())
+        }
         _ = lease.lost() => anyhow::bail!("the session's lease is lost to another player"),
+    };
+    // failed: the session is given back, saying why
+    if let Err(e) = &result {
+        let failed = Event::PlayerFailed {
+            epoch: lease.epoch,
+            error: format!("{e:#}"),
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(5), session.publish(&failed)).await;
     }
     lease.release().await;
-    Ok(())
+    result
 }
 
 fn uuid(s: &str, what: &str) -> anyhow::Result<String> {

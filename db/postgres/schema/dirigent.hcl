@@ -41,7 +41,10 @@ table "dirigent.sessions" {
 # Who may read and write a session's events (chlive's grants, `subject` being its `hello` user):
 # its users, and the player holding its lease. The player's row is the lease: `expires_at` is
 # null while the player is connected to control, and when it drops (or control restarts) the
-# time until which the player may come back for it; past it, control deletes the row.
+# time until which the player may come back for it; past it, control deletes the row. A session
+# with a lease is active, one without idle. `spawned_by`: the runner control started the player
+# with (reserving the lease for it), and which starts another when the lease expires rather than
+# being given back; null for a player started otherwise.
 table "dirigent.session_access" {
   column "session_id" { type = uuid }
   column "subject" { type = text }
@@ -51,6 +54,7 @@ table "dirigent.session_access" {
     default = false
   }
   column "expires_at" { type = timestamptz }
+  column "spawned_by" { type = text }
   primary_key { columns = [column.session_id, column.subject] }
   foreign_key "session_access_session_id_fkey" {
     columns    = [column.session_id]

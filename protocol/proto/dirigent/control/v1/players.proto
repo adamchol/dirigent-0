@@ -1,0 +1,79 @@
+// How a player holds a session, from dirigent's control plane: a lease, kept for as long as the
+// player's `Lease` call is open. A session with a lease is active, one without idle. Control
+// starts a player by reserving the lease for it first (an epoch), which the player then resumes.
+syntax = "proto3";
+
+package dirigent.control.v1;
+
+service Players {
+  // The player's first message asks for the session; control answers `Acquired`, or ends the
+  // call with a status:
+  //   NOT_FOUND            there's no such session
+  //   FAILED_PRECONDITION  another player holds it
+  //   ABORTED              the lease the player resumes is gone (it expired, or the session was
+  //                        stopped meanwhile): the player must stop
+  // The player ending its stream gives the lease back; the call breaking (the connection lost,
+  // HTTP/2 keepalive timing out) keeps it for a grace period, in which the same player may
+  // resume it with its epoch. Each new holder gets the session's next epoch.
+  rpc Lease(stream FromPlayer) returns (stream ToPlayer);
+}
+
+message FromPlayer {
+  oneof msg {
+    Acquire acquire = 1;
+  }
+}
+
+// Hold `session` (a UUID) as `player` (its id; to chlive and in the session's grants it's the
+// subject `player:<id>`).
+message Acquire {
+  string session = 1;
+  string player = 2;
+  // The lease it resumes: one control reserved for it, or the one it held before its connection
+  // broke. It gets that lease back or none, never a new one. Absent: the session, if it's free.
+  optional int64 epoch = 3;
+}
+
+message ToPlayer {
+  oneof msg {
+    Acquired acquired = 1;
+    Detach detach = 2;
+  }
+}
+
+// The player holds the session, as its `epoch`th player, and runs `spec`.
+message Acquired {
+  int64 epoch = 1;
+  SessionSpec spec = 2;
+}
+
+// Any time after `Acquired`: the session was stopped. The player finishes the turn running
+// (`now`: cancels it), then gives the lease back.
+message Detach {
+  bool now = 1;
+}
+
+// What a session runs, set when it's made and fixed from then on.
+message SessionSpec {
+  string model = 1;
+  // Absent: no extended thinking.
+  optional Effort effort = 2;
+  // Where the workspace's files come from; none, an empty workspace.
+  oneof source {
+    GitSource git = 3;
+  }
+}
+
+enum Effort {
+  EFFORT_UNSPECIFIED = 0;
+  EFFORT_LOW = 1;
+  EFFORT_MEDIUM = 2;
+  EFFORT_HIGH = 3;
+  EFFORT_MAX = 4;
+}
+
+// A public repository, cloned at `ref` (a branch or tag; absent, its default branch).
+message GitSource {
+  string url = 1;
+  optional string ref = 2;
+}

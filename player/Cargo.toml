@@ -11,7 +11,8 @@ path = "src/main.rs"
 dirigent-protocol = { path = "../protocol" }
 genai = "=0.7.0-beta.22"
 chlive-client = { git = "https://github.com/dialohq/chlive", branch = "master" }
-tokio-tungstenite = "0.30"
+tonic = "0.14"
+tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process", "fs", "io-util"] }
 tokio-util = "0.7"

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -56,6 +56,14 @@ pub struct Agent {
 
 pub const ABORTED_TOOL_RESULT: &str = "Tool call aborted by user interrupt";
 
+/// The word to leave the session (control's, through the lease): `when` becomes `Some(now)`
+/// once it's stopped, and a graceful stop (`false`) may turn into one that's now.
+pub struct Detach {
+    /// The player's epoch, which `PlayerDetached` names.
+    pub epoch: i64,
+    pub when: watch::Receiver<Option<bool>>,
+}
+
 #[derive(Debug, Clone)]
 struct Call {
     id: String,
@@ -91,10 +99,15 @@ impl Agent {
     /// messages the log leaves queued get a turn each. A turn the log leaves unfinished (the
     /// previous player stopped mid-turn) is closed first: its tool calls get aborted results and
     /// it ends Aborted.
+    ///
+    /// Told to detach, the loop starts no more turns (queued messages wait in the log for the
+    /// next player) and, once the turn running ends (cancelled if the stop is now), records
+    /// `PlayerDetached` and returns.
     pub async fn run(
         &self,
         session: &mut dyn Session,
         log: Vec<(String, Event)>,
+        mut detach: Detach,
     ) -> anyhow::Result<()> {
         let mut fold = Fold::default();
         let handled: Vec<(String, Event)> = log
@@ -126,15 +139,27 @@ impl Agent {
             "session started"
         );
         let mut client = true;
+        // `Some(now)` once told to detach
+        let mut detaching: Option<bool> = None;
 
         loop {
-            run.next_turn().await;
-            if !client && run.turn.is_none() {
+            if detaching.is_none() {
+                run.next_turn().await;
+            }
+            if (!client || detaching.is_some()) && run.turn.is_none() {
                 break;
             }
             tokio::select! {
                 biased;
                 Some(ev) = outcomes.recv() => run.handle(ev).await,
+                now = told_to_detach(&mut detach.when, detaching), if detaching != Some(true) => {
+                    info!(now, "detaching");
+                    detaching = Some(now);
+                    if let (true, Some(t)) = (now, &mut run.turn) {
+                        t.interrupted = true;
+                        t.token.cancel();
+                    }
+                }
                 ev = run.session.recv(), if client => match ev {
                     Some((id, ev)) => run.input(id, ev).await,
                     None => {
@@ -149,8 +174,29 @@ impl Agent {
                 },
             }
         }
+        if detaching.is_some() {
+            run.record(&Event::PlayerDetached {
+                epoch: detach.epoch,
+            })
+            .await;
+        }
         info!("session ended");
         Ok(())
+    }
+}
+
+/// Once `when` says something other than `seen`: whether to stop now. Never, if its sender is
+/// gone without a word.
+async fn told_to_detach(when: &mut watch::Receiver<Option<bool>>, seen: Option<bool>) -> bool {
+    loop {
+        if let Some(now) = *when.borrow_and_update() {
+            if Some(now) != seen {
+                return now;
+            }
+        }
+        if when.changed().await.is_err() {
+            return std::future::pending().await;
+        }
     }
 }
 
@@ -183,8 +229,9 @@ fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -> Ve
                 waiting.clear();
             }
             Event::PlayerAttached { .. }
+            | Event::PlayerDetached { .. }
             | Event::WorkspaceReady { .. }
-            | Event::WorkspaceFailed { .. }
+            | Event::PlayerFailed { .. }
             | Event::WorkspaceRestored { .. }
             | Event::Checkpoint { .. }
             | Event::CheckpointFailed { .. }
@@ -353,8 +400,9 @@ impl Run<'_> {
             }
             // Users' events and the loop's own decisions; never outcomes.
             Event::PlayerAttached { .. }
+            | Event::PlayerDetached { .. }
             | Event::WorkspaceReady { .. }
-            | Event::WorkspaceFailed { .. }
+            | Event::PlayerFailed { .. }
             | Event::WorkspaceRestored { .. }
             | Event::Checkpoint { .. }
             | Event::CheckpointFailed { .. }
@@ -710,8 +758,9 @@ fn log_event(ev: &Event) {
             other => warn!("turn ended: {other:?}"),
         },
         Event::PlayerAttached { .. }
+        | Event::PlayerDetached { .. }
         | Event::WorkspaceReady { .. }
-        | Event::WorkspaceFailed { .. }
+        | Event::PlayerFailed { .. }
         | Event::WorkspaceRestored { .. }
         | Event::Checkpoint { .. }
         | Event::CheckpointFailed { .. }
@@ -790,6 +839,7 @@ mod tests {
         provider: Arc<MockProvider>,
         published: Published,
         tx: mpsc::Sender<(String, Event)>,
+        detach: watch::Sender<Option<bool>>,
         task: tokio::task::JoinHandle<anyhow::Result<()>>,
     }
 
@@ -824,6 +874,7 @@ mod tests {
             checkpoints,
         };
         let (tx, inbox) = mpsc::channel(8);
+        let (detach, when) = watch::channel(None);
         let mut session = TestSession {
             log,
             inbox,
@@ -831,7 +882,9 @@ mod tests {
         };
         let task = tokio::spawn(async move {
             let log = session.load().await?;
-            agent.run(&mut session, log).await
+            agent
+                .run(&mut session, log, Detach { epoch: 1, when })
+                .await
         });
         Harness {
             _dir: dir,
@@ -839,6 +892,7 @@ mod tests {
             provider,
             published,
             tx,
+            detach,
             task,
         }
     }
@@ -921,8 +975,9 @@ mod tests {
             .filter(|e| !matches!(e, Event::ModelDelta { .. }))
             .map(|e| match e {
                 Event::PlayerAttached { epoch } => format!("attached:{epoch}"),
+                Event::PlayerDetached { epoch } => format!("detached:{epoch}"),
                 Event::WorkspaceReady { .. } => "workspace".into(),
-                Event::WorkspaceFailed { error } => format!("workspace failed:{error}"),
+                Event::PlayerFailed { error, .. } => format!("failed:{error}"),
                 Event::WorkspaceRestored { .. } => "restored".into(),
                 Event::Checkpoint { .. } => "checkpoint".into(),
                 Event::CheckpointFailed { error, .. } => format!("checkpoint failed:{error}"),
@@ -1001,6 +1056,75 @@ mod tests {
         assert_eq!(reqs[0].system.as_deref(), Some("sys"));
         let names: Vec<_> = reqs[0].tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep"]);
+    }
+
+    impl Harness {
+        /// Wait until a turn has started.
+        async fn started(&self) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !self
+                .events()
+                .iter()
+                .any(|e| matches!(e, Event::TurnStarted { .. }))
+            {
+                assert!(Instant::now() < deadline, "no turn started");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// Wait for the loop to return on its own (detached), with the client still there.
+        async fn detached(self) -> Vec<String> {
+            tokio::time::timeout(Duration::from_secs(5), self.task)
+                .await
+                .expect("the loop didn't return")
+                .unwrap()
+                .unwrap();
+            render(
+                &self
+                    .published
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(_, e)| e.clone())
+                    .collect::<Vec<_>>(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn detaching_lets_the_turn_finish_and_starts_no_more() {
+        let h = resumed(vec![sent("a"), sent("b")]);
+        h.provider
+            .reset([Script::text("one", Duration::from_millis(300))]);
+        h.started().await;
+        h.detach.send_replace(Some(false));
+        assert_eq!(
+            h.detached().await,
+            ["user:a", "assistant:one", "end:Completed", "detached:1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn detaching_while_idle_returns_at_once() {
+        let h = harness();
+        h.detach.send_replace(Some(false));
+        assert_eq!(h.detached().await, ["detached:1"]);
+    }
+
+    #[tokio::test]
+    async fn detaching_now_cancels_the_turn() {
+        let h = resumed(vec![sent("a")]);
+        h.provider
+            .reset([Script::text("one", Duration::from_secs(30))]);
+        h.started().await;
+        h.detach.send_replace(Some(false));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // the graceful stop turns into one that's now
+        h.detach.send_replace(Some(true));
+        assert_eq!(
+            h.detached().await,
+            ["user:a", "cancelled", "end:Aborted", "detached:1"]
+        );
     }
 
     #[tokio::test]

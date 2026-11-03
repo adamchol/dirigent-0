@@ -101,6 +101,12 @@ pub enum Event {
     /// From the player, before it reads the log: it holds the session's lease, as the `epoch`th
     /// player to (see `control`).
     PlayerAttached { epoch: i64 },
+    /// From the player, last: the session was stopped and it gives the lease back, as the
+    /// `epoch`th player.
+    PlayerDetached { epoch: i64 },
+    /// From the player, last: it failed, `error` says why, and gives the lease back (the session
+    /// is idle until it's started again).
+    PlayerFailed { epoch: i64, error: String },
     /// From the player, after reading the log: the workspace is in place, from `source` (as in
     /// the spec) at the commit `head`; `recreated` when the log had it ready before but the
     /// player found it gone and made it again, without what the session had changed.
@@ -115,8 +121,6 @@ pub enum Event {
     /// From the player, after reading the log: it found the workspace gone, and restored it from
     /// the log's last [`Event::Checkpoint`], `snapshot`.
     WorkspaceRestored { snapshot: String },
-    /// From the player: the workspace couldn't be made; the player stops.
-    WorkspaceFailed { error: String },
     /// From the player, after the turn `turn` ended: the workspace as it left it is the snapshot
     /// `snapshot` (kopia's id), which a player that finds the workspace gone restores.
     Checkpoint { turn: String, snapshot: String },

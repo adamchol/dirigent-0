@@ -1,11 +1,14 @@
-//! How a player holds a session: a lease from the control plane, kept for as long as the
-//! player's WebSocket to it (`/player`) is open. The player asks for one session, again until it
-//! has it; control answers with the lease, or why not yet. A clean close (a Close frame) gives
-//! the lease back; a dropped connection keeps it for a grace period, in which the same player can
-//! reconnect and resume it, with the same epoch. Each new holder gets the next epoch. With the
-//! lease comes the session's spec: what the player runs, and where its workspace comes from.
+//! How a player holds a session: a lease from the control plane, over gRPC ([`pb`], whose
+//! contract `proto/dirigent/control/v1/players.proto` describes the lease), and what a session
+//! is to control's HTTP API. The spec is kept as JSON (in Postgres and the API) and goes to the
+//! player as protobuf.
 
 use serde::{Deserialize, Serialize};
+
+/// The gRPC contract (generated): the `Players` service, its client and server.
+pub mod pb {
+    tonic::include_proto!("dirigent.control.v1");
+}
 
 /// The subject a player is, to chlive and in the session's grants.
 pub fn player_subject(player: &str) -> String {
@@ -63,32 +66,80 @@ pub enum Source {
     },
 }
 
-/// From the player, until it holds the session.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToControl {
-    /// Hold `session` as `player` (its id; the subject is [`player_subject`]). Reconnecting, the
-    /// player resumes the lease it held, `epoch`: it gets it back or loses it, never a new one.
-    Acquire {
-        session: String,
-        player: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        epoch: Option<i64>,
-    },
+impl From<SessionSpec> for pb::SessionSpec {
+    fn from(spec: SessionSpec) -> Self {
+        pb::SessionSpec {
+            model: spec.model,
+            effort: spec.effort.map(|e| pb::Effort::from(e) as i32),
+            source: spec.source.map(|s| match s {
+                Source::Git { url, reference } => pb::session_spec::Source::Git(pb::GitSource {
+                    url,
+                    r#ref: reference,
+                }),
+            }),
+        }
+    }
 }
 
-/// From control.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToPlayer {
-    /// The player holds the session, as its `epoch`th player, and runs `spec`.
-    Acquired { epoch: i64, spec: SessionSpec },
-    /// Another player holds it; ask again later.
-    Held,
-    /// No such session (yet); ask again later.
-    UnknownSession,
-    /// The lease the player resumes is gone (it expired): it must stop.
-    Lost,
+impl TryFrom<pb::SessionSpec> for SessionSpec {
+    type Error = String;
+
+    fn try_from(spec: pb::SessionSpec) -> Result<Self, String> {
+        if spec.model.is_empty() {
+            return Err("a spec without a model".into());
+        }
+        let effort = match spec.effort {
+            None => None,
+            Some(e) => Some(match pb::Effort::try_from(e) {
+                Ok(pb::Effort::Low) => Effort::Low,
+                Ok(pb::Effort::Medium) => Effort::Medium,
+                Ok(pb::Effort::High) => Effort::High,
+                Ok(pb::Effort::Max) => Effort::Max,
+                Ok(pb::Effort::Unspecified) | Err(_) => {
+                    return Err(format!("a spec with effort {e}, not one there is"))
+                }
+            }),
+        };
+        Ok(SessionSpec {
+            model: spec.model,
+            effort,
+            source: spec.source.map(|s| match s {
+                pb::session_spec::Source::Git(g) => Source::Git {
+                    url: g.url,
+                    reference: g.r#ref,
+                },
+            }),
+        })
+    }
+}
+
+impl From<Effort> for pb::Effort {
+    fn from(e: Effort) -> Self {
+        match e {
+            Effort::Low => pb::Effort::Low,
+            Effort::Medium => pb::Effort::Medium,
+            Effort::High => pb::Effort::High,
+            Effort::Max => pb::Effort::Max,
+        }
+    }
+}
+
+/// A session, as control's HTTP API shows it (`GET /sessions/{id}`, `GET /sessions`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub spec: SessionSpec,
+    /// Its holders so far; the current one's, while there is one.
+    pub epoch: i64,
+    /// The player holding its lease: none, the session is idle.
+    pub player: Option<Holder>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Holder {
+    pub subject: String,
+    /// Connected to control; `false` while it's dropped and may come back for it.
+    pub attached: bool,
 }
 
 #[cfg(test)]
@@ -96,35 +147,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn messages_are_tagged_json() {
-        let acquire = ToControl::Acquire {
-            session: "s".into(),
-            player: "p".into(),
-            epoch: None,
+    fn a_session_shows_its_holder() {
+        let info = SessionInfo {
+            id: "s".into(),
+            spec: SessionSpec::default(),
+            epoch: 3,
+            player: Some(Holder {
+                subject: "player:p".into(),
+                attached: false,
+            }),
         };
-        let wire = serde_json::to_string(&acquire).unwrap();
-        assert_eq!(wire, r#"{"type":"acquire","session":"s","player":"p"}"#);
-        assert_eq!(serde_json::from_str::<ToControl>(&wire).unwrap(), acquire);
-        let resume = r#"{"type":"acquire","session":"s","player":"p","epoch":3}"#;
-        assert!(matches!(
-            serde_json::from_str(resume).unwrap(),
-            ToControl::Acquire { epoch: Some(3), .. }
-        ));
-        for (msg, wire) in [
-            (
-                ToPlayer::Acquired {
-                    epoch: 2,
-                    spec: SessionSpec::default(),
-                },
-                r#"{"type":"acquired","epoch":2,"spec":{"model":"claude-sonnet-5","effort":"medium","source":null}}"#,
-            ),
-            (ToPlayer::Held, r#"{"type":"held"}"#),
-            (ToPlayer::UnknownSession, r#"{"type":"unknown_session"}"#),
-            (ToPlayer::Lost, r#"{"type":"lost"}"#),
-        ] {
-            assert_eq!(serde_json::to_string(&msg).unwrap(), wire);
-            assert_eq!(serde_json::from_str::<ToPlayer>(wire).unwrap(), msg);
-        }
+        let wire = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            wire["player"],
+            serde_json::json!({"subject": "player:p", "attached": false})
+        );
+        assert_eq!(serde_json::from_value::<SessionInfo>(wire).unwrap(), info);
     }
 
     #[test]
@@ -151,5 +189,41 @@ mod tests {
             serde_json::to_string(&git).unwrap(),
             r#"{"git":{"url":"u"}}"#
         );
+    }
+
+    #[test]
+    fn a_spec_goes_through_protobuf_as_it_is() {
+        use prost::Message;
+        let specs = [
+            SessionSpec::default(),
+            SessionSpec {
+                model: "m".into(),
+                effort: None,
+                source: Some(Source::Git {
+                    url: "u".into(),
+                    reference: Some("main".into()),
+                }),
+            },
+            SessionSpec {
+                model: "m".into(),
+                effort: Some(Effort::Max),
+                source: Some(Source::Git {
+                    url: "u".into(),
+                    reference: None,
+                }),
+            },
+        ];
+        for spec in specs {
+            let wire = pb::SessionSpec::from(spec.clone()).encode_to_vec();
+            let back = pb::SessionSpec::decode(wire.as_slice()).unwrap();
+            assert_eq!(SessionSpec::try_from(back).unwrap(), spec);
+        }
+        let unspecified = pb::SessionSpec {
+            model: "m".into(),
+            effort: Some(pb::Effort::Unspecified as i32),
+            source: None,
+        };
+        assert!(SessionSpec::try_from(unspecified).is_err());
+        assert!(SessionSpec::try_from(pb::SessionSpec::default()).is_err());
     }
 }

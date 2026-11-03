@@ -18,8 +18,8 @@ use crate::session::Session;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The session's log, once the workspace in `workdir` is made from `source`: with the event that
-/// says so appended, if there's one. A workspace that can't be made is a `WorkspaceFailed` in the
-/// log, and an error.
+/// says so appended, if there's one; or why it can't be made (which the player reports as it
+/// fails).
 pub async fn open(
     session: &mut dyn Session,
     workdir: &Path,
@@ -34,14 +34,7 @@ pub async fn open(
             let id = session.publish(&ev).await;
             log.push((id, ev));
         }
-        Err(error) => {
-            session
-                .publish(&Event::WorkspaceFailed {
-                    error: error.clone(),
-                })
-                .await;
-            anyhow::bail!("the workspace couldn't be made: {error}");
-        }
+        Err(error) => anyhow::bail!("the workspace couldn't be made: {error}"),
     }
     Ok(log)
 }

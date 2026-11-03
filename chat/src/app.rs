@@ -94,6 +94,12 @@ impl App {
             Event::PlayerAttached { epoch } => {
                 self.system(format!("player attached · epoch {epoch}"));
             }
+            Event::PlayerDetached { epoch } => {
+                self.system(format!("player detached · epoch {epoch}"));
+            }
+            Event::PlayerFailed { error, .. } => {
+                self.push(Line::from(format!("player failed: {error}")).red());
+            }
             Event::WorkspaceReady {
                 source,
                 head,
@@ -108,9 +114,6 @@ impl App {
                 };
                 let again = if recreated { " · recreated" } else { "" };
                 self.system(format!("workspace ready · {from}{again}"));
-            }
-            Event::WorkspaceFailed { error } => {
-                self.push(Line::from(format!("workspace failed: {error}")).red());
             }
             Event::WorkspaceRestored { snapshot } => {
                 self.system(format!("workspace restored · {}", short(&snapshot)));
@@ -490,16 +493,19 @@ mod tests {
     fn the_players_own_events_show_only_with_the_flag_but_failures_always() {
         let events = [
             Event::PlayerAttached { epoch: 1 },
-            Event::WorkspaceFailed { error: "e".into() },
+            Event::PlayerFailed {
+                epoch: 1,
+                error: "e".into(),
+            },
         ];
         let mut quiet = App::new("s".into(), "url".into(), false);
         log(&mut quiet, events.clone());
-        assert_eq!(transcript(&quiet), ["workspace failed: e"]);
+        assert_eq!(transcript(&quiet), ["player failed: e"]);
         let mut shown = app();
         log(&mut shown, events);
         assert_eq!(
             transcript(&shown),
-            ["player attached · epoch 1", "workspace failed: e"]
+            ["player attached · epoch 1", "player failed: e"]
         );
     }
 

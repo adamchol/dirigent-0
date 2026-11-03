@@ -10,18 +10,20 @@ path = "src/main.rs"
 
 [dependencies]
 dirigent-protocol = { path = "../protocol" }
-axum = { version = "0.8", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "process", "io-util"] }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-serde_json-1"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tonic = "0.14"
+tokio-stream = { version = "0.1", features = ["net"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-futures = "0.3"
-tokio-tungstenite = "0.30"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
+tempfile = "3"
+libc = "0.2"

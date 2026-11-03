@@ -193,11 +193,11 @@ mod e2e {
     use tokio::task::JoinHandle;
 
     use super::*;
-    use crate::agent::{Agent, AgentConfig};
+    use crate::agent::{Agent, AgentConfig, Detach};
     use crate::checkpoints::Checkpoints;
-    use crate::provider::mock::MockProvider;
+    use crate::provider::mock::{MockProvider, Script};
     use crate::provider::Message;
-    use crate::session::control::Lease;
+    use crate::session::control::{Lease, Refused};
     use crate::tools::Registry;
     use crate::workspace;
 
@@ -235,7 +235,8 @@ mod e2e {
         new_session_from(stack, None).await
     }
 
-    /// A new session, with [`USER`] its user and its workspace from `source`.
+    /// A new session, idle (the test starts its players), with [`USER`] its user and its workspace
+    /// from `source`.
     async fn new_session_from(stack: &Stack, source: Option<Source>) -> String {
         let session = new_id();
         let status = reqwest::Client::new()
@@ -290,7 +291,9 @@ mod e2e {
             checkpoints: Some(checkpoints),
         };
         let player = new_id();
-        let lease = Lease::acquire(&stack.control_ws, session, &player).await;
+        let lease = Lease::acquire(&stack.control_ws, session, &player, None)
+            .await
+            .unwrap();
         let mut s = ChliveSession::new(
             session,
             lease.epoch,
@@ -298,9 +301,13 @@ mod e2e {
             &player_subject(&player),
         );
         let source = lease.spec.source.clone();
+        let detach = Detach {
+            epoch: lease.epoch,
+            when: lease.detach(),
+        };
         let task = tokio::spawn(async move {
             let log = workspace::open(&mut s, workdir, source.as_ref(), Some(checkpoints)).await?;
-            agent.run(&mut s, log).await
+            agent.run(&mut s, log, detach).await
         });
         Player {
             provider,
@@ -521,31 +528,68 @@ mod e2e {
     }
 
     #[tokio::test]
-    async fn e2e_a_second_player_waits_for_the_first_to_let_go() {
+    async fn e2e_a_second_player_is_refused_while_the_first_holds_the_session() {
         let Some(stack) = stack() else { return };
         let session = new_session(&stack).await;
         let user = User::new(&stack, &session);
         let first = start(&stack, &session).await;
         log_until(&stack, &session, |r| attached(r) == [1]).await;
-        let second = {
-            let stack = stack.clone();
-            let session = session.clone();
-            tokio::spawn(async move { start(&stack, &session).await })
-        };
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert!(
-            !second.is_finished(),
-            "the second player got a held session"
-        );
+        let refused = Lease::acquire(&stack.control_ws, &session, &new_id(), None).await;
+        let err = refused.err().expect("the second player got a held session");
+        assert!(matches!(err.downcast_ref(), Some(Refused::Held)), "{err:#}");
         first.stop().await;
-        let second = tokio::time::timeout(Duration::from_secs(10), second)
-            .await
-            .expect("the second player never got the session")
-            .unwrap();
+        let second = start(&stack, &session).await;
         user.say("hi").await;
         let log = log_until(&stack, &session, |r| turns_ended(r) == 1).await;
         assert_eq!(attached(&log), [1, 2]);
         assert_eq!(second.provider.requests().len(), 1);
+        second.stop().await;
+    }
+
+    #[tokio::test]
+    async fn e2e_stopping_the_session_detaches_the_player() {
+        let Some(stack) = stack() else { return };
+        let session = new_session(&stack).await;
+        let user = User::new(&stack, &session);
+        let first = start(&stack, &session).await;
+        first
+            .provider
+            .reset([Script::text("one", Duration::from_secs(1))]);
+        user.say("hi").await;
+        log_until(&stack, &session, |r| {
+            r.iter().any(|r| r.kind == "turn_started")
+        })
+        .await;
+        let http = reqwest::Client::new();
+        let control = |action: &str| {
+            http.post(format!("{}/sessions/{session}/{action}", stack.control))
+                .send()
+        };
+        assert!(control("stop").await.unwrap().status().is_success());
+        let log = log_until(&stack, &session, |r| {
+            r.iter().any(|r| r.kind == "player_detached")
+        })
+        .await;
+        assert_eq!(
+            kinds(&log),
+            [
+                "user:hi",
+                "turn_started",
+                "assistant:one",
+                "end:Completed",
+                "player_detached"
+            ]
+        );
+        let Player { task, lease, .. } = first;
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the player didn't return")
+            .unwrap()
+            .unwrap();
+        lease.release().await;
+        // idle: the next player takes it
+        let second = start(&stack, &session).await;
+        log_until(&stack, &session, |r| attached(r) == [1, 2]).await;
         second.stop().await;
     }
 

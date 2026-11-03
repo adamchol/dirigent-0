@@ -1,6 +1,7 @@
 # The dnvr dev shell: the Rust toolchain, the local event system (nix/stack.nix: Redpanda,
 # ClickHouse, Kafka Connect with the ClickHouse sink, the pause server, chlive, Postgres), the
-# control plane with a dev session, a player for it on the mock provider, and scripts.
+# control plane running the started sessions' players (mock provider), with a dev session, and
+# scripts.
 {
   pkgs,
   presets,
@@ -28,11 +29,12 @@ let
     accessFile = "scripts/clickhouse-dev-access.sql";
     serverConfig = "nix/chlive.toml";
     cacheDir = ".dnvr/chlive-cache";
-    # the checkpoints' object store and kopia repository, and the dev player's kopia state
+    # the checkpoints' object store and kopia repository, and control's players' sessions
+    # (workspaces and players' state)
     extraData = [
       ".dnvr/rustfs"
       ".dnvr/kopia"
-      ".dnvr/player-state"
+      ".dnvr/sessions"
     ];
     # each row also stores its message's partition, offset and timestamp (db/clickhouse),
     # which chlive reads from the messages for live rows (nix/chlive.toml)
@@ -52,13 +54,13 @@ let
     export DIRIGENT_POSTGRES_URL="''${DIRIGENT_POSTGRES_URL:-$(dnvr-state get postgres.url)}"
     export DIRIGENT_CONTROL_POSTGRES="''${DIRIGENT_CONTROL_POSTGRES:-$(dnvr-state get postgres.url | sed 's|://[^@]*@|://dirigent_control@|')}"
     export DIRIGENT_CONTROL_HTTP="''${DIRIGENT_CONTROL_HTTP:-$(dnvr-state get control.url)}"
-    export DIRIGENT_CONTROL_URL="''${DIRIGENT_CONTROL_URL:-$(dnvr-state get control.wsUrl)}"
+    export DIRIGENT_CONTROL_URL="''${DIRIGENT_CONTROL_URL:-$(dnvr-state get control.grpcUrl)}"
     export DIRIGENT_KOPIA_TOKEN="''${DIRIGENT_KOPIA_TOKEN:-$(dnvr-state get kopia-repo.token)}"
   '';
 in
 { ... }:
 {
-  description = "dirigent: the control plane and a player on the mock provider over chlive (Redpanda + ClickHouse + Kafka Connect + pause server + chlive + Postgres)";
+  description = "dirigent: the control plane running players (mock provider) over chlive (Redpanda + ClickHouse + Kafka Connect + pause server + chlive + Postgres)";
 
   defaultRunner = "rex";
 
@@ -93,23 +95,32 @@ in
   inherit (stack) prerun;
 
   processes = stack.processes // {
-    # The control plane, as Postgres' `dirigent_control` role. Publishes `url` (its HTTP API)
-    # and `wsUrl` (players' WebSocket). Its port is fixed: players reconnect to the same address
-    # when it restarts.
+    # The control plane, as Postgres' `dirigent_control` role, running the started sessions'
+    # players as local processes, each in .dnvr/sessions/<id> (its output in player.log). On the
+    # mock provider unless DIRIGENT_PLAYER_ARGS says otherwise, e.g. `DIRIGENT_PLAYER_ARGS= dnvr
+    # up` for the real one. Publishes `url` (its HTTP API) and `grpcUrl` (where players hold their
+    # sessions). Its ports are fixed: players reconnect to the same address when it restarts.
     control = {
       env = {
         PG_URL = "dnvr://postgres/url";
         MIGRATED = "dnvr://migrate-postgres/ready";
+        # for the players
+        CHLIVE_URL = "dnvr://chlive/url";
+        DIRIGENT_KOPIA_TOKEN = "dnvr://kopia-repo/token";
       };
       command = ''
         cd "$DNVR_ROOT"
         port=54330
         dnvr-state set url "http://127.0.0.1:$port"
-        dnvr-state set wsUrl "ws://127.0.0.1:$port/player"
-        cargo build -q -p dirigent-control
+        grpc=54331
+        dnvr-state set grpcUrl "http://127.0.0.1:$grpc"
+        cargo build -q -p dirigent-control -p dirigent-player
         # exec'd, not `cargo run`, which wouldn't pass the stop signal on
-        exec target/debug/control --listen "127.0.0.1:$port" \
-          --postgres "''${PG_URL/:\/\/*@/://dirigent_control@}"
+        # shellcheck disable=SC2086
+        exec target/debug/control --listen "127.0.0.1:$port" --grpc-listen "127.0.0.1:$grpc" \
+          --postgres "''${PG_URL/:\/\/*@/://dirigent_control@}" \
+          --players .dnvr/sessions --player target/debug/player \
+          -- ''${DIRIGENT_PLAYER_ARGS---mock}
       '';
     };
 
@@ -156,36 +167,16 @@ in
       '';
     };
 
-    # $DIRIGENT_SESSION, made through control with `user:dev` its user; then idles.
+    # $DIRIGENT_SESSION, made and started through control with `user:dev` its user; then idles.
     dev-session = {
       env.CONTROL = "dnvr://control/url";
       command = ''
         curl -fsS --retry 60 --retry-connrefused --retry-delay 1 \
           -X PUT "$CONTROL/sessions/$DIRIGENT_SESSION" \
-          -H 'content-type: application/json' -d '{"users": ["user:dev"]}'
+          -H 'content-type: application/json' -d '{"users": ["user:dev"], "start": true}'
         dnvr-state set ready 1
         echo "[dev-session] $DIRIGENT_SESSION"
         exec tail -f /dev/null
-      '';
-    };
-
-    # A player for $DIRIGENT_SESSION, working in .dnvr/workdir. On the mock provider unless
-    # DIRIGENT_PLAYER_ARGS says otherwise, e.g. `DIRIGENT_PLAYER_ARGS= dnvr up` for the real one.
-    player = {
-      env = {
-        CHLIVE_URL = "dnvr://chlive/url";
-        DIRIGENT_CONTROL_URL = "dnvr://control/wsUrl";
-        SESSION_READY = "dnvr://dev-session/ready";
-        DIRIGENT_KOPIA_TOKEN = "dnvr://kopia-repo/token";
-      };
-      command = ''
-        cd "$DNVR_ROOT"
-        mkdir -p .dnvr/workdir
-        cargo build -q -p dirigent-player
-        # exec'd, not `cargo run`, which wouldn't pass SIGTERM on: the lease would drop instead of
-        # being given back
-        # shellcheck disable=SC2086
-        exec target/debug/player --workdir .dnvr/workdir --state-dir .dnvr/player-state ''${DIRIGENT_PLAYER_ARGS---mock}
       '';
     };
   };
@@ -201,7 +192,7 @@ in
       '';
     };
     session = {
-      description = "Make a session through control: session [--git <url> [--ref <ref>]] [--model <m>] [--effort <e>] [<uuid> [<user>]] (a new id, user:dev); prints its id. Run a player on it with `cargo run -p dirigent-player -- --mock --session <id> --workdir <dir>`";
+      description = "Make a session through control: session [--start] [--git <url> [--ref <ref>]] [--model <m>] [--effort <e>] [<uuid> [<user>]] (a new id, user:dev); prints its id. Started, control starts a player for it";
       runtimeInputs = [
         dnvrState
         pkgs.curl
@@ -213,6 +204,7 @@ in
         spec='{}'
         while [ $# -gt 0 ]; do
           case "$1" in
+            --start) spec=$(jq -c '.start = true' <<<"$spec"); shift ;;
             --git) spec=$(jq -c --arg u "$2" '.source.git.url = $u' <<<"$spec"); shift 2 ;;
             --ref) spec=$(jq -c --arg r "$2" '.source.git.ref = $r' <<<"$spec"); shift 2 ;;
             --model) spec=$(jq -c --arg m "$2" '.model = $m' <<<"$spec"); shift 2 ;;
@@ -227,12 +219,55 @@ in
         echo "$id"
       '';
     };
+    sessions = {
+      description = "The sessions control has: id, epoch and the player holding it (- when idle)";
+      runtimeInputs = [
+        dnvrState
+        pkgs.curl
+        pkgs.jq
+      ];
+      text = ''
+        ${stackEnv}
+        curl -fsS "$DIRIGENT_CONTROL_HTTP/sessions" | jq -r \
+          '.[] | [.id, .epoch, (.player | if . then .subject + (if .attached then "" else " (away)" end) else "-" end)] | @tsv'
+      '';
+    };
+    start = {
+      description = "Start (or resume) a session: start <uuid>; control starts a player for it, unless one holds it";
+      runtimeInputs = [
+        dnvrState
+        pkgs.curl
+      ];
+      text = ''
+        ${stackEnv}
+        curl -fsS -X POST "$DIRIGENT_CONTROL_HTTP/sessions/''${1:?a session id}/start"
+      '';
+    };
+    stop = {
+      description = "Stop a session: stop [--now] <uuid>; its player finishes the turn (--now: cancels it) and detaches";
+      runtimeInputs = [
+        dnvrState
+        pkgs.curl
+      ];
+      text = ''
+        ${stackEnv}
+        now=false
+        if [ "''${1:-}" = --now ]; then
+          now=true
+          shift
+        fi
+        curl -fsS -X POST "$DIRIGENT_CONTROL_HTTP/sessions/''${1:?a session id}/stop" \
+          -H 'content-type: application/json' -d "{\"now\": $now}"
+      '';
+    };
     e2e = {
       description = "Run the control plane's and the player's tests against the running stack (mock provider)";
       runtimeInputs = [ dnvrState ];
       text = ''
         ${stackEnv}
         cd "$DNVR_ROOT"
+        # control's tests run it
+        cargo build -q -p dirigent-player
         DIRIGENT_E2E=1 cargo test -p dirigent-control e2e "$@"
         DIRIGENT_E2E=1 exec cargo test -p dirigent-player e2e "$@"
       '';

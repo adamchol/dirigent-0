@@ -120,8 +120,9 @@ impl Entry {
                 ),
             }),
             Event::PlayerAttached { .. }
+            | Event::PlayerDetached { .. }
             | Event::WorkspaceReady { .. }
-            | Event::WorkspaceFailed { .. }
+            | Event::PlayerFailed { .. }
             | Event::WorkspaceRestored { .. }
             | Event::Checkpoint { .. }
             | Event::CheckpointFailed { .. }
