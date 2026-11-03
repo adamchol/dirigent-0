@@ -112,8 +112,16 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         recreated: bool,
     },
+    /// From the player, after reading the log: it found the workspace gone, and restored it from
+    /// the log's last [`Event::Checkpoint`], `snapshot`.
+    WorkspaceRestored { snapshot: String },
     /// From the player: the workspace couldn't be made; the player stops.
     WorkspaceFailed { error: String },
+    /// From the player, after the turn `turn` ended: the workspace as it left it is the snapshot
+    /// `snapshot` (kopia's id), which a player that finds the workspace gone restores.
+    Checkpoint { turn: String, snapshot: String },
+    /// From the player: the turn `turn` got no checkpoint; the session goes on.
+    CheckpointFailed { turn: String, error: String },
     /// From a user.
     UserMessage { text: String },
     /// From a user: stop the turn `turn`, the one they saw running.

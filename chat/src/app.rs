@@ -25,6 +25,8 @@ pub enum Action {
 pub struct App {
     session: String,
     url: String,
+    /// Whether the player's own events (attaching, the workspace, checkpoints) are shown.
+    events: bool,
     lines: Vec<Line<'static>>,
     /// Lines scrolled up from the bottom; 0 follows new output.
     scroll_up: usize,
@@ -42,10 +44,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(session: String, url: String) -> Self {
+    pub fn new(session: String, url: String, events: bool) -> Self {
         App {
             session,
             url,
+            events,
             lines: Vec::new(),
             scroll_up: 0,
             input: String::new(),
@@ -89,7 +92,7 @@ impl App {
     fn on_handled(&mut self, ev: Event) {
         match ev {
             Event::PlayerAttached { epoch } => {
-                self.push(Line::from(format!("player attached · epoch {epoch}")).dim());
+                self.system(format!("player attached · epoch {epoch}"));
             }
             Event::WorkspaceReady {
                 source,
@@ -98,16 +101,25 @@ impl App {
             } => {
                 let from = match (&source, &head) {
                     (Some(Source::Git { url, .. }), Some(head)) => {
-                        format!("{url}@{}", &head[..head.len().min(8)])
+                        format!("{url}@{}", short(head))
                     }
                     (Some(Source::Git { url, .. }), None) => url.clone(),
                     (None, _) => "empty".into(),
                 };
                 let again = if recreated { " · recreated" } else { "" };
-                self.push(Line::from(format!("workspace ready · {from}{again}")).dim());
+                self.system(format!("workspace ready · {from}{again}"));
             }
             Event::WorkspaceFailed { error } => {
                 self.push(Line::from(format!("workspace failed: {error}")).red());
+            }
+            Event::WorkspaceRestored { snapshot } => {
+                self.system(format!("workspace restored · {}", short(&snapshot)));
+            }
+            Event::Checkpoint { snapshot, .. } => {
+                self.system(format!("checkpoint · {}", short(&snapshot)));
+            }
+            Event::CheckpointFailed { error, .. } => {
+                self.push(Line::from(format!("checkpoint failed: {error}")).red());
             }
             Event::UserMessage { text } => {
                 if !self.working {
@@ -268,6 +280,13 @@ impl App {
 
     fn push(&mut self, line: Line<'static>) {
         self.lines.push(line);
+    }
+
+    /// One of the player's own events, dimmed; shown only with `--events`.
+    fn system(&mut self, text: String) {
+        if self.events {
+            self.push(Line::from(text).dim());
+        }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -432,6 +451,11 @@ fn summarize(input: &Value) -> String {
     }
 }
 
+/// An id (a commit, a snapshot), shortened for display.
+fn short(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
 fn tokens(n: u64) -> String {
     if n < 1000 {
         n.to_string()
@@ -451,7 +475,7 @@ mod tests {
     }
 
     fn app() -> App {
-        App::new("s".into(), "url".into())
+        App::new("s".into(), "url".into(), true)
     }
 
     fn transcript(app: &App) -> Vec<String> {
@@ -460,6 +484,23 @@ mod tests {
 
     fn screen(app: &App) -> Vec<String> {
         app.screen().iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn the_players_own_events_show_only_with_the_flag_but_failures_always() {
+        let events = [
+            Event::PlayerAttached { epoch: 1 },
+            Event::WorkspaceFailed { error: "e".into() },
+        ];
+        let mut quiet = App::new("s".into(), "url".into(), false);
+        log(&mut quiet, events.clone());
+        assert_eq!(transcript(&quiet), ["workspace failed: e"]);
+        let mut shown = app();
+        log(&mut shown, events);
+        assert_eq!(
+            transcript(&shown),
+            ["player attached · epoch 1", "workspace failed: e"]
+        );
     }
 
     /// Log the player's `events`, with ids nothing refers to.

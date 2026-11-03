@@ -28,6 +28,12 @@ let
     accessFile = "scripts/clickhouse-dev-access.sql";
     serverConfig = "nix/chlive.toml";
     cacheDir = ".dnvr/chlive-cache";
+    # the checkpoints' object store and kopia repository, and the dev player's kopia state
+    extraData = [
+      ".dnvr/rustfs"
+      ".dnvr/kopia"
+      ".dnvr/player-state"
+    ];
     # each row also stores its message's partition, offset and timestamp (db/clickhouse),
     # which chlive reads from the messages for live rows (nix/chlive.toml)
     connectorSettings.session_events = {
@@ -47,6 +53,7 @@ let
     export DIRIGENT_CONTROL_POSTGRES="''${DIRIGENT_CONTROL_POSTGRES:-$(dnvr-state get postgres.url | sed 's|://[^@]*@|://dirigent_control@|')}"
     export DIRIGENT_CONTROL_HTTP="''${DIRIGENT_CONTROL_HTTP:-$(dnvr-state get control.url)}"
     export DIRIGENT_CONTROL_URL="''${DIRIGENT_CONTROL_URL:-$(dnvr-state get control.wsUrl)}"
+    export DIRIGENT_KOPIA_TOKEN="''${DIRIGENT_KOPIA_TOKEN:-$(dnvr-state get kopia-repo.token)}"
   '';
 in
 { ... }:
@@ -64,8 +71,11 @@ in
     pkg-config
     jq
     curl
-    # the player clones sessions' sources with it
+    # the player clones sessions' sources with git, and checkpoints workspaces with kopia (to
+    # RustFS, S3)
     git
+    kopia
+    rustfs
     nixfmt
     dnvrState
     # migrations (openmig.toml); its scratch servers run these, the same majors as the stack's
@@ -103,6 +113,49 @@ in
       '';
     };
 
+    # RustFS: the S3 store workspaces are checkpointed to (through kopia-repo). Publishes `url`.
+    rustfs = {
+      command = ''
+        cd "$DNVR_ROOT"
+        mkdir -p .dnvr/rustfs
+        port=$(dnvr-state pick-port)
+        dnvr-state set url "http://127.0.0.1:$port"
+        exec rustfs server --address "127.0.0.1:$port" \
+          --access-key dirigent --secret-key dirigent-dev-secret .dnvr/rustfs
+      '';
+    };
+
+    # The kopia repository on RustFS, made once, with the checkpoints' policy: `.gitignore`d files
+    # and files over 50 MB are left out, and no snapshot ever expires (the log refers to them).
+    # Publishes `token`, which players connect with; then idles.
+    kopia-repo = {
+      env.S3 = "dnvr://rustfs/url";
+      command = ''
+        cd "$DNVR_ROOT"
+        mkdir -p .dnvr/kopia
+        export KOPIA_CONFIG_PATH=.dnvr/kopia/admin.config KOPIA_LOG_DIR=.dnvr/kopia/logs \
+          KOPIA_CHECK_FOR_UPDATES=false
+        # the bucket; RustFS answers 503 for a moment after it's up
+        timeout 60 sh -c "until curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 \
+          --user dirigent:dirigent-dev-secret -X PUT '$S3/dirigent-workspaces' -o /dev/null \
+          || curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 --user dirigent:dirigent-dev-secret \
+          -I '$S3/dirigent-workspaces' -o /dev/null; do sleep 1; done"
+        s3=(--bucket dirigent-workspaces --endpoint "''${S3#http://}" --disable-tls
+          --access-key dirigent --secret-access-key dirigent-dev-secret --password dirigent-dev)
+        if ! kopia repository connect s3 "''${s3[@]}" >/dev/null 2>&1; then
+          kopia repository create s3 "''${s3[@]}"
+        fi
+        kopia policy set --global --add-dot-ignore .gitignore --max-file-size 50000000 \
+          --keep-latest 1000000000 --keep-hourly 0 --keep-daily 0 --keep-weekly 0 \
+          --keep-monthly 0 --keep-annual 0 >/dev/null
+        token=$(kopia repository status -t -s | grep -o -- '--token [^ ]*' | cut -d' ' -f2)
+        dnvr-state set token "$token"
+        dnvr-state set ready 1
+        echo "[kopia-repo] ready"
+        exec tail -f /dev/null
+      '';
+    };
+
     # $DIRIGENT_SESSION, made through control with `user:dev` its user; then idles.
     dev-session = {
       env.CONTROL = "dnvr://control/url";
@@ -123,6 +176,7 @@ in
         CHLIVE_URL = "dnvr://chlive/url";
         DIRIGENT_CONTROL_URL = "dnvr://control/wsUrl";
         SESSION_READY = "dnvr://dev-session/ready";
+        DIRIGENT_KOPIA_TOKEN = "dnvr://kopia-repo/token";
       };
       command = ''
         cd "$DNVR_ROOT"
@@ -131,7 +185,7 @@ in
         # exec'd, not `cargo run`, which wouldn't pass SIGTERM on: the lease would drop instead of
         # being given back
         # shellcheck disable=SC2086
-        exec target/debug/player --workdir .dnvr/workdir ''${DIRIGENT_PLAYER_ARGS---mock}
+        exec target/debug/player --workdir .dnvr/workdir --state-dir .dnvr/player-state ''${DIRIGENT_PLAYER_ARGS---mock}
       '';
     };
   };

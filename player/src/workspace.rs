@@ -4,19 +4,18 @@
 //! ([`Event::WorkspaceReady`]), so a player that finds it gone on a later start makes it again.
 
 use std::path::Path;
-use std::process::Stdio;
 use std::time::Duration;
 
 use dirigent_protocol::control::Source;
 use dirigent_protocol::Event;
 use tokio::process::Command;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::checkpoints::Checkpoints;
+use crate::process::{command, run};
 use crate::session::Session;
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
-/// How much of git's stderr a failure keeps.
-const ERROR_TAIL: usize = 2000;
 
 /// The session's log, once the workspace in `workdir` is made from `source`: with the event that
 /// says so appended, if there's one. A workspace that can't be made is a `WorkspaceFailed` in the
@@ -25,12 +24,13 @@ pub async fn open(
     session: &mut dyn Session,
     workdir: &Path,
     source: Option<&Source>,
+    checkpoints: Option<&Checkpoints>,
 ) -> anyhow::Result<Vec<(String, Event)>> {
     let mut log = session.load().await?;
-    match prepare(workdir, source, &log).await {
+    match prepare(workdir, source, &log, checkpoints).await {
         Ok(None) => {}
         Ok(Some(ev)) => {
-            info!(?ev, "workspace ready");
+            info!(?ev, "workspace in place");
             let id = session.publish(&ev).await;
             log.push((id, ev));
         }
@@ -47,11 +47,13 @@ pub async fn open(
 }
 
 /// Make the workspace in `workdir` (which exists) from `source`, as `log` (the session's log so
-/// far) needs: the event to append, if any, or why it couldn't be made.
+/// far) needs: the event to append, if any, or why it couldn't be made. Found gone, it's
+/// restored from the log's last checkpoint, given `checkpoints`; without, made again.
 pub async fn prepare(
     workdir: &Path,
     source: Option<&Source>,
     log: &[(String, Event)],
+    checkpoints: Option<&Checkpoints>,
 ) -> Result<Option<Event>, String> {
     let ready = log
         .iter()
@@ -60,6 +62,24 @@ pub async fn prepare(
         .map_err(|e| format!("reading {}: {e}", workdir.display()))?
         .next()
         .is_none();
+    let last = log.iter().rev().find_map(|(_, e)| match e {
+        Event::Checkpoint { snapshot, .. } => Some(snapshot),
+        _ => None,
+    });
+    if let (true, Some(snapshot)) = (empty, last) {
+        match checkpoints {
+            Some(checkpoints) => {
+                checkpoints.restore(snapshot, workdir).await?;
+                return Ok(Some(Event::WorkspaceRestored {
+                    snapshot: snapshot.clone(),
+                }));
+            }
+            None => warn!(
+                snapshot,
+                "the workspace is gone, and checkpoints are off: making it again"
+            ),
+        }
+    }
     match (source, ready, empty) {
         (_, true, false) | (None, true, true) => Ok(None),
         (None, false, _) => Ok(Some(Event::WorkspaceReady {
@@ -107,31 +127,9 @@ async fn head(workdir: &Path) -> Result<String, String> {
 }
 
 fn git() -> Command {
-    let mut cmd = Command::new("git");
-    cmd.env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let mut cmd = command("git");
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd
-}
-
-/// Its stdout, or the tail of its stderr.
-async fn run(mut cmd: Command, timeout: Duration) -> Result<String, String> {
-    let out = tokio::time::timeout(timeout, cmd.output())
-        .await
-        .map_err(|_| format!("timed out after {}s", timeout.as_secs()))?
-        .map_err(|e| format!("running git: {e}"))?;
-    if out.status.success() {
-        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
-    }
-    let err = String::from_utf8_lossy(&out.stderr);
-    let err = err.trim();
-    let start = err.len().saturating_sub(ERROR_TAIL);
-    let start = (start..err.len())
-        .find(|&i| err.is_char_boundary(i))
-        .unwrap_or(err.len());
-    Err(format!("{} ({})", &err[start..], out.status))
 }
 
 #[cfg(test)]
@@ -189,7 +187,7 @@ pub(crate) mod tests {
             source: Some(got),
             head: Some(head),
             recreated: false,
-        }) = prepare(&work, Some(&source), &[]).await.unwrap()
+        }) = prepare(&work, Some(&source), &[], None).await.unwrap()
         else {
             panic!("not ready");
         };
@@ -200,7 +198,10 @@ pub(crate) mod tests {
             "main\n"
         );
         // a later start finds it there
-        assert_eq!(prepare(&work, Some(&source), &ready(false)).await, Ok(None));
+        assert_eq!(
+            prepare(&work, Some(&source), &ready(false), None).await,
+            Ok(None)
+        );
     }
 
     #[tokio::test]
@@ -209,7 +210,7 @@ pub(crate) mod tests {
         let url = repo(tmp.path());
         let work = tmp.path().join("ws");
         std::fs::create_dir(&work).unwrap();
-        prepare(&work, Some(&git_source(&url, Some("dev"))), &[])
+        prepare(&work, Some(&git_source(&url, Some("dev"))), &[], None)
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(work.join("file")).unwrap(), "dev\n");
@@ -221,7 +222,7 @@ pub(crate) mod tests {
         let url = repo(tmp.path());
         let work = tmp.path().join("ws");
         std::fs::create_dir(&work).unwrap();
-        let got = prepare(&work, Some(&git_source(&url, None)), &ready(false)).await;
+        let got = prepare(&work, Some(&git_source(&url, None)), &ready(false), None).await;
         assert!(
             matches!(
                 got,
@@ -240,16 +241,22 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("mine"), "x").unwrap();
         assert_eq!(
-            prepare(tmp.path(), None, &[]).await,
+            prepare(tmp.path(), None, &[], None).await,
             Ok(Some(Event::WorkspaceReady {
                 source: None,
                 head: None,
                 recreated: false
             }))
         );
-        assert_eq!(prepare(tmp.path(), None, &ready(false)).await, Ok(None));
+        assert_eq!(
+            prepare(tmp.path(), None, &ready(false), None).await,
+            Ok(None)
+        );
         let empty = tempfile::tempdir().unwrap();
-        assert_eq!(prepare(empty.path(), None, &ready(false)).await, Ok(None));
+        assert_eq!(
+            prepare(empty.path(), None, &ready(false), None).await,
+            Ok(None)
+        );
     }
 
     #[tokio::test]
@@ -259,7 +266,7 @@ pub(crate) mod tests {
         let work = tmp.path().join("ws");
         std::fs::create_dir(&work).unwrap();
         std::fs::write(work.join("mine"), "x").unwrap();
-        let err = prepare(&work, Some(&git_source(&url, None)), &[])
+        let err = prepare(&work, Some(&git_source(&url, None)), &[], None)
             .await
             .unwrap_err();
         assert!(err.contains("isn't empty"), "{err}");
@@ -269,9 +276,65 @@ pub(crate) mod tests {
     async fn a_bad_url_fails_without_asking_for_credentials() {
         let tmp = tempfile::tempdir().unwrap();
         let url = format!("file://{}/nothing.git", tmp.path().display());
-        let err = prepare(tmp.path(), Some(&git_source(&url, None)), &[])
+        let err = prepare(tmp.path(), Some(&git_source(&url, None)), &[], None)
             .await
             .unwrap_err();
         assert!(err.starts_with("cloning file://"), "{err}");
+    }
+
+    fn checkpointed(snapshot: &str) -> Vec<(String, Event)> {
+        let mut log = ready(false);
+        log.push((
+            "e1".into(),
+            Event::Checkpoint {
+                turn: "t".into(),
+                snapshot: snapshot.into(),
+            },
+        ));
+        log
+    }
+
+    #[tokio::test]
+    async fn a_workspace_found_gone_is_restored_from_the_last_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = repo(tmp.path());
+        let cp = crate::checkpoints::tests::checkpoints(tmp.path()).await;
+        let old = tmp.path().join("old");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("notes"), "mine").unwrap();
+        let snapshot = cp.snapshot(&old, "t").await.unwrap();
+        let source = git_source(&url, None);
+
+        let work = tmp.path().join("ws");
+        std::fs::create_dir(&work).unwrap();
+        let log = checkpointed(&snapshot);
+        assert_eq!(
+            prepare(&work, Some(&source), &log, Some(&cp)).await,
+            Ok(Some(Event::WorkspaceRestored {
+                snapshot: snapshot.clone()
+            }))
+        );
+        assert_eq!(std::fs::read_to_string(work.join("notes")).unwrap(), "mine");
+        // there, it's kept as it is
+        assert_eq!(
+            prepare(&work, Some(&source), &log, Some(&cp)).await,
+            Ok(None)
+        );
+
+        // without checkpoints, it's made again from the source
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let got = prepare(&other, Some(&source), &log, None).await;
+        assert!(
+            matches!(
+                got,
+                Ok(Some(Event::WorkspaceReady {
+                    recreated: true,
+                    ..
+                }))
+            ),
+            "{got:?}"
+        );
+        assert!(other.join("file").exists() && !other.join("notes").exists());
     }
 }

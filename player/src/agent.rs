@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::checkpoints::Checkpoints;
 use crate::compact;
 use crate::history::{History, CHARS_PER_TOKEN};
 use crate::provider::{
@@ -49,6 +50,8 @@ pub struct Agent {
     pub cfg: AgentConfig,
     pub tools: Arc<Registry>,
     pub workdir: &'static Path,
+    /// Where the workspace is snapshotted after every turn; none, it isn't.
+    pub checkpoints: Option<&'static Checkpoints>,
 }
 
 pub const ABORTED_TOOL_RESULT: &str = "Tool call aborted by user interrupt";
@@ -182,6 +185,9 @@ fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -> Ve
             Event::PlayerAttached { .. }
             | Event::WorkspaceReady { .. }
             | Event::WorkspaceFailed { .. }
+            | Event::WorkspaceRestored { .. }
+            | Event::Checkpoint { .. }
+            | Event::CheckpointFailed { .. }
             | Event::UserInterrupt { .. }
             | Event::TurnStarted { .. }
             | Event::Steered { .. }
@@ -349,6 +355,9 @@ impl Run<'_> {
             Event::PlayerAttached { .. }
             | Event::WorkspaceReady { .. }
             | Event::WorkspaceFailed { .. }
+            | Event::WorkspaceRestored { .. }
+            | Event::Checkpoint { .. }
+            | Event::CheckpointFailed { .. }
             | Event::UserMessage { .. }
             | Event::UserInterrupt { .. }
             | Event::TurnStarted { .. }
@@ -364,9 +373,22 @@ impl Run<'_> {
         self.history.push(&id, ev);
     }
 
+    /// The turn ends, and the workspace as it left it is checkpointed. The loop waits for the
+    /// snapshot: what users send meanwhile waits in the session.
     async fn end_turn(&mut self, reason: TurnEndReason) {
-        let interrupt = self.turn.take().and_then(|t| t.interrupt);
+        let (turn, interrupt) = match self.turn.take() {
+            Some(t) => (Some(t.id), t.interrupt),
+            None => (None, None),
+        };
         self.record(&Event::TurnEnded { reason, interrupt }).await;
+        let (Some(checkpoints), Some(turn)) = (self.agent.checkpoints, turn) else {
+            return;
+        };
+        let ev = match checkpoints.snapshot(self.agent.workdir, &turn).await {
+            Ok(snapshot) => Event::Checkpoint { turn, snapshot },
+            Err(error) => Event::CheckpointFailed { turn, error },
+        };
+        self.record(&ev).await;
     }
 
     /// Call the model on the history, or compact it first when it is near the window.
@@ -690,6 +712,9 @@ fn log_event(ev: &Event) {
         Event::PlayerAttached { .. }
         | Event::WorkspaceReady { .. }
         | Event::WorkspaceFailed { .. }
+        | Event::WorkspaceRestored { .. }
+        | Event::Checkpoint { .. }
+        | Event::CheckpointFailed { .. }
         | Event::UserMessage { .. }
         | Event::UserInterrupt { .. }
         | Event::TurnStarted { .. }
@@ -778,6 +803,14 @@ mod tests {
     }
 
     fn resumed_with(log: Vec<(String, Event)>, cfg: AgentConfig) -> Harness {
+        with_checkpoints(log, cfg, None)
+    }
+
+    fn with_checkpoints(
+        log: Vec<(String, Event)>,
+        cfg: AgentConfig,
+        checkpoints: Option<&'static Checkpoints>,
+    ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let workdir: &'static Path =
             Box::leak(dir.path().canonicalize().unwrap().into_boxed_path());
@@ -788,6 +821,7 @@ mod tests {
             cfg,
             tools: Arc::new(Registry::default_set()),
             workdir,
+            checkpoints,
         };
         let (tx, inbox) = mpsc::channel(8);
         let mut session = TestSession {
@@ -889,6 +923,9 @@ mod tests {
                 Event::PlayerAttached { epoch } => format!("attached:{epoch}"),
                 Event::WorkspaceReady { .. } => "workspace".into(),
                 Event::WorkspaceFailed { error } => format!("workspace failed:{error}"),
+                Event::WorkspaceRestored { .. } => "restored".into(),
+                Event::Checkpoint { .. } => "checkpoint".into(),
+                Event::CheckpointFailed { error, .. } => format!("checkpoint failed:{error}"),
                 Event::UserMessage { text } => format!("user:{text}"),
                 Event::UserInterrupt { .. } => "interrupt".into(),
                 Event::TurnStarted { input } => format!("user:{}", text_of(input)),
@@ -964,6 +1001,60 @@ mod tests {
         assert_eq!(reqs[0].system.as_deref(), Some("sys"));
         let names: Vec<_> = reqs[0].tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep"]);
+    }
+
+    #[tokio::test]
+    async fn every_turn_ends_with_a_checkpoint_of_the_workspace() {
+        let repo = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let checkpoints: &'static Checkpoints = Box::leak(Box::new(
+            crate::checkpoints::tests::checkpoints(repo.path()).await,
+        ));
+        let h = with_checkpoints(Vec::new(), CFG, Some(checkpoints));
+        h.provider.reset([
+            Script::text("one", Duration::ZERO),
+            Script::text("two", Duration::ZERO),
+        ]);
+        std::fs::write(h.workdir.join("f"), "x").unwrap();
+        h.send("a").await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !h
+            .events()
+            .iter()
+            .any(|e| matches!(e, Event::Checkpoint { .. }))
+        {
+            assert!(Instant::now() < deadline, "no checkpoint");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        h.send("b").await;
+        let published = h.published.clone();
+        let (kinds, _) = h.finish(2).await;
+        assert_eq!(
+            kinds,
+            [
+                "user:a",
+                "assistant:one",
+                "end:Completed",
+                "checkpoint",
+                "user:b",
+                "assistant:two",
+                "end:Completed",
+                "checkpoint"
+            ]
+        );
+        let published = published.lock().unwrap();
+        let started: Vec<_> = published
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::TurnStarted { .. }))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let checkpointed: Vec<_> = published
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Event::Checkpoint { turn, .. } => Some(turn.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, checkpointed);
     }
 
     #[tokio::test]

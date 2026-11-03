@@ -1,6 +1,8 @@
 mod agent;
+mod checkpoints;
 mod compact;
 mod history;
+mod process;
 mod provider;
 mod session;
 mod tools;
@@ -12,9 +14,10 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::builder::styling::{AnsiColor, Styles};
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::agent::{Agent, AgentConfig};
+use crate::checkpoints::Checkpoints;
 use crate::provider::Provider;
 use crate::session::chlive::ChliveSession;
 use crate::session::control::Lease;
@@ -69,6 +72,16 @@ struct Cli {
     #[arg(long, env = "WORKDIR", default_value = ".")]
     workdir: PathBuf,
 
+    /// The kopia repository the workspace is checkpointed to after every turn, and restored
+    /// from when it's found gone (`kopia repository status -t`). Without it, no checkpoints.
+    #[arg(long, env = "DIRIGENT_KOPIA_TOKEN", hide_env_values = true)]
+    kopia_token: Option<String>,
+
+    /// The player's own state, outside the workspace: kopia's config and cache. A new
+    /// directory in the system's temporary one when absent.
+    #[arg(long, env = "DIRIGENT_STATE_DIR")]
+    state_dir: Option<PathBuf>,
+
     /// The model's context window in tokens; the context is compacted at 85% of it.
     #[arg(long, env = "DIRIGENT_CONTEXT_WINDOW", default_value_t = 200_000)]
     context_window: u64,
@@ -117,6 +130,26 @@ async fn main() -> anyhow::Result<()> {
         Some(p) => uuid(p, "--player-id")?,
         None => uuid::Uuid::new_v4().to_string(),
     };
+    let checkpoints: Option<&'static Checkpoints> = match &cli.kopia_token {
+        Some(token) => {
+            let state = match &cli.state_dir {
+                Some(dir) => dir.clone(),
+                None => std::env::temp_dir().join(format!("dirigent-player-{player}")),
+            };
+            std::fs::create_dir_all(&state)?;
+            anyhow::ensure!(
+                !state.canonicalize()?.starts_with(workdir),
+                "--state-dir {} is inside the workspace",
+                state.display()
+            );
+            let checkpoints = Checkpoints::connect(token, &state, &id).await?;
+            Some(Box::leak(Box::new(checkpoints)))
+        }
+        None => {
+            warn!("no --kopia-token: the workspace isn't checkpointed");
+            None
+        }
+    };
     info!(
         session = id,
         player,
@@ -128,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
     let mut session =
         ChliveSession::new(&id, lease.epoch, &cli.chlive_url, &player_subject(&player));
     let run = async {
-        let log = workspace::open(&mut session, workdir, spec.source.as_ref()).await?;
+        let log = workspace::open(&mut session, workdir, spec.source.as_ref(), checkpoints).await?;
         // after the workspace is made: its AGENTS.md is part of the prompt
         let system: &'static str = Box::leak(build_system_prompt(workdir).into_boxed_str());
         let agent = Agent {
@@ -141,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
             },
             tools: Arc::new(Registry::default_set()),
             workdir,
+            checkpoints,
         };
         info!(
             session = id,

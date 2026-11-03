@@ -194,6 +194,7 @@ mod e2e {
 
     use super::*;
     use crate::agent::{Agent, AgentConfig};
+    use crate::checkpoints::Checkpoints;
     use crate::provider::mock::MockProvider;
     use crate::provider::Message;
     use crate::session::control::Lease;
@@ -208,6 +209,8 @@ mod e2e {
         /// Control's HTTP API, and its WebSocket for players.
         control: String,
         control_ws: String,
+        /// The kopia repository players checkpoint to.
+        kopia: String,
     }
 
     fn stack() -> Option<Stack> {
@@ -219,6 +222,7 @@ mod e2e {
             chlive: var("CHLIVE_URL"),
             control: var("DIRIGENT_CONTROL_HTTP"),
             control_ws: var("DIRIGENT_CONTROL_URL"),
+            kopia: var("DIRIGENT_KOPIA_TOKEN"),
         })
     }
 
@@ -250,6 +254,7 @@ mod e2e {
         lease: Lease,
         task: JoinHandle<anyhow::Result<()>>,
         dir: tempfile::TempDir,
+        _state: tempfile::TempDir,
     }
 
     impl Player {
@@ -265,6 +270,12 @@ mod e2e {
         let dir = tempfile::tempdir().unwrap();
         let workdir: &'static Path =
             Box::leak(dir.path().canonicalize().unwrap().into_boxed_path());
+        let state = tempfile::tempdir().unwrap();
+        let checkpoints: &'static Checkpoints = Box::leak(Box::new(
+            Checkpoints::connect(&stack.kopia, state.path(), session)
+                .await
+                .unwrap(),
+        ));
         let provider = Arc::new(MockProvider::default());
         let agent = Agent {
             provider: provider.clone(),
@@ -276,6 +287,7 @@ mod e2e {
             },
             tools: Arc::new(Registry::default_set()),
             workdir,
+            checkpoints: Some(checkpoints),
         };
         let player = new_id();
         let lease = Lease::acquire(&stack.control_ws, session, &player).await;
@@ -287,7 +299,7 @@ mod e2e {
         );
         let source = lease.spec.source.clone();
         let task = tokio::spawn(async move {
-            let log = workspace::open(&mut s, workdir, source.as_ref()).await?;
+            let log = workspace::open(&mut s, workdir, source.as_ref(), Some(checkpoints)).await?;
             agent.run(&mut s, log).await
         });
         Player {
@@ -295,6 +307,7 @@ mod e2e {
             lease,
             task,
             dir,
+            _state: state,
         }
     }
 
@@ -374,7 +387,9 @@ mod e2e {
     /// What happened, leaving out the players attaching and their workspaces.
     fn kinds(rows: &[EventRow]) -> Vec<String> {
         rows.iter()
-            .filter(|r| r.kind != "player_attached" && r.kind != "workspace_ready")
+            .filter(|r| {
+                !["player_attached", "workspace_ready", "checkpoint"].contains(&r.kind.as_str())
+            })
             .map(|r| match r.event().unwrap() {
                 Event::UserMessage { text } => format!("user:{text}"),
                 Event::AssistantMessage { content, .. } => {
@@ -584,5 +599,53 @@ mod e2e {
             "main\n"
         );
         player.stop().await;
+    }
+
+    #[tokio::test]
+    async fn e2e_a_player_on_a_new_machine_restores_the_last_checkpoint() {
+        let Some(stack) = stack() else { return };
+        let repos = tempfile::tempdir().unwrap();
+        let source = Source::Git {
+            url: workspace::tests::repo(repos.path()),
+            reference: None,
+        };
+        let session = new_session_from(&stack, Some(source)).await;
+        let user = User::new(&stack, &session);
+        let first = start(&stack, &session).await;
+        log_until(&stack, &session, |r| {
+            r.iter().any(|r| r.kind == "workspace_ready")
+        })
+        .await;
+        std::fs::write(first.dir.path().join("notes.txt"), "mine").unwrap();
+        user.say("hi").await;
+        let log = log_until(&stack, &session, |r| {
+            r.iter().any(|r| r.kind == "checkpoint")
+        })
+        .await;
+        let snapshot = log
+            .iter()
+            .find_map(|r| match r.event().unwrap() {
+                Event::Checkpoint { snapshot, .. } => Some(snapshot),
+                _ => None,
+            })
+            .unwrap();
+        first.stop().await;
+
+        let second = start(&stack, &session).await;
+        let log = log_until(&stack, &session, |r| {
+            r.iter().any(|r| r.kind == "workspace_restored")
+        })
+        .await;
+        assert!(log.iter().any(|r| r.event().unwrap()
+            == Event::WorkspaceRestored {
+                snapshot: snapshot.clone()
+            }));
+        let dir = second.dir.path();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.txt")).unwrap(),
+            "mine"
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("file")).unwrap(), "main\n");
+        second.stop().await;
     }
 }

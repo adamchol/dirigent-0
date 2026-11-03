@@ -122,6 +122,9 @@ impl Entry {
             Event::PlayerAttached { .. }
             | Event::WorkspaceReady { .. }
             | Event::WorkspaceFailed { .. }
+            | Event::WorkspaceRestored { .. }
+            | Event::Checkpoint { .. }
+            | Event::CheckpointFailed { .. }
             | Event::UserInterrupt { .. }
             | Event::TurnStarted { .. }
             | Event::Steered { .. }

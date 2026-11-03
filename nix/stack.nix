@@ -30,6 +30,8 @@
   cacheDir,
   # per topic, more settings for its sink connector (e.g. transforms)
   connectorSettings ? { },
+  # more data directories for `reset-data` to delete, relative to DNVR_ROOT
+  extraData ? [ ],
 }:
 let
   dir = n: ".dnvr/${n}";
@@ -391,13 +393,15 @@ in
       text = ''exec ${postgresql}/bin/psql "$(dnvr-state get postgres.url)" "$@"'';
     };
     reset-data = {
-      description = "Delete the local Redpanda, ClickHouse, Postgres and chlive cache data (run while `dnvr up` is stopped)";
+      description = "Delete the local Redpanda, ClickHouse, Postgres and chlive cache data, and the stack's own (run while `dnvr up` is stopped)";
       text = ''
         # Kafka (with Connect's own topics) and ClickHouse (with the sink's KeeperMap offsets)
         # go together; chlive's stored results hold cursors into both.
         ${resetRedpanda}
         rm -rf "''${DNVR_ROOT:?}/${dir "clickhouse"}" "''${DNVR_ROOT:?}/${cacheDir}" \
-          "''${DNVR_ROOT:?}/${dir "postgres"}"
+          "''${DNVR_ROOT:?}/${dir "postgres"}" ${
+            pkgs.lib.concatMapStringsSep " " (d: "\"\${DNVR_ROOT:?}/${d}\"") extraData
+          }
         echo "removed Redpanda, ClickHouse, Postgres and chlive cache data; the next \`dnvr up\` starts empty"
       '';
     };

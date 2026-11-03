@@ -53,6 +53,9 @@ impl Fold {
             Event::PlayerAttached { .. }
             | Event::WorkspaceReady { .. }
             | Event::WorkspaceFailed { .. }
+            | Event::WorkspaceRestored { .. }
+            | Event::Checkpoint { .. }
+            | Event::CheckpointFailed { .. }
             | Event::ModelDelta { .. }
             | Event::AssistantMessage { .. }
             | Event::ModelCancelled

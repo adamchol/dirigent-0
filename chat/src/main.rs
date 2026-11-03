@@ -31,6 +31,11 @@ struct Cli {
     /// Who the user is, to chlive (a subject with access to the session).
     #[arg(long, env = "DIRIGENT_USER", default_value = "user:dev")]
     user: String,
+
+    /// Also show the player's own events (attaching, the workspace, checkpoints), dimmed.
+    /// Failures always show.
+    #[arg(long, env = "DIRIGENT_CHAT_EVENTS")]
+    events: bool,
 }
 
 #[tokio::main]
@@ -46,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
         .raw::<EventRow>();
 
     let mut terminal = ratatui::init();
-    let app = App::new(session.clone(), cli.chlive_url);
+    let app = App::new(session.clone(), cli.chlive_url, cli.events);
     let result = run(&mut terminal, app, &session, &client, log).await;
     ratatui::restore();
     result
