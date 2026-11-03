@@ -80,6 +80,8 @@ in
     rustfs
     nixfmt
     dnvrState
+    # the web UI (web/)
+    bun
     # migrations (openmig.toml); its scratch servers run these, the same majors as the stack's
     openmig
     postgresql
@@ -164,6 +166,23 @@ in
         dnvr-state set ready 1
         echo "[kopia-repo] ready"
         exec tail -f /dev/null
+      '';
+    };
+
+    # The web UI (web/): Vite's dev server, with chlive's client from its checkout
+    # ($CHLIVE_CLIENT, by default /root/chlive/client), proxying `/live` to chlive and `/api` to
+    # control. Publishes `url`.
+    web = {
+      env = {
+        CHLIVE_URL = "dnvr://chlive/url";
+        CONTROL = "dnvr://control/url";
+      };
+      command = ''
+        cd "$DNVR_ROOT/web"
+        port=54340
+        dnvr-state set url "http://127.0.0.1:$port"
+        bun install --frozen-lockfile
+        exec bun x vite --host 127.0.0.1 --port "$port" --strictPort
       '';
     };
 
@@ -258,6 +277,15 @@ in
         fi
         curl -fsS -X POST "$DIRIGENT_CONTROL_HTTP/sessions/''${1:?a session id}/stop" \
           -H 'content-type: application/json' -d "{\"now\": $now}"
+      '';
+    };
+    web-check = {
+      description = "Type-check the web UI and run its tests";
+      text = ''
+        cd "$DNVR_ROOT/web"
+        bun install --frozen-lockfile
+        bun x tsc --noEmit
+        exec bun test
       '';
     };
     e2e = {
