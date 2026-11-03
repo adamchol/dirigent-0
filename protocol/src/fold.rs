@@ -51,6 +51,8 @@ impl Fold {
                 Some(ev.clone())
             }
             Event::PlayerAttached { .. }
+            | Event::WorkspaceReady { .. }
+            | Event::WorkspaceFailed { .. }
             | Event::ModelDelta { .. }
             | Event::AssistantMessage { .. }
             | Event::ModelCancelled

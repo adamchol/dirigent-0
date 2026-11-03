@@ -4,6 +4,7 @@ mod history;
 mod provider;
 mod session;
 mod tools;
+mod workspace;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,11 +15,11 @@ use clap::Parser;
 use tracing::info;
 
 use crate::agent::{Agent, AgentConfig};
-use crate::provider::{Effort, Provider};
+use crate::provider::Provider;
 use crate::session::chlive::ChliveSession;
 use crate::session::control::Lease;
 use crate::tools::Registry;
-use dirigent_protocol::control::player_subject;
+use dirigent_protocol::control::{player_subject, SessionSpec};
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
@@ -63,14 +64,10 @@ struct Cli {
     #[arg(long, env = "MOCK")]
     mock: bool,
 
+    /// The session's workspace, made if it's missing; the spec's source is cloned into it when
+    /// it's empty. The model and effort come from the spec too.
     #[arg(long, env = "WORKDIR", default_value = ".")]
     workdir: PathBuf,
-
-    #[arg(long, env = "DIRIGENT_MODEL", default_value = "claude-sonnet-5")]
-    model: String,
-
-    #[arg(long, value_enum, default_value = "medium")]
-    effort: Option<Effort>,
 
     /// The model's context window in tokens; the context is compacted at 85% of it.
     #[arg(long, env = "DIRIGENT_CONTEXT_WINDOW", default_value_t = 200_000)]
@@ -106,27 +103,14 @@ async fn main() -> anyhow::Result<()> {
         )?)
     };
 
+    std::fs::create_dir_all(&cli.workdir)
+        .with_context(|| format!("--workdir {}", cli.workdir.display()))?;
     let workdir: &'static Path = Box::leak(
         cli.workdir
             .canonicalize()
             .with_context(|| format!("--workdir {}", cli.workdir.display()))?
             .into_boxed_path(),
     );
-    let system: &'static str = Box::leak(build_system_prompt(workdir).into_boxed_str());
-
-    let cfg = AgentConfig {
-        model: &cli.model,
-        system,
-        effort: cli.effort,
-        context_window: cli.context_window,
-    };
-
-    let agent = Agent {
-        provider: provider.clone(),
-        cfg,
-        tools: Arc::new(Registry::default_set()),
-        workdir,
-    };
 
     let id = uuid(&cli.session, "--session")?;
     let player = match &cli.player_id {
@@ -140,20 +124,39 @@ async fn main() -> anyhow::Result<()> {
         "acquiring the session"
     );
     let lease = Lease::acquire(&cli.control_url, &id, &player).await;
+    let spec: &'static SessionSpec = Box::leak(Box::new(lease.spec.clone()));
     let mut session =
         ChliveSession::new(&id, lease.epoch, &cli.chlive_url, &player_subject(&player));
-    info!(
-        session = id,
-        player,
-        epoch = lease.epoch,
-        chlive = cli.chlive_url,
-        provider = provider.name(),
-        model = cfg.model,
-        workdir = %workdir.display(),
-        "running the session"
-    );
+    let run = async {
+        let log = workspace::open(&mut session, workdir, spec.source.as_ref()).await?;
+        // after the workspace is made: its AGENTS.md is part of the prompt
+        let system: &'static str = Box::leak(build_system_prompt(workdir).into_boxed_str());
+        let agent = Agent {
+            provider: provider.clone(),
+            cfg: AgentConfig {
+                model: &spec.model,
+                system,
+                effort: spec.effort,
+                context_window: cli.context_window,
+            },
+            tools: Arc::new(Registry::default_set()),
+            workdir,
+        };
+        info!(
+            session = id,
+            player,
+            epoch = lease.epoch,
+            chlive = cli.chlive_url,
+            provider = provider.name(),
+            model = spec.model,
+            effort = ?spec.effort,
+            workdir = %workdir.display(),
+            "running the session"
+        );
+        agent.run(&mut session, log).await
+    };
     tokio::select! {
-        r = agent.run(&mut session) => r?,
+        r = run => r?,
         _ = stopped() => info!("shutting down"),
         _ = lease.lost() => anyhow::bail!("the session's lease is lost to another player"),
     }

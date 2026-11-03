@@ -64,6 +64,8 @@ in
     pkg-config
     jq
     curl
+    # the player clones sessions' sources with it
+    git
     nixfmt
     dnvrState
     # migrations (openmig.toml); its scratch servers run these, the same majors as the stack's
@@ -145,17 +147,29 @@ in
       '';
     };
     session = {
-      description = "Make a session through control: session [<uuid> [<user>]] (a new id, user:dev); prints its id";
+      description = "Make a session through control: session [--git <url> [--ref <ref>]] [--model <m>] [--effort <e>] [<uuid> [<user>]] (a new id, user:dev); prints its id. Run a player on it with `cargo run -p dirigent-player -- --mock --session <id> --workdir <dir>`";
       runtimeInputs = [
         dnvrState
         pkgs.curl
+        pkgs.jq
         pkgs.util-linux
       ];
       text = ''
         ${stackEnv}
+        spec='{}'
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --git) spec=$(jq -c --arg u "$2" '.source.git.url = $u' <<<"$spec"); shift 2 ;;
+            --ref) spec=$(jq -c --arg r "$2" '.source.git.ref = $r' <<<"$spec"); shift 2 ;;
+            --model) spec=$(jq -c --arg m "$2" '.model = $m' <<<"$spec"); shift 2 ;;
+            --effort) spec=$(jq -c --arg e "$2" '.effort = $e' <<<"$spec"); shift 2 ;;
+            *) break ;;
+          esac
+        done
         id="''${1:-$(uuidgen)}"
+        body=$(jq -c --arg u "''${2:-user:dev}" '.users = [$u]' <<<"$spec")
         curl -fsS -X PUT "$DIRIGENT_CONTROL_HTTP/sessions/$id" \
-          -H 'content-type: application/json' -d "{\"users\": [\"''${2:-user:dev}\"]}"
+          -H 'content-type: application/json' -d "$body"
         echo "$id"
       '';
     };

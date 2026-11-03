@@ -29,6 +29,12 @@ table "dirigent.sessions" {
     null    = false
     default = 0
   }
+  # What it runs (dirigent_protocol::control::SessionSpec), with its defaults filled in; fixed.
+  column "spec" {
+    type    = jsonb
+    null    = false
+    default = sql("'{}'::jsonb")
+  }
   primary_key { columns = [column.id] }
 }
 

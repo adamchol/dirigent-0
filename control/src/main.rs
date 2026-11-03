@@ -16,12 +16,12 @@ use axum::response::Response;
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use clap::Parser;
-use dirigent_protocol::control::{player_subject, ToControl, ToPlayer};
+use dirigent_protocol::control::{player_subject, SessionSpec, ToControl, ToPlayer};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::leases::{Acquire, Store};
+use crate::leases::{Acquire, Put, Store};
 
 /// How often a player is pinged, and how long it may be silent before it counts as dropped.
 const PING: Duration = Duration::from_secs(5);
@@ -109,6 +109,8 @@ struct NewSession {
     /// The subjects with access to it.
     #[serde(default)]
     users: Vec<String>,
+    #[serde(flatten)]
+    spec: SessionSpec,
 }
 
 async fn put_session(
@@ -116,12 +118,16 @@ async fn put_session(
     Path(id): Path<Uuid>,
     Json(body): Json<NewSession>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    match control.store.put_session(id, &body.users).await {
-        Ok(true) => {
-            info!(session = %id, users = ?body.users, "session made");
+    match control.store.put_session(id, &body.spec, &body.users).await {
+        Ok(Put::Made) => {
+            info!(session = %id, users = ?body.users, spec = ?body.spec, "session made");
             Ok(StatusCode::CREATED)
         }
-        Ok(false) => Ok(StatusCode::OK),
+        Ok(Put::Exists) => Ok(StatusCode::OK),
+        Ok(Put::Conflict) => Err((
+            StatusCode::CONFLICT,
+            "the session exists, with another spec".into(),
+        )),
         Err(e) => {
             error!(session = %id, "putting a session: {e:#}");
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -175,7 +181,7 @@ async fn attach(control: &'static Control, mut socket: WebSocket) {
         };
         let subject = player_subject(&player);
         let reply = match control.store.acquire(session, &subject, epoch).await {
-            Ok(Acquire::Acquired(epoch)) => {
+            Ok(Acquire::Acquired(epoch, spec)) => {
                 info!(session = %session, subject, epoch, "lease held");
                 held = Some((session, subject.clone()));
                 control
@@ -183,7 +189,7 @@ async fn attach(control: &'static Control, mut socket: WebSocket) {
                     .lock()
                     .unwrap()
                     .insert((session, subject), conn);
-                ToPlayer::Acquired { epoch }
+                ToPlayer::Acquired { epoch, spec }
             }
             Ok(Acquire::Held) => ToPlayer::Held,
             Ok(Acquire::Unknown) => ToPlayer::UnknownSession,
@@ -252,13 +258,25 @@ mod e2e {
     }
 
     async fn put(base: &str, session: Uuid, users: &[&str]) -> reqwest::StatusCode {
+        put_json(base, session, serde_json::json!({ "users": users })).await
+    }
+
+    async fn put_json(base: &str, session: Uuid, body: serde_json::Value) -> reqwest::StatusCode {
         reqwest::Client::new()
             .put(format!("http://{base}/sessions/{session}"))
-            .json(&serde_json::json!({ "users": users }))
+            .json(&body)
             .send()
             .await
             .unwrap()
             .status()
+    }
+
+    /// What a session put with the default spec acquires.
+    fn acquired(epoch: i64) -> ToPlayer {
+        ToPlayer::Acquired {
+            epoch,
+            spec: SessionSpec::default(),
+        }
     }
 
     async fn connect(base: &str) -> Ws {
@@ -323,21 +341,48 @@ mod e2e {
     }
 
     #[tokio::test]
+    async fn e2e_a_session_keeps_the_spec_it_was_made_with() {
+        let Some(base) = start().await else { return };
+        let s = Uuid::new_v4();
+        let spec = serde_json::json!({
+            "model": "claude-opus-5",
+            "effort": "high",
+            "source": { "git": { "url": "https://example.com/r.git", "ref": "dev" } },
+        });
+        let mut body = spec.clone();
+        body["users"] = serde_json::json!(["user:a"]);
+        assert_eq!(
+            put_json(&base, s, body.clone()).await,
+            reqwest::StatusCode::CREATED
+        );
+        assert_eq!(put_json(&base, s, body).await, reqwest::StatusCode::OK);
+        assert_eq!(
+            put(&base, s, &["user:b"]).await,
+            reqwest::StatusCode::CONFLICT
+        );
+        let mut ws = connect(&base).await;
+        assert_eq!(
+            acquire(&mut ws, s, "p", None).await,
+            ToPlayer::Acquired {
+                epoch: 1,
+                spec: serde_json::from_value(spec).unwrap(),
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn e2e_a_held_session_goes_to_the_next_player_once_given_back() {
         let Some(base) = start().await else { return };
         let s = Uuid::new_v4();
         put(&base, s, &[]).await;
         let mut a = connect(&base).await;
         let mut b = connect(&base).await;
-        assert_eq!(
-            acquire(&mut a, s, "a", None).await,
-            ToPlayer::Acquired { epoch: 1 }
-        );
+        assert_eq!(acquire(&mut a, s, "a", None).await, acquired(1));
         assert_eq!(acquire(&mut b, s, "b", None).await, ToPlayer::Held);
         a.close(None).await.unwrap();
         assert_eq!(
             acquire_within(&mut b, s, "b", Duration::from_secs(5)).await,
-            ToPlayer::Acquired { epoch: 2 }
+            acquired(2)
         );
     }
 
@@ -347,18 +392,12 @@ mod e2e {
         let s = Uuid::new_v4();
         put(&base, s, &[]).await;
         let mut a = connect(&base).await;
-        assert_eq!(
-            acquire(&mut a, s, "a", None).await,
-            ToPlayer::Acquired { epoch: 1 }
-        );
+        assert_eq!(acquire(&mut a, s, "a", None).await, acquired(1));
         drop(a); // no Close frame
         let mut b = connect(&base).await;
         assert_eq!(acquire(&mut b, s, "b", None).await, ToPlayer::Held);
         let mut a = connect(&base).await;
-        assert_eq!(
-            acquire(&mut a, s, "a", Some(1)).await,
-            ToPlayer::Acquired { epoch: 1 }
-        );
+        assert_eq!(acquire(&mut a, s, "a", Some(1)).await, acquired(1));
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(acquire(&mut b, s, "b", None).await, ToPlayer::Held);
     }
@@ -369,15 +408,12 @@ mod e2e {
         let s = Uuid::new_v4();
         put(&base, s, &[]).await;
         let mut a = connect(&base).await;
-        assert_eq!(
-            acquire(&mut a, s, "a", None).await,
-            ToPlayer::Acquired { epoch: 1 }
-        );
+        assert_eq!(acquire(&mut a, s, "a", None).await, acquired(1));
         drop(a);
         let mut b = connect(&base).await;
         assert_eq!(
             acquire_within(&mut b, s, "b", Duration::from_secs(5)).await,
-            ToPlayer::Acquired { epoch: 2 }
+            acquired(2)
         );
         let mut a = connect(&base).await;
         assert_eq!(acquire(&mut a, s, "a", Some(1)).await, ToPlayer::Lost);

@@ -188,7 +188,7 @@ mod e2e {
     use std::path::Path;
     use std::sync::Arc;
 
-    use dirigent_protocol::control::player_subject;
+    use dirigent_protocol::control::{player_subject, Source};
     use dirigent_protocol::{ContentBlock, TurnEndReason};
     use tokio::task::JoinHandle;
 
@@ -198,6 +198,7 @@ mod e2e {
     use crate::provider::Message;
     use crate::session::control::Lease;
     use crate::tools::Registry;
+    use crate::workspace;
 
     const USER: &str = "user:e2e";
 
@@ -227,10 +228,15 @@ mod e2e {
 
     /// A new session, with [`USER`] its user.
     async fn new_session(stack: &Stack) -> String {
+        new_session_from(stack, None).await
+    }
+
+    /// A new session, with [`USER`] its user and its workspace from `source`.
+    async fn new_session_from(stack: &Stack, source: Option<Source>) -> String {
         let session = new_id();
         let status = reqwest::Client::new()
             .put(format!("{}/sessions/{session}", stack.control))
-            .json(&serde_json::json!({ "users": [USER] }))
+            .json(&serde_json::json!({ "users": [USER], "source": source }))
             .send()
             .await
             .unwrap()
@@ -243,7 +249,7 @@ mod e2e {
         provider: Arc<MockProvider>,
         lease: Lease,
         task: JoinHandle<anyhow::Result<()>>,
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
     }
 
     impl Player {
@@ -279,12 +285,16 @@ mod e2e {
             &stack.chlive,
             &player_subject(&player),
         );
-        let task = tokio::spawn(async move { agent.run(&mut s).await });
+        let source = lease.spec.source.clone();
+        let task = tokio::spawn(async move {
+            let log = workspace::open(&mut s, workdir, source.as_ref()).await?;
+            agent.run(&mut s, log).await
+        });
         Player {
             provider,
             lease,
             task,
-            _dir: dir,
+            dir,
         }
     }
 
@@ -361,10 +371,10 @@ mod e2e {
         rows.iter().filter(|r| r.kind == "turn_ended").count()
     }
 
-    /// What happened, leaving out the players attaching.
+    /// What happened, leaving out the players attaching and their workspaces.
     fn kinds(rows: &[EventRow]) -> Vec<String> {
         rows.iter()
-            .filter(|r| r.kind != "player_attached")
+            .filter(|r| r.kind != "player_attached" && r.kind != "workspace_ready")
             .map(|r| match r.event().unwrap() {
                 Event::UserMessage { text } => format!("user:{text}"),
                 Event::AssistantMessage { content, .. } => {
@@ -542,5 +552,37 @@ mod e2e {
         let row = EventRow::new(&session, new_id(), &Event::UserMessage { text: "x".into() });
         let e = outsider.insert(EVENTS, [row]).await.unwrap_err();
         assert_eq!(e.code, "INVALID_INSERT", "{e}");
+    }
+
+    #[tokio::test]
+    async fn e2e_the_player_clones_the_source_into_its_workspace() {
+        let Some(stack) = stack() else { return };
+        let repos = tempfile::tempdir().unwrap();
+        let source = Source::Git {
+            url: workspace::tests::repo(repos.path()),
+            reference: None,
+        };
+        let session = new_session_from(&stack, Some(source.clone())).await;
+        let player = start(&stack, &session).await;
+        let log = log_until(&stack, &session, |r| {
+            r.iter().any(|r| r.kind == "workspace_ready")
+        })
+        .await;
+        let ready = log.iter().find(|r| r.kind == "workspace_ready").unwrap();
+        let Event::WorkspaceReady {
+            source: Some(got),
+            head: Some(head),
+            recreated: false,
+        } = ready.event().unwrap()
+        else {
+            panic!("{ready:?}");
+        };
+        assert_eq!(got, source);
+        assert_eq!(head.len(), 40);
+        assert_eq!(
+            std::fs::read_to_string(player.dir.path().join("file")).unwrap(),
+            "main\n"
+        );
+        player.stop().await;
     }
 }

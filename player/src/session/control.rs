@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use dirigent_protocol::control::{ToControl, ToPlayer};
+use dirigent_protocol::control::{SessionSpec, ToControl, ToPlayer};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -25,6 +25,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 pub struct Lease {
     /// The holder's place in the session's line of players.
     pub epoch: i64,
+    /// What the session runs.
+    pub spec: SessionSpec,
     lost: CancellationToken,
     release: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
@@ -40,7 +42,7 @@ impl Lease {
             epoch,
         };
         let mut backoff = Backoff::default();
-        let (ws, epoch) = loop {
+        let (ws, epoch, spec) = loop {
             let mut ws = match tokio_tungstenite::connect_async(url).await {
                 Ok((ws, _)) => ws,
                 Err(e) => {
@@ -51,7 +53,7 @@ impl Lease {
             };
             backoff = Backoff::default();
             match hold(&mut ws, &ask(None)).await {
-                Ok(epoch) => break (ws, epoch),
+                Ok((epoch, spec)) => break (ws, epoch, spec),
                 Err(e) => {
                     warn!("acquiring the session: {e:#}");
                     backoff.wait().await;
@@ -69,6 +71,7 @@ impl Lease {
         ));
         Lease {
             epoch,
+            spec,
             lost,
             release: Some(release),
             task,
@@ -97,8 +100,8 @@ impl Drop for Lease {
     }
 }
 
-/// Asks with `ask` until the session is held; its epoch. `Lost` is an error.
-async fn hold(ws: &mut Ws, ask: &ToControl) -> anyhow::Result<i64> {
+/// Asks with `ask` until the session is held; its epoch and spec. `Lost` is an error.
+async fn hold(ws: &mut Ws, ask: &ToControl) -> anyhow::Result<(i64, SessionSpec)> {
     let ask = serde_json::to_string(ask).expect("messages serialize");
     let mut waiting = false;
     loop {
@@ -113,7 +116,7 @@ async fn hold(ws: &mut Ws, ask: &ToControl) -> anyhow::Result<i64> {
             }
         };
         match reply {
-            ToPlayer::Acquired { epoch } => return Ok(epoch),
+            ToPlayer::Acquired { epoch, spec } => return Ok((epoch, spec)),
             ToPlayer::Lost => return Err(LostLease.into()),
             ToPlayer::Held | ToPlayer::UnknownSession => {
                 if !waiting {

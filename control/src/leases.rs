@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
+use dirigent_protocol::control::SessionSpec;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use tracing::error;
@@ -18,11 +19,21 @@ pub struct Store {
     grace: f64,
 }
 
-/// What a player asking for a session gets.
+/// What putting a session did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Put {
+    Made,
+    /// It was there, with the same spec.
+    Exists,
+    /// It was there, with another spec: nothing changed.
+    Conflict,
+}
+
+/// What a player asking for a session gets.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Acquire {
-    /// It holds it, as the `epoch`th player.
-    Acquired(i64),
+    /// It holds it, as the `epoch`th player, and runs the spec.
+    Acquired(i64, SessionSpec),
     /// Another player does.
     Held,
     /// There's no such session.
@@ -49,17 +60,38 @@ impl Store {
         })
     }
 
-    /// The session `id`, made if there's none, with access for `users` (subjects) besides those
-    /// it has; whether it was made.
-    pub async fn put_session(&self, id: Uuid, users: &[String]) -> anyhow::Result<bool> {
+    /// The session `id`, made with `spec` if there's none, with access for `users` (subjects)
+    /// besides those it has. One that's there keeps its spec: given another, nothing changes.
+    pub async fn put_session(
+        &self,
+        id: Uuid,
+        spec: &SessionSpec,
+        users: &[String],
+    ) -> anyhow::Result<Put> {
+        let json = serde_json::to_value(spec)?;
         let mut db = self.db.lock().await;
         let tx = db.transaction().await?;
         let made = tx
             .execute(
-                "INSERT INTO dirigent.sessions (id) VALUES ($1) ON CONFLICT DO NOTHING",
-                &[&id],
+                "INSERT INTO dirigent.sessions (id, spec) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                &[&id, &json],
             )
             .await?;
+        let put = if made == 1 {
+            Put::Made
+        } else {
+            let row = tx
+                .query_one(
+                    "SELECT spec FROM dirigent.sessions WHERE id = $1 FOR UPDATE",
+                    &[&id],
+                )
+                .await?;
+            let had: SessionSpec = serde_json::from_value(row.get(0))?;
+            if had != *spec {
+                return Ok(Put::Conflict);
+            }
+            Put::Exists
+        };
         for user in users {
             tx.execute(
                 "INSERT INTO dirigent.session_access (session_id, subject) VALUES ($1, $2) \
@@ -69,7 +101,7 @@ impl Store {
             .await?;
         }
         tx.commit().await?;
-        Ok(made == 1)
+        Ok(put)
     }
 
     /// `subject` (a player) asks to hold `session`, or to resume the lease it held, `resume`.
@@ -85,7 +117,7 @@ impl Store {
         let tx = db.transaction().await?;
         let Some(row) = tx
             .query_opt(
-                "SELECT epoch FROM dirigent.sessions WHERE id = $1 FOR UPDATE",
+                "SELECT epoch, spec FROM dirigent.sessions WHERE id = $1 FOR UPDATE",
                 &[&session],
             )
             .await?
@@ -96,6 +128,7 @@ impl Store {
             });
         };
         let epoch: i64 = row.get(0);
+        let spec: SessionSpec = serde_json::from_value(row.get(1))?;
         let holder = tx
             .query_opt(
                 "SELECT subject, expires_at IS NULL OR expires_at > now() \
@@ -111,7 +144,7 @@ impl Store {
                     &[&session],
                 )
                 .await?;
-                Acquire::Acquired(epoch)
+                Acquire::Acquired(epoch, spec)
             }
             _ if resume.is_some() => Acquire::Lost,
             Some(h) if h.get::<_, bool>(1) => Acquire::Held,
@@ -135,7 +168,7 @@ impl Store {
                     &[&session, &subject],
                 )
                 .await?;
-                Acquire::Acquired(epoch)
+                Acquire::Acquired(epoch, spec)
             }
         };
         tx.commit().await?;

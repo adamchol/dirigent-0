@@ -101,6 +101,19 @@ pub enum Event {
     /// From the player, before it reads the log: it holds the session's lease, as the `epoch`th
     /// player to (see `control`).
     PlayerAttached { epoch: i64 },
+    /// From the player, after reading the log: the workspace is in place, from `source` (as in
+    /// the spec) at the commit `head`; `recreated` when the log had it ready before but the
+    /// player found it gone and made it again, without what the session had changed.
+    WorkspaceReady {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<control::Source>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        recreated: bool,
+    },
+    /// From the player: the workspace couldn't be made; the player stops.
+    WorkspaceFailed { error: String },
     /// From a user.
     UserMessage { text: String },
     /// From a user: stop the turn `turn`, the one they saw running.

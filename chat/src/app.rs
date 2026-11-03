@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use dirigent_protocol::control::Source;
 use dirigent_protocol::fold::Fold;
 use dirigent_protocol::rows::EventRow;
 use dirigent_protocol::{ContentBlock, Delta, Event, TurnEndReason, Usage};
@@ -89,6 +90,24 @@ impl App {
         match ev {
             Event::PlayerAttached { epoch } => {
                 self.push(Line::from(format!("player attached · epoch {epoch}")).dim());
+            }
+            Event::WorkspaceReady {
+                source,
+                head,
+                recreated,
+            } => {
+                let from = match (&source, &head) {
+                    (Some(Source::Git { url, .. }), Some(head)) => {
+                        format!("{url}@{}", &head[..head.len().min(8)])
+                    }
+                    (Some(Source::Git { url, .. }), None) => url.clone(),
+                    (None, _) => "empty".into(),
+                };
+                let again = if recreated { " · recreated" } else { "" };
+                self.push(Line::from(format!("workspace ready · {from}{again}")).dim());
+            }
+            Event::WorkspaceFailed { error } => {
+                self.push(Line::from(format!("workspace failed: {error}")).red());
             }
             Event::UserMessage { text } => {
                 if !self.working {

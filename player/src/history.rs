@@ -45,7 +45,10 @@ impl Files {
                 self.read.extend(files.read.iter().cloned());
                 self.modified.extend(files.modified.iter().cloned());
             }
-            Entry::User { .. } | Entry::ToolResult { .. } | Entry::TurnEnded { .. } => {}
+            Entry::User { .. }
+            | Entry::Note { .. }
+            | Entry::ToolResult { .. }
+            | Entry::TurnEnded { .. } => {}
         }
     }
 }
@@ -53,6 +56,11 @@ impl Files {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
     User {
+        text: String,
+    },
+    /// From the player, for the model to know: joins the next user message, without starting a
+    /// turn.
+    Note {
         text: String,
     },
     Assistant {
@@ -100,7 +108,20 @@ impl Entry {
             }),
             // Applied by `History::push`.
             Event::Compacted { .. } => None,
+            Event::WorkspaceReady {
+                recreated: true,
+                head,
+                ..
+            } => Some(Entry::Note {
+                text: format!(
+                    "[The workspace was recreated from its source{}: changes to files from before \
+                     this point are gone.]",
+                    head.as_ref().map_or(String::new(), |h| format!(" at {h}"))
+                ),
+            }),
             Event::PlayerAttached { .. }
+            | Event::WorkspaceReady { .. }
+            | Event::WorkspaceFailed { .. }
             | Event::UserInterrupt { .. }
             | Event::TurnStarted { .. }
             | Event::Steered { .. }
@@ -114,7 +135,7 @@ impl Entry {
     /// The size of what the model sees of it.
     fn chars(&self) -> u64 {
         let n = match self {
-            Entry::User { text } => text.len(),
+            Entry::User { text } | Entry::Note { text } => text.len(),
             Entry::Assistant { content, .. } => content
                 .iter()
                 .map(|b| match b {
@@ -262,6 +283,7 @@ impl History {
                 }
                 Entry::User { text } if calling => held.push(text.clone()),
                 Entry::User { text } => texts.push(text.clone()),
+                Entry::Note { text } => texts.push(text.clone()),
                 Entry::Assistant { content, .. } => {
                     flush(&mut out, &mut results, &mut texts, &calls);
                     calls = content
@@ -459,6 +481,29 @@ mod tests {
 
     fn messages(events: &[Event]) -> Vec<Message> {
         history(events).messages()
+    }
+
+    #[test]
+    fn a_recreated_workspace_is_a_note_in_the_next_user_message() {
+        let ready = |recreated| Event::WorkspaceReady {
+            source: None,
+            head: Some("abc".into()),
+            recreated,
+        };
+        let msgs = messages(&[
+            ready(false),
+            user("a"),
+            assistant(vec![text("ok")], StopReason::EndTurn),
+            ended(TurnEndReason::Completed),
+            ready(true),
+            user("b"),
+        ]);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0], Message::user("a"));
+        let text = msgs[2].text();
+        assert!(text.starts_with("[The workspace"), "{text}");
+        assert!(text.contains("recreated from its source at abc"), "{text}");
+        assert!(text.ends_with('b'), "{text}");
     }
 
     #[test]

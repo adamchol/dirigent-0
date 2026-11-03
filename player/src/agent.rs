@@ -88,8 +88,11 @@ impl Agent {
     /// messages the log leaves queued get a turn each. A turn the log leaves unfinished (the
     /// previous player stopped mid-turn) is closed first: its tool calls get aborted results and
     /// it ends Aborted.
-    pub async fn run(&self, session: &mut dyn Session) -> anyhow::Result<()> {
-        let log = session.load().await?;
+    pub async fn run(
+        &self,
+        session: &mut dyn Session,
+        log: Vec<(String, Event)>,
+    ) -> anyhow::Result<()> {
         let mut fold = Fold::default();
         let handled: Vec<(String, Event)> = log
             .iter()
@@ -177,6 +180,8 @@ fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -> Ve
                 waiting.clear();
             }
             Event::PlayerAttached { .. }
+            | Event::WorkspaceReady { .. }
+            | Event::WorkspaceFailed { .. }
             | Event::UserInterrupt { .. }
             | Event::TurnStarted { .. }
             | Event::Steered { .. }
@@ -342,6 +347,8 @@ impl Run<'_> {
             }
             // Users' events and the loop's own decisions; never outcomes.
             Event::PlayerAttached { .. }
+            | Event::WorkspaceReady { .. }
+            | Event::WorkspaceFailed { .. }
             | Event::UserMessage { .. }
             | Event::UserInterrupt { .. }
             | Event::TurnStarted { .. }
@@ -681,6 +688,8 @@ fn log_event(ev: &Event) {
             other => warn!("turn ended: {other:?}"),
         },
         Event::PlayerAttached { .. }
+        | Event::WorkspaceReady { .. }
+        | Event::WorkspaceFailed { .. }
         | Event::UserMessage { .. }
         | Event::UserInterrupt { .. }
         | Event::TurnStarted { .. }
@@ -786,7 +795,10 @@ mod tests {
             inbox,
             published: published.clone(),
         };
-        let task = tokio::spawn(async move { agent.run(&mut session).await });
+        let task = tokio::spawn(async move {
+            let log = session.load().await?;
+            agent.run(&mut session, log).await
+        });
         Harness {
             _dir: dir,
             workdir,
@@ -875,6 +887,8 @@ mod tests {
             .filter(|e| !matches!(e, Event::ModelDelta { .. }))
             .map(|e| match e {
                 Event::PlayerAttached { epoch } => format!("attached:{epoch}"),
+                Event::WorkspaceReady { .. } => "workspace".into(),
+                Event::WorkspaceFailed { error } => format!("workspace failed:{error}"),
                 Event::UserMessage { text } => format!("user:{text}"),
                 Event::UserInterrupt { .. } => "interrupt".into(),
                 Event::TurnStarted { input } => format!("user:{}", text_of(input)),

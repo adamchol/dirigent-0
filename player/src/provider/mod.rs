@@ -59,14 +59,7 @@ pub struct ToolSpec {
     pub input_schema: Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum Effort {
-    Low,
-    Medium,
-    High,
-    Max,
-}
+pub use dirigent_protocol::control::Effort;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
