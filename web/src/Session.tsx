@@ -5,9 +5,20 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { LiveClient } from "@chlive/client";
 import { useLiveQuery } from "@chlive/client/react";
 
+import type { SessionInfo } from "./api.ts";
 import { LOG_QUERY, timeline, type EventRow, type Item, type Usage } from "./events.ts";
 
-export function Session(props: { id: string; client: LiveClient }) {
+export function Session(props: {
+  id: string;
+  client: LiveClient;
+  user: string;
+  /** The session as control has it (once listed). */
+  info?: SessionInfo;
+  /** Look as another user. */
+  become: (user: string) => void;
+}) {
+  // chlive shows a user without access an empty log and refuses their rows
+  const denied = props.info && !props.info.users.includes(props.user);
   const log = useLiveQuery<EventRow & Record<string, unknown>>(LOG_QUERY, { params: { session: props.id } });
   const { items, openTurn } = useMemo(() => timeline(log.rows), [log.rows]);
 
@@ -50,6 +61,23 @@ export function Session(props: { id: string; client: LiveClient }) {
         <code>{props.id}</code>
         {openTurn && <span className="running">turn running</span>}
       </div>
+      {denied && (
+        <div className="error">
+          {props.user} has no access to this session
+          {props.info!.users.length ? (
+            <>
+              ; its users:{" "}
+              {props.info!.users.map((u) => (
+                <button key={u} type="button" onClick={() => props.become(u)} title={`look as ${u}`}>
+                  {u}
+                </button>
+              ))}
+            </>
+          ) : (
+            " (it has no users)"
+          )}
+        </div>
+      )}
       {log.status === "error" ? (
         <div className="log denied">No log: {log.error?.message}</div>
       ) : (
@@ -72,14 +100,17 @@ export function Session(props: { id: string; client: LiveClient }) {
         <textarea
           value={draft}
           rows={2}
-          placeholder="Message"
+          disabled={denied}
+          placeholder={`Message as ${props.user}`}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) send(e);
           }}
         />
-        <button type="submit">Send</button>
-        {openTurn && (
+        <button type="submit" disabled={denied}>
+          Send
+        </button>
+        {openTurn && !denied && (
           <button type="button" className="interrupt" onClick={() => write("user_interrupt", { turn: openTurn })}>
             Interrupt
           </button>

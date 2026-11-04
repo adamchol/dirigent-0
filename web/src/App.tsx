@@ -6,7 +6,7 @@ import { LiveClient, defaultUrl } from "@chlive/client";
 import { LiveClientProvider } from "@chlive/client/react";
 
 import { Session } from "./Session.tsx";
-import { Sessions } from "./Sessions.tsx";
+import { Sessions, useSessions } from "./Sessions.tsx";
 
 /** A connection to chlive as `user`, closed when the user changes. */
 function useClient(user: string): LiveClient | null {
@@ -43,12 +43,19 @@ export function App() {
   const [draft, setDraft] = useState(user);
   const [selected, select] = useHash();
   const client = useClient(user);
+  const sessions = useSessions();
+  const info = sessions.list.find((s) => s.id === selected);
 
   function changeUser(e: React.FormEvent) {
     e.preventDefault();
-    const u = draft.trim();
+    become(draft);
+  }
+
+  function become(to: string) {
+    const u = to.trim();
     if (!u) return;
     setUser(u);
+    setDraft(u);
     try {
       localStorage.setItem("dirigent.user", u);
     } catch {
@@ -65,13 +72,13 @@ export function App() {
           <input id="user" value={draft} onChange={(e) => setDraft(e.target.value)} spellCheck={false} />
         </form>
       </header>
-      <Sessions selected={selected} select={select} user={user} />
+      <Sessions sessions={sessions} selected={selected} select={select} user={user} />
       <main>
         {!selected ? (
           <p className="empty">Pick a session.</p>
         ) : client ? (
           <LiveClientProvider client={client}>
-            <Session key={`${user}/${selected}`} id={selected} client={client} />
+            <Session key={`${user}/${selected}`} id={selected} client={client} user={user} info={info} become={become} />
           </LiveClientProvider>
         ) : null}
       </main>

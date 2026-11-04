@@ -805,6 +805,7 @@ mod e2e {
             put(&base, s, &["user:a", "user:b"]).await,
             reqwest::StatusCode::OK
         );
+        assert_eq!(info(&base, s).await.users, ["user:a", "user:b"]);
         let mut ws = connect(&base).await;
         assert_eq!(acquire(&mut ws, Uuid::new_v4(), "p", None).await, UNKNOWN);
     }

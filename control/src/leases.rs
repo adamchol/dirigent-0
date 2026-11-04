@@ -351,8 +351,10 @@ impl Store {
     }
 }
 
-/// The sessions with their lease holders, for [`session_info`].
-const SESSIONS: &str = "SELECT s.id, s.spec, s.epoch, a.subject, a.expires_at IS NULL \
+/// The sessions with their lease holders and users, for [`session_info`].
+const SESSIONS: &str = "SELECT s.id, s.spec, s.epoch, a.subject, a.expires_at IS NULL, \
+     ARRAY(SELECT u.subject FROM dirigent.session_access u \
+           WHERE u.session_id = s.id AND NOT u.player ORDER BY u.subject) \
      FROM dirigent.sessions s \
      LEFT JOIN dirigent.session_access a ON a.session_id = s.id AND a.player";
 
@@ -367,5 +369,6 @@ fn session_info(row: &Row) -> anyhow::Result<SessionInfo> {
             subject,
             attached: row.get(4),
         }),
+        users: row.get(5),
     })
 }

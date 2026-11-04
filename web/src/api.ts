@@ -17,6 +17,8 @@ export interface SessionInfo {
   epoch: number;
   /** The player holding its lease; none, the session is idle. */
   player: { subject: string; attached: boolean } | null;
+  /** The subjects with access to it, besides its player. */
+  users: string[];
 }
 
 export type State = "active" | "away" | "idle";

@@ -349,3 +349,22 @@ summary {
     border-bottom: 1px solid var(--line);
   }
 }
+
+.users {
+  flex-basis: 100%;
+}
+
+.users.other {
+  color: var(--away);
+}
+
+.error button {
+  margin-left: 4px;
+  padding: 0 6px;
+}
+
+button:disabled,
+textarea:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

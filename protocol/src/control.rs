@@ -133,6 +133,9 @@ pub struct SessionInfo {
     pub epoch: i64,
     /// The player holding its lease: none, the session is idle.
     pub player: Option<Holder>,
+    /// The subjects with access to it, besides its player.
+    #[serde(default)]
+    pub users: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +159,7 @@ mod tests {
                 subject: "player:p".into(),
                 attached: false,
             }),
+            users: vec!["user:u".into()],
         };
         let wire = serde_json::to_value(&info).unwrap();
         assert_eq!(

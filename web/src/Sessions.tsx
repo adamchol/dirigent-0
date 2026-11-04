@@ -8,7 +8,15 @@ import type { Effort, SessionInfo } from "./api.ts";
 
 const POLL_MS = 2000;
 
-export function Sessions(props: { selected: string; select: (id: string) => void; user: string }) {
+export interface Polled {
+  list: SessionInfo[];
+  error: string;
+  setError: (e: string) => void;
+  refresh: () => void;
+}
+
+/** Control's sessions, polled. */
+export function useSessions(): Polled {
   const [list, setList] = useState<SessionInfo[]>([]);
   const [error, setError] = useState("");
 
@@ -26,6 +34,12 @@ export function Sessions(props: { selected: string; select: (id: string) => void
     const t = setInterval(refresh, POLL_MS);
     return () => clearInterval(t);
   }, [refresh]);
+
+  return { list, error, setError, refresh };
+}
+
+export function Sessions(props: { sessions: Polled; selected: string; select: (id: string) => void; user: string }) {
+  const { list, error, setError, refresh } = props.sessions;
 
   /** Run `f`, then show what it changed (or why it failed). */
   const act = (f: () => Promise<void>) => async () => {
@@ -62,6 +76,7 @@ export function Sessions(props: { selected: string; select: (id: string) => void
                   {s.spec.effort ? ` · ${s.spec.effort}` : ""}
                 </span>
                 {s.spec.source && <span className="meta source">{source(s)}</span>}
+                <span className={`meta users${s.users.includes(props.user) ? "" : " other"}`}>{s.users.join(", ") || "no users"}</span>
               </button>
               <span className="actions">
                 {st === "idle" ? (
