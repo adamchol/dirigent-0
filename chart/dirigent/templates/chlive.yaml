@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: dirigent-chlive
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "dirigent.selector" . | nindent 4 }}
+    app.kubernetes.io/component: chlive
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dirigent-chlive
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: chlive
+spec:
+  # one: its Postgres replication slot is its own
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "dirigent.selector" . | nindent 6 }}
+      app.kubernetes.io/component: chlive
+  template:
+    metadata:
+      labels:
+        {{- include "dirigent.selector" . | nindent 8 }}
+        app.kubernetes.io/component: chlive
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/chlive-config.yaml") . | sha256sum }}
+    spec:
+      containers:
+        - name: chlive
+          image: {{ include "dirigent.image" (list . "chlive") }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args: [--config, /etc/chlive/chlive.toml]
+          env:
+            - name: CHLIVE_RO_PASSWORD
+              valueFrom: { secretKeyRef: { name: dirigent-clickhouse, key: chlive_ro } }
+            - name: CHLIVE_SNAP_PASSWORD
+              valueFrom: { secretKeyRef: { name: dirigent-clickhouse, key: chlive_snap } }
+            - name: PG_PASSWORD
+              valueFrom: { secretKeyRef: { name: dirigent-chlive-postgres, key: password } }
+            - name: CHLIVE_SECURITY__PROVIDERS__PG__URL
+              value: "postgres://dirigent_chlive:$(PG_PASSWORD)@dirigent-postgres-rw:5432/dirigent"
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          resources:
+            {{- toYaml .Values.chlive.resources | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/chlive, readOnly: true }
+            - { name: cache, mountPath: /var/cache/chlive }
+      volumes:
+        - name: config
+          configMap: { name: dirigent-chlive }
+        - name: cache
+          emptyDir: { sizeLimit: {{ .Values.chlive.cacheSize }} }

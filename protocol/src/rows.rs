@@ -115,7 +115,10 @@ mod tests {
 
     fn every_event() -> Vec<Event> {
         vec![
-            Event::UserMessage { text: "hi".into() },
+            Event::UserMessage {
+                text: "hi".into(),
+                via: None,
+            },
             Event::PlayerAttached { epoch: 3 },
             Event::UserInterrupt { turn: "t1".into() },
             Event::TurnStarted { input: "m1".into() },
@@ -230,7 +233,14 @@ mod tests {
 
     #[test]
     fn the_kafka_fields_and_the_author_are_read_but_never_sent() {
-        let row = EventRow::new("s", "e1".into(), &Event::UserMessage { text: "a".into() });
+        let row = EventRow::new(
+            "s",
+            "e1".into(),
+            &Event::UserMessage {
+                text: "a".into(),
+                via: None,
+            },
+        );
         let sent = serde_json::to_value(&row).unwrap();
         for field in ["offset", "partition", "ts", "author"] {
             assert!(sent.get(field).is_none(), "{field} sent: {sent}");

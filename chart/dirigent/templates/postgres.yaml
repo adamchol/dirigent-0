@@ -1,0 +1,55 @@
+{{- /* The chart's Postgres: control's state, and chlive's grants (logical replication). */}}
+{{- range $role := list "dirigent_control" "dirigent_chlive" }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $role | replace "_" "-" }}-postgres
+  labels:
+    {{- include "dirigent.labels" $ | nindent 4 }}
+type: kubernetes.io/basic-auth
+stringData:
+  username: {{ $role }}
+  password: {{ include "dirigent.password" (list $ (printf "%s-postgres" ($role | replace "_" "-")) "password") | quote }}
+---
+{{- end }}
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: dirigent-postgres
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+spec:
+  instances: {{ .Values.postgres.instances }}
+  {{- with .Values.postgres.image }}
+  imageName: {{ . }}
+  {{- end }}
+  # the migrations run as the superuser
+  enableSuperuserAccess: true
+  bootstrap:
+    initdb:
+      database: dirigent
+      owner: dirigent
+  postgresql:
+    parameters:
+      # chlive follows the grants by logical replication
+      wal_level: logical
+      max_replication_slots: "10"
+      max_wal_senders: "10"
+  managed:
+    roles:
+      - name: dirigent_control
+        ensure: present
+        login: true
+        passwordSecret:
+          name: dirigent-control-postgres
+      - name: dirigent_chlive
+        ensure: present
+        login: true
+        replication: true
+        passwordSecret:
+          name: dirigent-chlive-postgres
+  storage:
+    size: {{ .Values.postgres.storage }}
+    {{- with .Values.postgres.storageClass }}
+    storageClass: {{ . }}
+    {{- end }}

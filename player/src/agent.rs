@@ -139,8 +139,11 @@ impl Agent {
             "session started"
         );
         let mut client = true;
-        // `Some(now)` once told to detach
-        let mut detaching: Option<bool> = None;
+        // `Some(now)` once told to detach (maybe before it started: no turn is begun then)
+        let mut detaching: Option<bool> = *detach.when.borrow_and_update();
+        if let Some(now) = detaching {
+            info!(now, "detaching");
+        }
 
         loop {
             if detaching.is_none() {
@@ -236,6 +239,7 @@ fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -> Ve
             | Event::Checkpoint { .. }
             | Event::CheckpointFailed { .. }
             | Event::UserInterrupt { .. }
+            | Event::SessionUpdate { .. }
             | Event::TurnStarted { .. }
             | Event::Steered { .. }
             | Event::ModelDelta { .. }
@@ -274,7 +278,7 @@ struct Run<'a> {
     fixed: u64,
     ctx: Arc<ToolCtx>,
     turn: Option<Turn>,
-    /// Messages waiting for a turn of their own: `(id, text)`.
+    /// Inputs waiting for a turn of their own: `(id, text)`.
     queue: VecDeque<(String, String)>,
     tx: Tx,
 }
@@ -283,14 +287,16 @@ impl Run<'_> {
     /// An event a user appended, with its id.
     async fn input(&mut self, id: String, ev: Event) {
         match ev {
-            Event::UserMessage { text } => {
+            Event::UserMessage { .. } | Event::SessionUpdate { .. } => {
+                let text = ev.input().expect("an input");
                 if self.turn.is_none() {
                     self.queue.push_back((id, text));
                     return;
                 }
-                info!("user message (steers the turn)");
+                info!("input (steers the turn)");
                 let id = self.session.publish(&Event::Steered { input: id }).await;
-                self.history.push(&id, &Event::UserMessage { text });
+                self.history
+                    .push(&id, &Event::UserMessage { text, via: None });
                 if let Some(t) = &mut self.turn {
                     t.steered = true;
                 }
@@ -316,9 +322,10 @@ impl Run<'_> {
         let Some((input, text)) = self.queue.pop_front() else {
             return;
         };
-        info!("user message (starts a turn)");
+        info!("input (starts a turn)");
         let id = self.session.publish(&Event::TurnStarted { input }).await;
-        self.history.push(&id, &Event::UserMessage { text });
+        self.history
+            .push(&id, &Event::UserMessage { text, via: None });
         self.turn = Some(Turn {
             id,
             token: CancellationToken::new(),
@@ -408,6 +415,7 @@ impl Run<'_> {
             | Event::CheckpointFailed { .. }
             | Event::UserMessage { .. }
             | Event::UserInterrupt { .. }
+            | Event::SessionUpdate { .. }
             | Event::TurnStarted { .. }
             | Event::Steered { .. }
             | Event::TurnEnded { .. } => {}
@@ -766,6 +774,7 @@ fn log_event(ev: &Event) {
         | Event::CheckpointFailed { .. }
         | Event::UserMessage { .. }
         | Event::UserInterrupt { .. }
+        | Event::SessionUpdate { .. }
         | Event::TurnStarted { .. }
         | Event::Steered { .. }
         | Event::ToolResult { .. }
@@ -900,7 +909,10 @@ mod tests {
     impl Harness {
         /// A user message, whose id is `in-<text>`.
         async fn send(&self, text: &str) {
-            let ev = Event::UserMessage { text: text.into() };
+            let ev = Event::UserMessage {
+                text: text.into(),
+                via: None,
+            };
             self.tx.send((format!("in-{text}"), ev)).await.unwrap();
         }
 
@@ -981,8 +993,9 @@ mod tests {
                 Event::WorkspaceRestored { .. } => "restored".into(),
                 Event::Checkpoint { .. } => "checkpoint".into(),
                 Event::CheckpointFailed { error, .. } => format!("checkpoint failed:{error}"),
-                Event::UserMessage { text } => format!("user:{text}"),
+                Event::UserMessage { text, .. } => format!("user:{text}"),
                 Event::UserInterrupt { .. } => "interrupt".into(),
+                Event::SessionUpdate { session, .. } => format!("update:{session}"),
                 Event::TurnStarted { input } => format!("user:{}", text_of(input)),
                 Event::Steered { input } => format!("steer:{}", text_of(input)),
                 Event::AssistantMessage { content, .. } => {
@@ -1576,7 +1589,10 @@ mod tests {
     }
 
     fn logged_user(text: &str) -> Event {
-        Event::UserMessage { text: text.into() }
+        Event::UserMessage {
+            text: text.into(),
+            via: None,
+        }
     }
 
     fn logged_call(id: &str, name: &str) -> Event {

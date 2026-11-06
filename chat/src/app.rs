@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use dirigent_protocol::control::Source;
 use dirigent_protocol::fold::Fold;
 use dirigent_protocol::rows::EventRow;
-use dirigent_protocol::{ContentBlock, Delta, Event, TurnEndReason, Usage};
+use dirigent_protocol::{ContentBlock, Delta, Event, TurnEndReason, Update, Usage};
 use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -124,15 +124,32 @@ impl App {
             Event::CheckpointFailed { error, .. } => {
                 self.push(Line::from(format!("checkpoint failed: {error}")).red());
             }
-            Event::UserMessage { text } => {
+            Event::UserMessage { text, via } => {
                 if !self.working {
                     self.working = true;
                     self.turn_usage = Usage::default();
+                }
+                if let Some(via) = via {
+                    self.system(format!("from the dirigent {}", short(&via)));
                 }
                 for (i, line) in text.lines().enumerate() {
                     let prefix = if i == 0 { "› " } else { "  " };
                     self.push(Line::from(format!("{prefix}{line}")).bold().cyan());
                 }
+            }
+            Event::SessionUpdate {
+                session, update, ..
+            } => {
+                if !self.working {
+                    self.working = true;
+                    self.turn_usage = Usage::default();
+                }
+                let what = match update {
+                    Update::TurnEnded { reason } => format!("turn {reason:?}").to_lowercase(),
+                    Update::PlayerFailed { error } => format!("player failed: {error}"),
+                    Update::PlayerDetached => "stopped".into(),
+                };
+                self.push(Line::from(format!("⇠ session {} · {what}", short(&session))).cyan());
             }
             Event::ModelDelta { delta } => self.on_delta(delta),
             Event::AssistantMessage { content, usage, .. } => {
@@ -520,7 +537,10 @@ mod tests {
     fn turn(app: &mut App, text: &str) {
         app.on_logged(
             &format!("m-{text}"),
-            Event::UserMessage { text: text.into() },
+            Event::UserMessage {
+                text: text.into(),
+                via: None,
+            },
         );
         let input = format!("m-{text}");
         app.on_logged(&format!("t-{text}"), Event::TurnStarted { input });
@@ -696,7 +716,13 @@ mod tests {
     #[test]
     fn a_message_waits_until_a_turn_takes_it() {
         let mut app = app();
-        app.on_logged("m-hi", Event::UserMessage { text: "hi".into() });
+        app.on_logged(
+            "m-hi",
+            Event::UserMessage {
+                text: "hi".into(),
+                via: None,
+            },
+        );
         assert!(transcript(&app).is_empty());
         assert_eq!(screen(&app), vec!["› hi"]);
         app.on_logged(

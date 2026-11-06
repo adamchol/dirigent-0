@@ -1,6 +1,7 @@
 //! Terminal client for a dirigent session it attaches to (sessions are made through control):
 //! the session's log comes from chlive, and what the user types is inserted into it through
-//! chlive, as `--user`, who needs access to the session.
+//! chlive, as `--user`, who needs access to the session: with the credentials control signs
+//! for them, in its `declared` auth (dev).
 
 mod app;
 
@@ -32,6 +33,14 @@ struct Cli {
     #[arg(long, env = "DIRIGENT_USER", default_value = "user:dev")]
     user: String,
 
+    /// Control's HTTP API, which signs the user's chlive credentials.
+    #[arg(
+        long,
+        env = "DIRIGENT_CONTROL_HTTP",
+        default_value = "http://127.0.0.1:8090"
+    )]
+    control_http: String,
+
     /// Also show the player's own events (attaching, the workspace, checkpoints), dimmed.
     /// Failures always show.
     #[arg(long, env = "DIRIGENT_CHAT_EVENTS")]
@@ -44,7 +53,9 @@ async fn main() -> anyhow::Result<()> {
     let session = uuid::Uuid::parse_str(&cli.session)
         .with_context(|| format!("--session {}: not a UUID", cli.session))?
         .to_string();
-    let client = LiveClient::new(ClientOptions::new(&cli.chlive_url).user(&cli.user));
+    let (control, user) = (cli.control_http.clone(), cli.user.clone());
+    let token = move || token(control.clone(), user.clone());
+    let client = LiveClient::new(ClientOptions::new(&cli.chlive_url).credentials(token));
     let log = client
         .query(SESSION_QUERY)
         .param("session", &session)
@@ -55,6 +66,25 @@ async fn main() -> anyhow::Result<()> {
     let result = run(&mut terminal, app, &session, &client, log).await;
     ratatui::restore();
     result
+}
+
+/// `user`'s chlive credential, from control (`POST /token`).
+async fn token(control: String, user: String) -> Result<String, String> {
+    let got: serde_json::Value = reqwest::Client::new()
+        .post(format!("{}/token", control.trim_end_matches('/')))
+        .header("dirigent-user", user)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| format!("control: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("control's token: {e}"))?;
+    got["token"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| "control sent no token".into())
 }
 
 async fn run(
@@ -74,7 +104,7 @@ async fn run(
                     let event = match app.on_key(key) {
                         None => continue,
                         Some(Action::Quit) => return Ok(()),
-                        Some(Action::Send(text)) => Event::UserMessage { text },
+                        Some(Action::Send(text)) => Event::UserMessage { text, via: None },
                         Some(Action::Interrupt) => match app.turn() {
                             Some(turn) => Event::UserInterrupt { turn },
                             None => {

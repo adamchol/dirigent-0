@@ -1,0 +1,98 @@
+{{- /* The kopia repository the players checkpoint their workspaces to, made once (the bucket
+too, where it can be), with the checkpoints' policy: `.gitignore`d files and files over 50 MB
+left out, and no snapshot ever expires (the log refers to them). Its token, which players
+connect with, goes in the Secret `dirigent-kopia` (DIRIGENT_KOPIA_TOKEN). */}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dirigent-checkpoints
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dirigent-checkpoints
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dirigent-checkpoints
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dirigent-checkpoints
+subjects:
+  - kind: ServiceAccount
+    name: dirigent-checkpoints
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dirigent-kopia
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: checkpoints
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 10
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        {{- include "dirigent.selector" . | nindent 8 }}
+        app.kubernetes.io/component: checkpoints
+    spec:
+      serviceAccountName: dirigent-checkpoints
+      restartPolicy: OnFailure
+      containers:
+        - name: kopia
+          image: {{ include "dirigent.image" (list . "kube-tools") }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["bash", "-euo", "pipefail", "-c"]
+          args:
+            - |
+              export HOME=/tmp KOPIA_CONFIG_PATH=/tmp/kopia/repo.config KOPIA_CHECK_FOR_UPDATES=false
+              scheme=http; tls=(--disable-tls); [ "$S3_TLS" = true ] && { scheme=https; tls=(); }
+              # the bucket, if it can be made (RustFS answers 503 for a moment after it's up)
+              for _ in $(seq 60); do
+                code=$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 \
+                  --user "$S3_ACCESS_KEY:$S3_SECRET_KEY" -X PUT "$scheme://$S3_ENDPOINT/$S3_BUCKET" || true)
+                case "$code" in 200|409) break ;; esac
+                sleep 2
+              done
+              s3=(--bucket "$S3_BUCKET" --endpoint "$S3_ENDPOINT" "${tls[@]}"
+                --access-key "$S3_ACCESS_KEY" --secret-access-key "$S3_SECRET_KEY" --password "$KOPIA_PASSWORD")
+              if ! kopia repository connect s3 "${s3[@]}" >/dev/null 2>&1; then
+                kopia repository create s3 "${s3[@]}"
+              fi
+              kopia policy set --global --add-dot-ignore .gitignore --max-file-size 50000000 \
+                --keep-latest 1000000000 --keep-hourly 0 --keep-daily 0 --keep-weekly 0 \
+                --keep-monthly 0 --keep-annual 0 >/dev/null
+              token=$(kopia repository status -t -s | grep -o -- '--token [^ ]*' | cut -d' ' -f2)
+              kubectl create secret generic dirigent-kopia --from-literal=DIRIGENT_KOPIA_TOKEN="$token" \
+                --dry-run=client -o yaml | kubectl apply -f -
+              echo "the kopia repository is ready"
+          env:
+            - name: S3_ENDPOINT
+              value: {{ include "dirigent.s3Endpoint" . | quote }}
+            - name: S3_BUCKET
+              value: {{ .Values.checkpoints.s3.bucket | quote }}
+            - name: S3_TLS
+              value: {{ ternary "false" (toString .Values.checkpoints.s3.tls) .Values.checkpoints.rustfs.enabled | quote }}
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ include "dirigent.s3Secret" . }}, key: accessKey } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: {{ include "dirigent.s3Secret" . }}, key: secretKey } }
+            - name: KOPIA_PASSWORD
+              valueFrom: { secretKeyRef: { name: dirigent-kopia-password, key: password } }

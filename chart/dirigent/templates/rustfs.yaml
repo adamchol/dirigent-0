@@ -1,0 +1,71 @@
+{{- if .Values.checkpoints.rustfs.enabled }}
+{{- /* A single-node RustFS for the checkpoints, instead of your S3. */}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dirigent-rustfs
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+stringData:
+  accessKey: dirigent
+  secretKey: {{ include "dirigent.password" (list . "dirigent-rustfs" "secretKey") | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dirigent-rustfs
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "dirigent.selector" . | nindent 4 }}
+    app.kubernetes.io/component: rustfs
+  ports:
+    - { name: s3, port: 9000, targetPort: s3 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dirigent-rustfs
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rustfs
+spec:
+  serviceName: dirigent-rustfs
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "dirigent.selector" . | nindent 6 }}
+      app.kubernetes.io/component: rustfs
+  template:
+    metadata:
+      labels:
+        {{- include "dirigent.selector" . | nindent 8 }}
+        app.kubernetes.io/component: rustfs
+    spec:
+      containers:
+        - name: rustfs
+          image: {{ include "dirigent.image" (list . "rustfs") }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args: [server, --address, "0.0.0.0:9000", --access-key, "$(ACCESS_KEY)", --secret-key, "$(SECRET_KEY)", /data]
+          env:
+            - name: ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: dirigent-rustfs, key: accessKey } }
+            - name: SECRET_KEY
+              valueFrom: { secretKeyRef: { name: dirigent-rustfs, key: secretKey } }
+          ports:
+            - { name: s3, containerPort: 9000 }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.checkpoints.rustfs.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.checkpoints.rustfs.storage }}
+{{- end }}

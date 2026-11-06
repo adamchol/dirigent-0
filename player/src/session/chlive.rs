@@ -17,10 +17,12 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chlive_client::{ClientOptions, Events, LiveClient};
 use futures::StreamExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, warn};
 
+use super::control::player_token;
 use super::Session;
+use dirigent_protocol::control::pb;
 use dirigent_protocol::rows::{EventRow, EVENTS, LOG_QUERY};
 use dirigent_protocol::Event;
 
@@ -49,9 +51,15 @@ struct Write {
 
 impl ChliveSession {
     /// `id` is the session's UUID, held as the `epoch`th player; `chlive_url` its WebSocket
-    /// (`ws://…/live`), where the player is `subject`.
-    pub fn new(id: &str, epoch: i64, chlive_url: &str, subject: &str) -> Self {
-        let client = LiveClient::new(ClientOptions::new(chlive_url).user(subject));
+    /// (`ws://…/live`), where the player is who its lease's `tokens` say.
+    pub fn new(
+        id: &str,
+        epoch: i64,
+        chlive_url: &str,
+        tokens: watch::Receiver<pb::Tokens>,
+    ) -> Self {
+        let opts = ClientOptions::new(chlive_url).credentials(player_token(tokens));
+        let client = LiveClient::new(opts);
         let (writes, queue) = mpsc::unbounded_channel();
         tokio::spawn(write(client.clone(), queue));
         ChliveSession {
@@ -188,8 +196,9 @@ mod e2e {
     use std::path::Path;
     use std::sync::Arc;
 
-    use dirigent_protocol::control::{player_subject, Source};
-    use dirigent_protocol::{ContentBlock, TurnEndReason};
+    use crate::dirigent::Director;
+    use dirigent_protocol::control::{Part, Source};
+    use dirigent_protocol::{ContentBlock, TurnEndReason, Update};
     use tokio::task::JoinHandle;
 
     use super::*;
@@ -238,10 +247,14 @@ mod e2e {
     /// A new session, idle (the test starts its players), with [`USER`] its user and its workspace
     /// from `source`.
     async fn new_session_from(stack: &Stack, source: Option<Source>) -> String {
+        put_session(stack, serde_json::json!({ "source": source })).await
+    }
+
+    /// A new session, [`USER`]'s, made with `body` (its spec, viewers).
+    async fn put_session(stack: &Stack, body: serde_json::Value) -> String {
         let session = new_id();
-        let status = reqwest::Client::new()
-            .put(format!("{}/sessions/{session}", stack.control))
-            .json(&serde_json::json!({ "users": [USER], "source": source }))
+        let status = api(stack, reqwest::Method::PUT, &format!("/sessions/{session}"))
+            .json(&body)
             .send()
             .await
             .unwrap()
@@ -250,10 +263,19 @@ mod e2e {
         session
     }
 
+    /// A request to control's API, as [`USER`].
+    fn api(stack: &Stack, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        reqwest::Client::new()
+            .request(method, format!("{}{path}", stack.control))
+            .header("dirigent-user", USER)
+    }
+
     struct Player {
         provider: Arc<MockProvider>,
         lease: Lease,
         task: JoinHandle<anyhow::Result<()>>,
+        /// A dirigent's follower.
+        follower: Option<JoinHandle<()>>,
         dir: tempfile::TempDir,
         _state: tempfile::TempDir,
     }
@@ -262,6 +284,9 @@ mod e2e {
         /// Stops it and gives the session back.
         async fn stop(self) {
             self.task.abort();
+            if let Some(f) = self.follower {
+                f.abort();
+            }
             self.lease.release().await;
         }
     }
@@ -278,6 +303,19 @@ mod e2e {
                 .unwrap(),
         ));
         let provider = Arc::new(MockProvider::default());
+        let player = new_id();
+        let lease = Lease::acquire(&stack.control_ws, session, &player, None)
+            .await
+            .unwrap();
+        let (tools, follower) = match lease.spec.part {
+            Part::Coder => (Registry::default_set(), None),
+            Part::Dirigent => {
+                let d = Director::new(session, lease.tokens(), &stack.chlive, &stack.control);
+                let d = Arc::new(d.unwrap());
+                let follow = crate::dirigent::follow(d.clone(), stack.chlive.clone());
+                (Registry::new(d.tools()), Some(tokio::spawn(follow)))
+            }
+        };
         let agent = Agent {
             provider: provider.clone(),
             cfg: AgentConfig {
@@ -286,20 +324,11 @@ mod e2e {
                 effort: None,
                 context_window: 1_000_000,
             },
-            tools: Arc::new(Registry::default_set()),
+            tools: Arc::new(tools),
             workdir,
             checkpoints: Some(checkpoints),
         };
-        let player = new_id();
-        let lease = Lease::acquire(&stack.control_ws, session, &player, None)
-            .await
-            .unwrap();
-        let mut s = ChliveSession::new(
-            session,
-            lease.epoch,
-            &stack.chlive,
-            &player_subject(&player),
-        );
+        let mut s = ChliveSession::new(session, lease.epoch, &stack.chlive, lease.tokens());
         let source = lease.spec.source.clone();
         let detach = Detach {
             epoch: lease.epoch,
@@ -313,13 +342,29 @@ mod e2e {
             provider,
             lease,
             task,
+            follower,
             dir,
             _state: state,
         }
     }
 
+    /// chlive, as `user`, with the credentials control signs for them (`declared` auth).
     fn client(stack: &Stack, user: &str) -> LiveClient {
-        LiveClient::new(ClientOptions::new(&stack.chlive).user(user))
+        let (control, user) = (stack.control.clone(), user.to_string());
+        let token = move || dev_token(control.clone(), user.clone());
+        LiveClient::new(ClientOptions::new(&stack.chlive).credentials(token))
+    }
+
+    async fn dev_token(control: String, user: String) -> Result<String, reqwest::Error> {
+        let got: serde_json::Value = reqwest::Client::new()
+            .post(format!("{control}/token"))
+            .header("dirigent-user", user)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(got["token"].as_str().unwrap_or_default().to_string())
     }
 
     struct User {
@@ -341,7 +386,11 @@ mod e2e {
         }
 
         async fn say(&self, text: &str) {
-            self.send(Event::UserMessage { text: text.into() }).await;
+            self.send(Event::UserMessage {
+                text: text.into(),
+                via: None,
+            })
+            .await;
         }
 
         async fn interrupt(&self, turn: &str) {
@@ -398,7 +447,7 @@ mod e2e {
                 !["player_attached", "workspace_ready", "checkpoint"].contains(&r.kind.as_str())
             })
             .map(|r| match r.event().unwrap() {
-                Event::UserMessage { text } => format!("user:{text}"),
+                Event::UserMessage { text, .. } => format!("user:{text}"),
                 Event::AssistantMessage { content, .. } => {
                     let calls = content
                         .iter()
@@ -560,12 +609,12 @@ mod e2e {
             r.iter().any(|r| r.kind == "turn_started")
         })
         .await;
-        let http = reqwest::Client::new();
-        let control = |action: &str| {
-            http.post(format!("{}/sessions/{session}/{action}", stack.control))
-                .send()
-        };
-        assert!(control("stop").await.unwrap().status().is_success());
+        let stop = api(
+            &stack,
+            reqwest::Method::POST,
+            &format!("/sessions/{session}/stop"),
+        );
+        assert!(stop.send().await.unwrap().status().is_success());
         let log = log_until(&stack, &session, |r| {
             r.iter().any(|r| r.kind == "player_detached")
         })
@@ -608,9 +657,179 @@ mod e2e {
             .await
             .unwrap();
         assert_eq!(rows.len(), 0);
-        let row = EventRow::new(&session, new_id(), &Event::UserMessage { text: "x".into() });
+        let row = EventRow::new(
+            &session,
+            new_id(),
+            &Event::UserMessage {
+                text: "x".into(),
+                via: None,
+            },
+        );
         let e = outsider.insert(EVENTS, [row]).await.unwrap_err();
         assert_eq!(e.code, "INVALID_INSERT", "{e}");
+    }
+
+    #[tokio::test]
+    async fn e2e_an_owner_writes_only_inputs_and_a_viewer_nothing() {
+        let Some(stack) = stack() else { return };
+        let viewer = "user:e2e-viewer";
+        let session = put_session(&stack, serde_json::json!({ "viewers": [viewer] })).await;
+        let owner = client(&stack, USER);
+        let insert = |c: &LiveClient, ev: Event| {
+            let row = EventRow::new(&session, new_id(), &ev);
+            let c = c.clone();
+            async move {
+                // until chlive has the grants (over CDC), refusals may be the lag's
+                let started = Instant::now();
+                loop {
+                    match c.insert(EVENTS, [&row]).await {
+                        Ok(_) => return Ok(()),
+                        Err(e) if started.elapsed() > Duration::from_secs(5) => return Err(e),
+                        Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+                    }
+                }
+            }
+        };
+        let say = |text: &str| Event::UserMessage {
+            text: text.into(),
+            via: None,
+        };
+        insert(&owner, say("hi")).await.unwrap();
+        insert(&owner, Event::UserInterrupt { turn: "t".into() })
+            .await
+            .unwrap();
+        let forged = Event::AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "forged".into(),
+            }],
+            stop_reason: dirigent_protocol::StopReason::EndTurn,
+            usage: Default::default(),
+        };
+        let e = insert(&owner, forged).await.unwrap_err();
+        assert!(e.message.contains("kind"), "{e}");
+        let as_viewer = client(&stack, viewer);
+        let e = insert(&as_viewer, say("me too")).await.unwrap_err();
+        assert!(e.message.contains("session_id"), "{e}");
+        // and reads it
+        let rows = as_viewer
+            .query(LOG_QUERY)
+            .param("session", &session)
+            .complete()
+            .fetch::<EventRow>()
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn e2e_chlive_takes_control_signed_credentials_only_and_a_players_for_its_session() {
+        let Some(stack) = stack() else { return };
+        // a credential's signature over another's claims
+        let mine = dev_token(stack.control.clone(), USER.into()).await.unwrap();
+        let theirs = dev_token(stack.control.clone(), "user:e2e-other".into())
+            .await
+            .unwrap();
+        let (claims, signature) = (mine.rsplit_once('.').unwrap().0, theirs.rsplit('.').next());
+        let forged = format!("{claims}.{}", signature.unwrap());
+        let (tx, mut refused) = mpsc::unbounded_channel();
+        let opts = ClientOptions::new(&stack.chlive)
+            .credentials(move || std::future::ready(Ok::<_, &str>(forged.clone())))
+            .on_auth_error(move |e| {
+                let _ = tx.send(e.code.clone());
+            });
+        let forger = LiveClient::new(opts);
+        let session = new_session(&stack).await;
+        let _sub = forger
+            .query(LOG_QUERY)
+            .param("session", &session)
+            .rows::<EventRow>();
+        let code = tokio::time::timeout(Duration::from_secs(10), refused.recv()).await;
+        assert_eq!(code.unwrap().as_deref(), Some("AUTH_BAD_SIGNATURE"));
+
+        // a player's are for its session only
+        let other = new_session(&stack).await;
+        let lease = Lease::acquire(&stack.control_ws, &session, &new_id(), None)
+            .await
+            .unwrap();
+        let opts = ClientOptions::new(&stack.chlive).credentials(player_token(lease.tokens()));
+        let player = LiveClient::new(opts);
+        let attached = |s: &str| EventRow::new(s, new_id(), &Event::PlayerAttached { epoch: 1 });
+        let started = Instant::now();
+        // until chlive has the lease's grant (over CDC)
+        while player.insert(EVENTS, [attached(&session)]).await.is_err() {
+            assert!(
+                started.elapsed() < GRANT_WAIT,
+                "chlive never let the player in"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let e = player.insert(EVENTS, [attached(&other)]).await.unwrap_err();
+        assert!(e.message.contains("session_id"), "{e}");
+        lease.release().await;
+    }
+
+    #[tokio::test]
+    async fn e2e_a_dirigent_creates_a_session_and_hears_when_its_turn_ends() {
+        let Some(stack) = stack() else { return };
+        let dirigent = put_session(&stack, serde_json::json!({ "part": "dirigent" })).await;
+        let user = User::new(&stack, &dirigent);
+        let player = start(&stack, &dirigent).await;
+        user.say(r#"!!create_session {"message": "hi"}"#).await;
+        let log = log_until(&stack, &dirigent, |r| {
+            r.iter().any(|r| r.kind == "session_update")
+        })
+        .await;
+        let child = log
+            .iter()
+            .find_map(|r| match r.event().unwrap() {
+                Event::ToolResult { meta, .. } => {
+                    meta["directs"]["session"].as_str().map(String::from)
+                }
+                _ => None,
+            })
+            .expect("a session made");
+        // the child is the user's, its task from them via the dirigent
+        let child_log = log_until(&stack, &child, |r| turns_ended(r) == 1).await;
+        let task = child_log.iter().find(|r| r.kind == "user_message").unwrap();
+        assert_eq!(task.author, USER);
+        assert_eq!(
+            task.event().unwrap(),
+            Event::UserMessage {
+                text: "hi".into(),
+                via: Some(dirigent.clone())
+            }
+        );
+        let update = log.iter().find(|r| r.kind == "session_update").unwrap();
+        let Event::SessionUpdate {
+            session,
+            update: Update::TurnEnded { reason },
+            reply: Some(reply),
+            ..
+        } = update.event().unwrap()
+        else {
+            panic!("{update:?}")
+        };
+        assert_eq!(
+            (session.as_str(), reason),
+            (child.as_str(), TurnEndReason::Completed)
+        );
+        assert!(reply.contains("hi"), "{reply}");
+        // the update starts a turn of the dirigent's
+        log_until(&stack, &dirigent, |r| turns_ended(r) == 2).await;
+        // a new player doesn't tell it again
+        player.stop().await;
+        let again = start(&stack, &dirigent).await;
+        log_until(&stack, &dirigent, |r| attached(r).len() == 2).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let log = log_until(&stack, &dirigent, |r| attached(r).len() == 2).await;
+        assert_eq!(log.iter().filter(|r| r.kind == "session_update").count(), 1);
+        again.stop().await;
+        let stop = api(
+            &stack,
+            reqwest::Method::POST,
+            &format!("/sessions/{child}/stop"),
+        );
+        assert!(stop.send().await.unwrap().status().is_success());
     }
 
     #[tokio::test]

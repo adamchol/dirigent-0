@@ -1,10 +1,12 @@
 //! The player's lease on its session, from the control plane: a gRPC call (`Players.Lease`, see
 //! `protocol/proto`), held for as long as the call is open. A broken call is made again and the
 //! lease resumed; if control says it's gone, the lease is lost and the player must stop. Once the
-//! session is stopped, control tells the player to detach ([`Lease::detach`]).
+//! session is stopped, control tells the player to detach ([`Lease::detach`]). The lease comes
+//! with the player's credentials, which control sends afresh while it's held ([`Lease::tokens`]).
 
 use std::time::Duration;
 
+use anyhow::Context;
 use dirigent_protocol::control::pb::players_client::PlayersClient;
 use dirigent_protocol::control::{pb, SessionSpec};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -29,8 +31,10 @@ pub struct Lease {
     pub epoch: i64,
     /// What the session runs.
     pub spec: SessionSpec,
+    tokens: watch::Receiver<pb::Tokens>,
     lost: CancellationToken,
-    release: Option<oneshot::Sender<()>>,
+    /// Ends the call; `true`: handing the session over first.
+    release: Option<oneshot::Sender<bool>>,
     detach: watch::Receiver<Option<bool>>,
     task: JoinHandle<()>,
 }
@@ -57,7 +61,14 @@ impl Lease {
             epoch,
         };
         let mut backoff = Backoff::default();
-        let (call, epoch, spec) = loop {
+        let (
+            call,
+            Acquired {
+                epoch,
+                spec,
+                tokens,
+            },
+        ) = loop {
             match hold(url, ask(epoch)).await {
                 Ok(held) => break held,
                 Err(e) if e.is::<Refused>() => return Err(e),
@@ -70,6 +81,7 @@ impl Lease {
         let lost = CancellationToken::new();
         let (release, released) = oneshot::channel();
         let (detach, detached) = watch::channel(None);
+        let (tokens_tx, tokens) = watch::channel(tokens);
         let task = tokio::spawn(keep(
             url.to_string(),
             ask(Some(epoch)),
@@ -77,15 +89,22 @@ impl Lease {
             lost.clone(),
             released,
             detach,
+            tokens_tx,
         ));
         Ok(Lease {
             epoch,
             spec,
+            tokens,
             lost,
             release: Some(release),
             detach: detached,
             task,
         })
+    }
+
+    /// The player's latest credentials.
+    pub fn tokens(&self) -> watch::Receiver<pb::Tokens> {
+        self.tokens.clone()
     }
 
     /// Whether to stop now, once control says the session is stopped; `None` until then. A
@@ -100,9 +119,18 @@ impl Lease {
     }
 
     /// Give the lease back (ending the call's stream), so the next player needn't wait.
-    pub async fn release(mut self) {
+    pub async fn release(self) {
+        self.end(false).await
+    }
+
+    /// Give it back for control to start the next player: this one is stopped from outside.
+    pub async fn handoff(self) {
+        self.end(true).await
+    }
+
+    async fn end(mut self, handoff: bool) {
         if let Some(release) = self.release.take() {
-            let _ = release.send(());
+            let _ = release.send(handoff);
         }
         let _ = tokio::time::timeout(Duration::from_secs(2), &mut self.task).await;
     }
@@ -116,9 +144,33 @@ impl Drop for Lease {
     }
 }
 
-/// A call to control at `url` asking for the session with `ask`: the call, with the lease's
-/// epoch and the spec; or why not ([`Refused`], or not reaching control).
-async fn hold(url: &str, ask: pb::Acquire) -> anyhow::Result<(Call, i64, SessionSpec)> {
+/// A chlive credentials provider (`ClientOptions::credentials`): the player's latest.
+pub fn player_token(
+    tokens: watch::Receiver<pb::Tokens>,
+) -> impl Fn() -> std::future::Ready<Result<String, &'static str>> + Send + Sync + 'static {
+    move || std::future::ready(Ok(tokens.borrow().player.clone()))
+}
+
+/// The same, a dirigent's as its owner.
+pub fn owner_token(
+    tokens: watch::Receiver<pb::Tokens>,
+) -> impl Fn() -> std::future::Ready<Result<String, &'static str>> + Send + Sync + 'static {
+    move || {
+        let owner = tokens.borrow().owner.clone();
+        std::future::ready(owner.ok_or("the lease has no credentials for its owner"))
+    }
+}
+
+/// What control leases a player.
+struct Acquired {
+    epoch: i64,
+    spec: SessionSpec,
+    tokens: pb::Tokens,
+}
+
+/// A call to control at `url` asking for the session with `ask`: the call, with what's leased;
+/// or why not ([`Refused`], or not reaching control).
+async fn hold(url: &str, ask: pb::Acquire) -> anyhow::Result<(Call, Acquired)> {
     let channel = Endpoint::from_shared(url.to_string())?
         .connect_timeout(CONNECT_TIMEOUT)
         .http2_keep_alive_interval(KEEPALIVE)
@@ -143,16 +195,21 @@ async fn hold(url: &str, ask: pb::Acquire) -> anyhow::Result<(Call, i64, Session
             }) => {
                 let spec = a.spec.unwrap_or_default().try_into();
                 let spec = spec.map_err(|e| anyhow::anyhow!("control sent {e}"))?;
-                Ok((rx, a.epoch, spec))
+                let acquired = Acquired {
+                    epoch: a.epoch,
+                    spec,
+                    tokens: a.tokens.context("control sent no credentials")?,
+                };
+                Ok((rx, acquired))
             }
             Some(other) => anyhow::bail!("control answered {other:?}, not Acquired"),
             None => anyhow::bail!("control ended the call"),
         }
     };
-    let (rx, epoch, spec) = tokio::time::timeout(ANSWER_TIMEOUT, answer)
+    let (rx, acquired) = tokio::time::timeout(ANSWER_TIMEOUT, answer)
         .await
         .map_err(|_| anyhow::anyhow!("control didn't answer"))??;
-    Ok((Call { tx, rx }, epoch, spec))
+    Ok((Call { tx, rx }, acquired))
 }
 
 /// A status ending the call: control's refusal, or another error.
@@ -161,6 +218,7 @@ fn refused(status: tonic::Status) -> anyhow::Error {
         Code::FailedPrecondition => Refused::Held.into(),
         Code::NotFound => Refused::Unknown.into(),
         Code::Aborted => Refused::Lost.into(),
+        Code::PermissionDenied => Refused::Unreserved.into(),
         _ => status.into(),
     }
 }
@@ -174,25 +232,33 @@ pub enum Refused {
     Unknown,
     #[error("the lease is lost")]
     Lost,
+    #[error("control leases sessions only to the players it started")]
+    Unreserved,
 }
 
 /// Holds the call open, calling again and resuming (`resume`) when it breaks, until the lease
-/// is released or lost; passes control's word to detach on to `detach`.
+/// is released or lost; passes control's word to detach on to `detach`, and its fresh
+/// credentials to `tokens`.
 async fn keep(
     url: String,
     resume: pb::Acquire,
     mut call: Call,
     lost: CancellationToken,
-    mut released: oneshot::Receiver<()>,
+    mut released: oneshot::Receiver<bool>,
     detach: watch::Sender<Option<bool>>,
+    tokens: watch::Sender<pb::Tokens>,
 ) {
     loop {
         // the call, until it breaks
         loop {
             tokio::select! {
-                _ = &mut released => {
+                handoff = &mut released => {
                     // the stream ends: control gives the lease back and ends the call
                     let Call { tx, mut rx } = call;
+                    if handoff == Ok(true) {
+                        let msg = pb::from_player::Msg::Handoff(pb::Handoff {});
+                        let _ = tx.send(pb::FromPlayer { msg: Some(msg) }).await;
+                    }
                     drop(tx);
                     while let Ok(Some(_)) = rx.message().await {}
                     return;
@@ -202,6 +268,9 @@ async fn keep(
                         info!(now = d.now, "control says detach");
                         // a stop that's now stays so
                         detach.send_modify(|v| *v = Some(d.now || v.unwrap_or(false)));
+                    }
+                    Ok(Some(pb::ToPlayer { msg: Some(pb::to_player::Msg::Tokens(t)) })) => {
+                        tokens.send_replace(t);
                     }
                     Ok(Some(other)) => warn!("control sent {other:?}"),
                     Ok(None) | Err(_) => break,
@@ -216,7 +285,10 @@ async fn keep(
                 held = hold(&url, resume.clone()) => held,
             };
             match held {
-                Ok((call, _, _)) => break call,
+                Ok((call, acquired)) => {
+                    tokens.send_replace(acquired.tokens);
+                    break call;
+                }
                 Err(e) if e.is::<Refused>() => {
                     warn!("control says the lease is gone: {e}");
                     lost.cancel();

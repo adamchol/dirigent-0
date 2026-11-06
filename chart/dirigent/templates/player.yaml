@@ -1,0 +1,60 @@
+{{- /* The players' VM template (control's --kube-template): control names and labels each VM,
+and adds the player's own lines to the environment in the `dirigent` volume (nix/player-vm.nix
+has the guest's side). Evicted or deleted, a VM is shut down, and its player gets the grace
+period to finish its turn, checkpoint and hand the session over: it isn't migrated. */}}
+{{- $env := list
+  "DIRIGENT_CONTROL_URL=http://dirigent-control:8091"
+  "DIRIGENT_CONTROL_HTTP=http://dirigent-control:8090"
+  "CHLIVE_URL=ws://dirigent-chlive:8080/live"
+  (printf "DIRIGENT_STOP_GRACE=%d" (sub (int .Values.player.stopGrace) (int .Values.player.checkpointMargin)))
+}}
+{{- if .Values.player.mock }}
+{{- $env = append $env "MOCK=true" }}
+{{- end }}
+{{- range $k, $v := .Values.player.env }}
+{{- $env = append $env (printf "%s=%s" $k (toString $v)) }}
+{{- end }}
+{{- $secrets := prepend .Values.player.secrets "dirigent-kopia" }}
+{{- $vm := dict
+  "apiVersion" "kubevirt.io/v1"
+  "kind" "VirtualMachineInstance"
+  "metadata" (dict "labels" (dict
+    "app.kubernetes.io/name" "dirigent"
+    "app.kubernetes.io/instance" .Release.Name
+    "app.kubernetes.io/component" "player"))
+}}
+{{- $disks := list
+  (dict "name" "root" "disk" (dict "bus" "virtio"))
+  (dict "name" "dirigent" "disk" (dict "bus" "virtio"))
+  (dict "name" "work" "serial" "dirigent-work" "disk" (dict "bus" "virtio"))
+}}
+{{- $volumes := list
+  (dict "name" "root" "containerDisk" (dict "image" (include "dirigent.image" (list . "player-vm")) "imagePullPolicy" .Values.images.pullPolicy))
+  (dict "name" "dirigent" "cloudInitNoCloud" (dict "userData" (join "\n" $env)))
+  (dict "name" "work" "emptyDisk" (dict "capacity" .Values.player.workspaceSize))
+}}
+{{- range $i, $s := $secrets }}
+{{- $disks = append $disks (dict "name" (printf "secret%d" $i) "serial" (printf "dirigent-secret%d" $i) "disk" (dict "bus" "virtio")) }}
+{{- $volumes = append $volumes (dict "name" (printf "secret%d" $i) "secret" (dict "secretName" $s)) }}
+{{- end }}
+{{- $_ := set $vm "spec" (dict
+  "terminationGracePeriodSeconds" (int .Values.player.stopGrace)
+  "evictionStrategy" "None"
+  "nodeSelector" .Values.player.nodeSelector
+  "domain" (dict
+    "cpu" (dict "cores" (int .Values.player.cpu))
+    "memory" (dict "guest" .Values.player.memory)
+    "devices" (dict
+      "disks" $disks
+      "interfaces" (list (dict "name" "default" "masquerade" (dict)))))
+  "networks" (list (dict "name" "default" "pod" (dict)))
+  "volumes" $volumes)
+}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dirigent-player
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+data:
+  vm.json: {{ toJson $vm | quote }}

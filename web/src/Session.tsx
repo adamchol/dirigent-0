@@ -5,20 +5,26 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { LiveClient } from "@chlive/client";
 import { useLiveQuery } from "@chlive/client/react";
 
+import * as api from "./api.ts";
 import type { SessionInfo } from "./api.ts";
 import { LOG_QUERY, timeline, type EventRow, type Item, type Usage } from "./events.ts";
 
 export function Session(props: {
   id: string;
   client: LiveClient;
-  user: string;
-  /** The session as control has it (once listed). */
+  who: api.Who;
+  /** The session as control shows it to the user; none, it's none of theirs (once `listed`). */
   info?: SessionInfo;
-  /** Look as another user. */
-  become: (user: string) => void;
+  /** Whether control's list came. */
+  listed: boolean;
+  /** Look as another user (`declared` auth only). */
+  become?: (user: string) => void;
+  /** The session changed (its viewers). */
+  changed: () => void;
 }) {
-  // chlive shows a user without access an empty log and refuses their rows
-  const denied = props.info && !props.info.users.includes(props.user);
+  // only its owner writes to it; chlive shows anyone else without access an empty log
+  const owner = props.info?.role === "owner";
+  const denied = !owner;
   const log = useLiveQuery<EventRow & Record<string, unknown>>(LOG_QUERY, { params: { session: props.id } });
   const { items, openTurn } = useMemo(() => timeline(log.rows), [log.rows]);
 
@@ -61,23 +67,18 @@ export function Session(props: {
         <code>{props.id}</code>
         {openTurn && <span className="running">turn running</span>}
       </div>
-      {denied && (
-        <div className="error">
-          {props.user} has no access to this session
-          {props.info!.users.length ? (
-            <>
-              ; its users:{" "}
-              {props.info!.users.map((u) => (
-                <button key={u} type="button" onClick={() => props.become(u)} title={`look as ${u}`}>
-                  {u}
-                </button>
-              ))}
-            </>
-          ) : (
-            " (it has no users)"
+      {props.info && owner && <Viewers info={props.info} who={props.who} changed={props.changed} />}
+      {props.info && !owner && (
+        <div className="notice">
+          Viewing {props.info.owner}'s session: only they write to it.{" "}
+          {props.become && (
+            <button type="button" onClick={() => props.become!(props.info!.owner)}>
+              look as {props.info.owner}
+            </button>
           )}
         </div>
       )}
+      {!props.info && props.listed && <div className="error">{props.who.user} has no access to this session.</div>}
       {log.status === "error" ? (
         <div className="log denied">No log: {log.error?.message}</div>
       ) : (
@@ -101,7 +102,7 @@ export function Session(props: {
           value={draft}
           rows={2}
           disabled={denied}
-          placeholder={`Message as ${props.user}`}
+          placeholder={`Message as ${props.who.user}`}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) send(e);
@@ -126,11 +127,23 @@ function Entry({ item }: { item: Item }) {
       return (
         <div className={`entry user${item.queued ? " queued" : ""}`}>
           <div className="who">
-            {item.author} <span className="meta">{time(item.ts)}</span>
+            {item.author}
+            {item.via && <span className="meta"> via dirigent {item.via.slice(0, 8)}</span>}{" "}
+            <span className="meta">{time(item.ts)}</span>
             {item.queued && <span className="meta"> · queued</span>}
           </div>
           <div className="text">{item.text}</div>
         </div>
+      );
+    case "update":
+      return (
+        <details className={`entry update${item.queued ? " queued" : ""}`}>
+          <summary>
+            ⇠ session <a href={`#${item.session}`}>{item.session.slice(0, 8)}</a>: {item.what}
+            {item.queued && <span className="meta"> · queued</span>}
+          </summary>
+          {item.reply && <div className="text">{item.reply}</div>}
+        </details>
       );
     case "text":
       return <div className="entry assistant text">{item.text}</div>;
@@ -188,4 +201,45 @@ function usage(u: Usage): string {
 function time(ts: string | Date): string {
   const d = ts instanceof Date ? ts : new Date(ts.includes("T") ? ts : `${ts.replace(" ", "T")}Z`);
   return isNaN(d.getTime()) ? String(ts) : d.toLocaleTimeString();
+}
+
+/** The session's viewers, which its owner adds and removes. */
+function Viewers(props: { info: SessionInfo; who: api.Who; changed: () => void }) {
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState("");
+  const act = async (f: () => Promise<void>) => {
+    try {
+      await f();
+      setError("");
+    } catch (e) {
+      setError((e as Error).message);
+    }
+    props.changed();
+  };
+  function add(e: React.FormEvent) {
+    e.preventDefault();
+    const viewer = draft.trim();
+    if (!viewer) return;
+    setDraft("");
+    act(() => api.addViewer(props.who, props.info.id, viewer));
+  }
+  return (
+    <form className="viewers" onSubmit={add}>
+      <span className="meta">viewers:</span>
+      {props.info.viewers.map((v) => (
+        <span key={v} className="chip">
+          {v}
+          <button
+            type="button"
+            title={`${v} reads it no more`}
+            onClick={() => act(() => api.removeViewer(props.who, props.info.id, v))}
+          >
+            ×
+          </button>
+        </span>
+      ))}
+      <input placeholder="user:…" value={draft} onChange={(e) => setDraft(e.target.value)} spellCheck={false} />
+      {error && <span className="error">{error}</span>}
+    </form>
+  );
 }

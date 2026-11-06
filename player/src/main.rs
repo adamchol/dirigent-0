@@ -1,10 +1,12 @@
 mod agent;
 mod checkpoints;
 mod compact;
+mod dirigent;
 mod history;
 mod process;
 mod provider;
 mod session;
+mod stop;
 mod tools;
 mod workspace;
 
@@ -19,15 +21,18 @@ use tracing::{info, warn};
 
 use crate::agent::{Agent, AgentConfig, Detach};
 use crate::checkpoints::Checkpoints;
+use crate::dirigent::Director;
 use crate::provider::Provider;
 use crate::session::chlive::ChliveSession;
 use crate::session::control::Lease;
 use crate::session::Session;
 use crate::tools::Registry;
-use dirigent_protocol::control::{player_subject, SessionSpec};
+use dirigent_protocol::control::{Part, SessionSpec};
 use dirigent_protocol::Event;
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
+/// The dirigent's, whole: its workspace isn't its work.
+const DIRIGENT_PROMPT: &str = include_str!("../prompts/dirigent.md");
 
 const HELP_STYLES: Styles = Styles::styled()
     .header(AnsiColor::BrightMagenta.on_default().bold())
@@ -56,7 +61,7 @@ struct Cli {
     player_id: Option<String>,
 
     /// The lease control reserved for this player (it started it): resumed, not taken anew.
-    #[arg(long, hide = true)]
+    #[arg(long, env = "DIRIGENT_EPOCH", hide = true)]
     epoch: Option<i64>,
 
     /// Control's gRPC service for players, where the session is leased.
@@ -66,6 +71,14 @@ struct Cli {
         default_value = "http://127.0.0.1:8091"
     )]
     control_url: String,
+
+    /// Control's HTTP API, which a dirigent directs sessions through.
+    #[arg(
+        long,
+        env = "DIRIGENT_CONTROL_HTTP",
+        default_value = "http://127.0.0.1:8090"
+    )]
+    control_http: String,
 
     /// chlive's WebSocket, where the session's log is read and appended to.
     #[arg(long, env = "CHLIVE_URL", default_value = "ws://127.0.0.1:8080/live")]
@@ -93,6 +106,12 @@ struct Cli {
     #[arg(long, env = "DIRIGENT_CONTEXT_WINDOW", default_value_t = 200_000)]
     context_window: u64,
 
+    /// Stopped from outside (SIGTERM: its machine is going), how long the turn running may
+    /// take to finish before it's cut, in seconds; then the workspace is checkpointed and the
+    /// session handed over to the next player. Less than the machine's own grace period.
+    #[arg(long, env = "DIRIGENT_STOP_GRACE", default_value_t = 300)]
+    stop_grace: u64,
+
     #[arg(long, env = "ANTHROPIC_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
 
@@ -111,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
     let cli: &'static Cli = Box::leak(Box::new(Cli::parse()));
+    let mut signals = stop::signals();
 
     let provider: Arc<dyn Provider> = if cli.mock {
         Arc::new(provider::mock::MockProvider::default())
@@ -165,14 +185,35 @@ async fn main() -> anyhow::Result<()> {
         control = cli.control_url,
         "acquiring the session"
     );
-    let lease = Lease::acquire(&cli.control_url, &id, &player, cli.epoch).await?;
+    let lease = tokio::select! {
+        lease = Lease::acquire(&cli.control_url, &id, &player, cli.epoch) => lease?,
+        _ = signals.recv() => {
+            info!("stopped before holding the session");
+            return Ok(());
+        }
+    };
+    let stop = stop::watch(lease.detach(), signals, Duration::from_secs(cli.stop_grace));
     let spec: &'static SessionSpec = Box::leak(Box::new(lease.spec.clone()));
-    let mut session =
-        ChliveSession::new(&id, lease.epoch, &cli.chlive_url, &player_subject(&player));
+    let mut session = ChliveSession::new(&id, lease.epoch, &cli.chlive_url, lease.tokens());
     let run = async {
         let log = workspace::open(&mut session, workdir, spec.source.as_ref(), checkpoints).await?;
-        // after the workspace is made: its AGENTS.md is part of the prompt
-        let system: &'static str = Box::leak(build_system_prompt(workdir).into_boxed_str());
+        let (system, tools): (&'static str, Registry) = match spec.part {
+            // after the workspace is made: its AGENTS.md is part of the prompt
+            Part::Coder => (
+                Box::leak(build_system_prompt(workdir).into_boxed_str()),
+                Registry::default_set(),
+            ),
+            Part::Dirigent => {
+                let director = Arc::new(Director::new(
+                    &id,
+                    lease.tokens(),
+                    &cli.chlive_url,
+                    &cli.control_http,
+                )?);
+                tokio::spawn(dirigent::follow(director.clone(), cli.chlive_url.clone()));
+                (DIRIGENT_PROMPT, Registry::new(director.tools()))
+            }
+        };
         let agent = Agent {
             provider: provider.clone(),
             cfg: AgentConfig {
@@ -181,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
                 effort: spec.effort,
                 context_window: cli.context_window,
             },
-            tools: Arc::new(Registry::default_set()),
+            tools: Arc::new(tools),
             workdir,
             checkpoints,
         };
@@ -193,21 +234,18 @@ async fn main() -> anyhow::Result<()> {
             provider = provider.name(),
             model = spec.model,
             effort = ?spec.effort,
+            part = ?spec.part,
             workdir = %workdir.display(),
             "running the session"
         );
         let detach = Detach {
             epoch: lease.epoch,
-            when: lease.detach(),
+            when: stop.when.clone(),
         };
         agent.run(&mut session, log, detach).await
     };
     let result = tokio::select! {
         r = run => r,
-        _ = stopped() => {
-            info!("shutting down");
-            Ok(())
-        }
         _ = lease.lost() => anyhow::bail!("the session's lease is lost to another player"),
     };
     // failed: the session is given back, saying why
@@ -218,7 +256,12 @@ async fn main() -> anyhow::Result<()> {
         };
         let _ = tokio::time::timeout(Duration::from_secs(5), session.publish(&failed)).await;
     }
-    lease.release().await;
+    if result.is_ok() && *stop.outside.borrow() {
+        info!("handing the session over");
+        lease.handoff().await;
+    } else {
+        lease.release().await;
+    }
     result
 }
 
@@ -250,17 +293,4 @@ fn build_system_prompt(workdir: &Path) -> String {
     }
     prompt.push_str(&format!("\n\nWorking directory: {}\n", workdir.display()));
     prompt
-}
-
-/// Ctrl-C, SIGTERM (how process managers and Kubernetes stop it) or SIGHUP (its terminal
-/// closing).
-async fn stopped() {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = signal(SignalKind::terminate()).expect("SIGTERM can be handled");
-    let mut hup = signal(SignalKind::hangup()).expect("SIGHUP can be handled");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
-        _ = hup.recv() => {}
-    }
 }

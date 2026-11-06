@@ -1,5 +1,6 @@
 //! The control plane's state, in Postgres (`db/postgres`): the sessions, and who may use each
-//! (`session_access`, which chlive grants from), its users and the one player holding its lease.
+//! (`session_access`, which chlive grants from): its owner, its viewers, and the one player
+//! holding its lease.
 //! A lease row's `expires_at` is null while its player is connected; once it isn't, the player
 //! may come back for it until then, and past it the row is deleted ([`Store::sweep`]). A session
 //! with a lease is active; one without, idle. Control starts a player by reserving the lease for
@@ -8,7 +9,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use dirigent_protocol::control::{Holder, SessionInfo, SessionSpec};
+use dirigent_protocol::control::{Holder, Role, SessionInfo, SessionSpec};
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls, Row};
 use tracing::error;
@@ -29,13 +30,15 @@ pub enum Put {
     Exists,
     /// It was there, with another spec: nothing changed.
     Conflict,
+    /// It was there, another's: nothing changed.
+    NotOwner,
 }
 
 /// What a player asking for a session gets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Acquire {
-    /// It holds it, as the `epoch`th player, and runs the spec.
-    Acquired(i64, SessionSpec),
+    /// It holds it, as the `epoch`th player, and runs the spec, for its owner.
+    Acquired(i64, SessionSpec, String),
     /// Another player does.
     Held,
     /// There's no such session.
@@ -72,13 +75,15 @@ impl Store {
         })
     }
 
-    /// The session `id`, made with `spec` if there's none, with access for `users` (subjects)
-    /// besides those it has. One that's there keeps its spec: given another, nothing changes.
+    /// The session `id`, made with `spec` and `owner` (a subject) if there's none, with
+    /// `viewers` besides those it has. One that's there keeps its spec and owner: given another,
+    /// nothing changes.
     pub async fn put_session(
         &self,
         id: Uuid,
         spec: &SessionSpec,
-        users: &[String],
+        owner: &str,
+        viewers: &[String],
     ) -> anyhow::Result<Put> {
         let json = serde_json::to_value(spec)?;
         let mut db = self.db.lock().await;
@@ -90,25 +95,36 @@ impl Store {
             )
             .await?;
         let put = if made == 1 {
+            tx.execute(
+                "INSERT INTO dirigent.session_access (session_id, subject, role) \
+                 VALUES ($1, $2, 'owner')",
+                &[&id, &owner],
+            )
+            .await?;
             Put::Made
         } else {
             let row = tx
                 .query_one(
-                    "SELECT spec FROM dirigent.sessions WHERE id = $1 FOR UPDATE",
+                    "SELECT spec, (SELECT subject FROM dirigent.session_access \
+                       WHERE session_id = $1 AND role = 'owner') \
+                     FROM dirigent.sessions WHERE id = $1 FOR UPDATE",
                     &[&id],
                 )
                 .await?;
+            if row.get::<_, Option<&str>>(1) != Some(owner) {
+                return Ok(Put::NotOwner);
+            }
             let had: SessionSpec = serde_json::from_value(row.get(0))?;
             if had != *spec {
                 return Ok(Put::Conflict);
             }
             Put::Exists
         };
-        for user in users {
+        for viewer in viewers.iter().filter(|v| *v != owner) {
             tx.execute(
-                "INSERT INTO dirigent.session_access (session_id, subject) VALUES ($1, $2) \
-                 ON CONFLICT DO NOTHING",
-                &[&id, user],
+                "INSERT INTO dirigent.session_access (session_id, subject, role) \
+                 VALUES ($1, $2, 'viewer') ON CONFLICT DO NOTHING",
+                &[&id, viewer],
             )
             .await?;
         }
@@ -116,25 +132,69 @@ impl Store {
         Ok(put)
     }
 
-    /// The session `id`, if there's one.
-    pub async fn session(&self, id: Uuid) -> anyhow::Result<Option<SessionInfo>> {
+    /// The session `id`, if there's one `caller` (a subject) owns or views.
+    pub async fn session(&self, id: Uuid, caller: &str) -> anyhow::Result<Option<SessionInfo>> {
         let rows = self
             .db
             .lock()
             .await
-            .query(&format!("{SESSIONS} WHERE s.id = $1"), &[&id])
+            .query(&format!("{SESSIONS} WHERE s.id = $2"), &[&caller, &id])
             .await?;
         rows.iter().map(session_info).next().transpose()
     }
 
-    pub async fn sessions(&self) -> anyhow::Result<Vec<SessionInfo>> {
+    /// The sessions `caller` owns or views.
+    pub async fn sessions(&self, caller: &str) -> anyhow::Result<Vec<SessionInfo>> {
         let rows = self
             .db
             .lock()
             .await
-            .query(&format!("{SESSIONS} ORDER BY s.id"), &[])
+            .query(&format!("{SESSIONS} ORDER BY s.id"), &[&caller])
             .await?;
         rows.iter().map(session_info).collect()
+    }
+
+    /// `caller`'s role in the session `id`, if it has one (or there's no such session).
+    pub async fn role(&self, id: Uuid, caller: &str) -> anyhow::Result<Option<Role>> {
+        let row = self
+            .db
+            .lock()
+            .await
+            .query_opt(
+                "SELECT role FROM dirigent.session_access \
+                 WHERE session_id = $1 AND subject = $2 AND role IN ('owner', 'viewer')",
+                &[&id, &caller],
+            )
+            .await?;
+        Ok(row.map(|r| role(r.get(0))))
+    }
+
+    /// Let `viewer` read the session `id` (unless it has a role there already).
+    pub async fn add_viewer(&self, id: Uuid, viewer: &str) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO dirigent.session_access (session_id, subject, role) \
+                 VALUES ($1, $2, 'viewer') ON CONFLICT DO NOTHING",
+                &[&id, &viewer],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `viewer` reads the session `id` no more.
+    pub async fn remove_viewer(&self, id: Uuid, viewer: &str) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .await
+            .execute(
+                "DELETE FROM dirigent.session_access \
+                 WHERE session_id = $1 AND subject = $2 AND role = 'viewer'",
+                &[&id, &viewer],
+            )
+            .await?;
+        Ok(())
     }
 
     /// `subject` (a player) asks to hold `session`, or to resume the lease it held, `resume`.
@@ -162,10 +222,19 @@ impl Store {
         };
         let epoch: i64 = row.get(0);
         let spec: SessionSpec = serde_json::from_value(row.get(1))?;
+        let owner: String = tx
+            .query_opt(
+                "SELECT subject FROM dirigent.session_access \
+                 WHERE session_id = $1 AND role = 'owner'",
+                &[&session],
+            )
+            .await?
+            .map(|r| r.get(0))
+            .unwrap_or_default();
         let holder = tx
             .query_opt(
                 "SELECT subject, expires_at IS NULL OR expires_at > now() \
-                 FROM dirigent.session_access WHERE session_id = $1 AND player",
+                 FROM dirigent.session_access WHERE session_id = $1 AND role = 'player'",
                 &[&session],
             )
             .await?;
@@ -173,17 +242,17 @@ impl Store {
             Some(h) if h.get::<_, &str>(0) == subject => {
                 tx.execute(
                     "UPDATE dirigent.session_access SET expires_at = NULL \
-                     WHERE session_id = $1 AND player",
+                     WHERE session_id = $1 AND role = 'player'",
                     &[&session],
                 )
                 .await?;
-                Acquire::Acquired(epoch, spec)
+                Acquire::Acquired(epoch, spec, owner)
             }
             _ if resume.is_some() => Acquire::Lost,
             Some(h) if h.get::<_, bool>(1) => Acquire::Held,
             _ => {
                 tx.execute(
-                    "DELETE FROM dirigent.session_access WHERE session_id = $1 AND player",
+                    "DELETE FROM dirigent.session_access WHERE session_id = $1 AND role = 'player'",
                     &[&session],
                 )
                 .await?;
@@ -196,12 +265,12 @@ impl Store {
                     .await?
                     .get(0);
                 tx.execute(
-                    "INSERT INTO dirigent.session_access (session_id, subject, player) \
-                     VALUES ($1, $2, true)",
+                    "INSERT INTO dirigent.session_access (session_id, subject, role) \
+                     VALUES ($1, $2, 'player')",
                     &[&session, &subject],
                 )
                 .await?;
-                Acquire::Acquired(epoch, spec)
+                Acquire::Acquired(epoch, spec, owner)
             }
         };
         tx.commit().await?;
@@ -215,7 +284,7 @@ impl Store {
             .await
             .execute(
                 "DELETE FROM dirigent.session_access \
-                 WHERE session_id = $1 AND subject = $2 AND player",
+                 WHERE session_id = $1 AND subject = $2 AND role = 'player'",
                 &[&session, &subject],
             )
             .await?;
@@ -229,7 +298,7 @@ impl Store {
             .await
             .execute(
                 "UPDATE dirigent.session_access SET expires_at = now() + make_interval(secs => $3) \
-                 WHERE session_id = $1 AND subject = $2 AND player AND expires_at IS NULL",
+                 WHERE session_id = $1 AND subject = $2 AND role = 'player' AND expires_at IS NULL",
                 &[&session, &subject, &self.grace],
             )
             .await?;
@@ -245,7 +314,7 @@ impl Store {
             .await
             .execute(
                 "UPDATE dirigent.session_access SET expires_at = now() + make_interval(secs => $1) \
-                 WHERE player AND expires_at IS NULL",
+                 WHERE role = 'player' AND expires_at IS NULL",
                 &[&self.grace],
             )
             .await?)
@@ -260,7 +329,7 @@ impl Store {
             .lock()
             .await
             .query(
-                "DELETE FROM dirigent.session_access WHERE player AND expires_at < now() \
+                "DELETE FROM dirigent.session_access WHERE role = 'player' AND expires_at < now() \
                  AND (spawned_by IS NULL OR spawned_by = $1) \
                  RETURNING session_id, spawned_by IS NOT NULL",
                 &[&runner],
@@ -292,7 +361,7 @@ impl Store {
         let held = tx
             .query_opt(
                 "SELECT expires_at IS NULL OR expires_at > now() \
-                 FROM dirigent.session_access WHERE session_id = $1 AND player",
+                 FROM dirigent.session_access WHERE session_id = $1 AND role = 'player'",
                 &[&session],
             )
             .await?;
@@ -300,7 +369,7 @@ impl Store {
             Some(true) => return Ok(Reserve::Held),
             Some(false) => {
                 tx.execute(
-                    "DELETE FROM dirigent.session_access WHERE session_id = $1 AND player",
+                    "DELETE FROM dirigent.session_access WHERE session_id = $1 AND role = 'player'",
                     &[&session],
                 )
                 .await?;
@@ -316,13 +385,28 @@ impl Store {
             .get(0);
         tx.execute(
             "INSERT INTO dirigent.session_access \
-             (session_id, subject, player, spawned_by, expires_at) \
-             VALUES ($1, $2, true, $3, now() + make_interval(secs => $4))",
+             (session_id, subject, role, spawned_by, expires_at) \
+             VALUES ($1, $2, 'player', $3, now() + make_interval(secs => $4))",
             &[&session, &subject, &runner, &startup.as_secs_f64()],
         )
         .await?;
         tx.commit().await?;
         Ok(Reserve::Reserved(epoch))
+    }
+
+    /// The players holding leases (or away, within the grace period) that `runner` started.
+    pub async fn players(&self, runner: &str) -> anyhow::Result<Vec<String>> {
+        let rows = self
+            .db
+            .lock()
+            .await
+            .query(
+                "SELECT subject FROM dirigent.session_access \
+                 WHERE role = 'player' AND spawned_by = $1",
+                &[&runner],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
     /// Delete the lease on `session`, whoever holds it; whether there was one.
@@ -332,31 +416,26 @@ impl Store {
             .lock()
             .await
             .execute(
-                "DELETE FROM dirigent.session_access WHERE session_id = $1 AND player",
+                "DELETE FROM dirigent.session_access WHERE session_id = $1 AND role = 'player'",
                 &[&session],
             )
             .await?;
         Ok(n == 1)
     }
-
-    /// Whether there's a session `id`.
-    pub async fn exists(&self, id: Uuid) -> anyhow::Result<bool> {
-        let row = self
-            .db
-            .lock()
-            .await
-            .query_opt("SELECT 1 FROM dirigent.sessions WHERE id = $1", &[&id])
-            .await?;
-        Ok(row.is_some())
-    }
 }
 
-/// The sessions with their lease holders and users, for [`session_info`].
-const SESSIONS: &str = "SELECT s.id, s.spec, s.epoch, a.subject, a.expires_at IS NULL, \
-     ARRAY(SELECT u.subject FROM dirigent.session_access u \
-           WHERE u.session_id = s.id AND NOT u.player ORDER BY u.subject) \
+/// The sessions the caller (`$1`) owns or views, with their lease holders, owners and viewers,
+/// for [`session_info`].
+const SESSIONS: &str = "SELECT s.id, s.spec, s.epoch, p.subject, p.expires_at IS NULL, \
+     coalesce(o.subject, ''), \
+     ARRAY(SELECT v.subject FROM dirigent.session_access v \
+           WHERE v.session_id = s.id AND v.role = 'viewer' ORDER BY v.subject), \
+     me.role \
      FROM dirigent.sessions s \
-     LEFT JOIN dirigent.session_access a ON a.session_id = s.id AND a.player";
+     JOIN dirigent.session_access me \
+       ON me.session_id = s.id AND me.subject = $1 AND me.role IN ('owner', 'viewer') \
+     LEFT JOIN dirigent.session_access p ON p.session_id = s.id AND p.role = 'player' \
+     LEFT JOIN dirigent.session_access o ON o.session_id = s.id AND o.role = 'owner'";
 
 fn session_info(row: &Row) -> anyhow::Result<SessionInfo> {
     let id: Uuid = row.get(0);
@@ -369,6 +448,15 @@ fn session_info(row: &Row) -> anyhow::Result<SessionInfo> {
             subject,
             attached: row.get(4),
         }),
-        users: row.get(5),
+        owner: row.get(5),
+        viewers: row.get(6),
+        role: role(row.get(7)),
     })
+}
+
+fn role(r: &str) -> Role {
+    match r {
+        "owner" => Role::Owner,
+        _ => Role::Viewer,
+    }
 }

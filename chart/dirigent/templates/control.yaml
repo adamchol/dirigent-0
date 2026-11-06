@@ -1,0 +1,120 @@
+{{- /* Control: the sessions, who may use them, the players' leases, and their VMs (made from
+the template below, in this namespace). */}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dirigent-control
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dirigent-control
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachineinstances]
+    verbs: [get, list, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dirigent-control
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dirigent-control
+subjects:
+  - kind: ServiceAccount
+    name: dirigent-control
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dirigent-control
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "dirigent.selector" . | nindent 4 }}
+    app.kubernetes.io/component: control
+  ports:
+    - { name: http, port: 8090, targetPort: http }
+    - { name: grpc, port: 8091, targetPort: grpc, appProtocol: kubernetes.io/h2c }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dirigent-control
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control
+spec:
+  # one: it sweeps the leases and runs the players
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "dirigent.selector" . | nindent 6 }}
+      app.kubernetes.io/component: control
+  template:
+    metadata:
+      labels:
+        {{- include "dirigent.selector" . | nindent 8 }}
+        app.kubernetes.io/component: control
+      annotations:
+        checksum/player: {{ include (print $.Template.BasePath "/player.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: dirigent-control
+      containers:
+        - name: control
+          image: {{ include "dirigent.image" (list . "control") }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args:
+            - --listen=0.0.0.0:8090
+            - --grpc-listen=0.0.0.0:8091
+            - --reserved-only
+            - --startup={{ .Values.control.startup }}
+            - --auth={{ .Values.auth.mode }}
+            {{- if eq .Values.auth.mode "oidc" }}
+            - --oidc-issuer=https://accounts.google.com
+            - --oidc-issuer=accounts.google.com
+            {{- range .Values.auth.google.clientIds }}
+            - --oidc-audience={{ . }}
+            {{- end }}
+            - --oidc-required-claim=email_verified=true
+            {{- range $k, $v := .Values.auth.google.requiredClaims }}
+            - --oidc-required-claim={{ $k }}={{ $v }}
+            {{- end }}
+            {{- end }}
+          env:
+            - name: PG_PASSWORD
+              valueFrom: { secretKeyRef: { name: dirigent-control-postgres, key: password } }
+            - name: DIRIGENT_CONTROL_POSTGRES
+              value: "postgres://dirigent_control:$(PG_PASSWORD)@dirigent-postgres-rw:5432/dirigent"
+            - name: DIRIGENT_SIGNING_KEY
+              value: /etc/dirigent/key/key.pem
+            - name: DIRIGENT_KUBE_TEMPLATE
+              value: /etc/dirigent/player/vm.json
+            - name: DIRIGENT_KUBE_NAME
+              value: {{ .Release.Name }}
+          ports:
+            - { name: http, containerPort: 8090 }
+            - { name: grpc, containerPort: 8091 }
+          readinessProbe:
+            httpGet: { path: /auth, port: http }
+          resources:
+            {{- toYaml .Values.control.resources | nindent 12 }}
+          volumeMounts:
+            - { name: key, mountPath: /etc/dirigent/key, readOnly: true }
+            - { name: player, mountPath: /etc/dirigent/player, readOnly: true }
+      volumes:
+        - name: key
+          secret: { secretName: dirigent-signing-key }
+        - name: player
+          configMap: { name: dirigent-player }

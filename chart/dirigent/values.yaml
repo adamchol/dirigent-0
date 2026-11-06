@@ -1,0 +1,146 @@
+# dirigent's chart. Its own parts: control (sessions, the players' leases, and their VMs), chlive
+# (the sessions' logs, live), the web UI, and the players' VM template. Required on the cluster:
+# KubeVirt (the players' VMs) and CloudNativePG (the chart's Postgres). Required of you:
+# ClickHouse, Kafka, and S3 for the workspaces' checkpoints (or RustFS, deployed by the chart).
+# One install per namespace: its objects are named `dirigent-*`.
+
+images:
+  registry: ghcr.io/adamchol
+  # the chart's appVersion when empty
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Who signs in. `oidc`: with Google, as `user:<email>`; `declared`: whoever the web's box says,
+# unverified (dev only).
+auth:
+  mode: oidc
+  google:
+    # the OAuth client ids whose ID tokens are taken; the first is the web's
+    clientIds: []
+    # claims a token must have, e.g. {hd: example.com}; email_verified is always required
+    requiredClaims: {}
+
+# The chart's Postgres: a CloudNativePG Cluster, with control's and chlive's roles.
+postgres:
+  instances: 1
+  storage: 10Gi
+  storageClass: ""
+  # CloudNativePG's PostgreSQL 17 image when empty
+  image: ""
+
+# Yours, required: its HTTP(S) interface. The admin runs the migrations and makes the users
+# dirigent needs (chlive's, and the ingestion's), with passwords the chart generates.
+clickhouse:
+  host: ""
+  port: 8443
+  secure: true
+  # a Secret with `username` and `password`
+  adminSecret: ""
+  # `ON CLUSTER` for the users and grants, if access is replicated
+  cluster: ""
+
+# Yours, required.
+kafka:
+  bootstrapServers: ""
+  # librdkafka properties for chlive (e.g. security.protocol); the ingestion's are its own
+  # (ingestion.kafka.existingSecret)
+  properties: {}
+
+# The workspaces' checkpoints: a kopia repository in S3.
+checkpoints:
+  s3:
+    # host:port; empty with rustfs.enabled
+    endpoint: ""
+    bucket: dirigent-workspaces
+    tls: true
+    # a Secret with `accessKey` and `secretKey`
+    existingSecret: ""
+  # or a single-node RustFS, deployed by the chart
+  rustfs:
+    enabled: false
+    storage: 50Gi
+    storageClass: ""
+
+# The players: one KubeVirt VM each.
+player:
+  cpu: 2
+  memory: 4Gi
+  # the workspace and the player's state, a fresh disk per VM (restored from its checkpoint)
+  workspaceSize: 20Gi
+  # How long a player stopped from outside (a node drained, its VM deleted) has: the turn may
+  # finish until `stopGrace - checkpointMargin`, then it's cut, checkpointed and handed over.
+  stopGrace: 3600
+  checkpointMargin: 300
+  # the mock model, no API calls (tests)
+  mock: false
+  # Secrets given to every player, each key a variable (e.g. ANTHROPIC_API_KEY)
+  secrets: []
+  # more variables, e.g. {ANTHROPIC_BASE_URL: …, RUST_LOG: player=debug}
+  env: {}
+  nodeSelector: {}
+
+control:
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+  # how long a started player has to take its lease: its VM's boot and image pull
+  startup: 600
+
+chlive:
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+  cacheSize: 10Gi
+
+web:
+  ingress:
+    enabled: false
+    className: ""
+    host: ""
+    tls: []
+    annotations: {}
+
+networkPolicy:
+  enabled: true
+  # the cluster's pod and service ranges: the players reach the internet, but in the cluster only
+  # control, chlive, S3 and DNS
+  clusterCIDRs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+# continuous-backup's chart (Kafka Connect with the ClickHouse sink, and the pause server), with
+# dirigent's pipeline. Disabled, it's yours: give pauseServerUrl, and run the session_events
+# pipeline (topic and table session_events, database dirigent, with the InsertField transform
+# below).
+ingestion:
+  enabled: true
+  pauseServerUrl: ""
+  fullnameOverride: dirigent-ingest
+  stateNamespace: dirigent
+  kafka:
+    bootstrapServers: ""
+    existingSecret: ""
+  clickhouse:
+    host: ""
+    port: 8443
+    secure: true
+    database: dirigent
+    # made by the chart's ClickHouse migrations
+    credentialsSecret:
+      name: dirigent-clickhouse-sink
+  pauseServer:
+    # ClickHouse Keeper, host:port
+    keeperAddress: ""
+    credentialsSecret:
+      name: dirigent-clickhouse-pause
+  recovery:
+    credentialsSecret:
+      name: dirigent-clickhouse-recovery
+  pipelines:
+    - name: session-events
+      topic: session_events
+      table: session_events
+      database: dirigent
+      # each row also stores its message's partition, offset and timestamp, which chlive reads
+      connectorConfig:
+        transforms: kafka
+        transforms.kafka.type: org.apache.kafka.connect.transforms.InsertField$Value
+        transforms.kafka.partition.field: partition
+        transforms.kafka.offset.field: offset
+        transforms.kafka.timestamp.field: ts

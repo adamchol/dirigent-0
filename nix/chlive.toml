@@ -22,12 +22,34 @@ offset = { kafka = "offset" }
 partition = { kafka = "partition" }
 ts = { kafka = "timestamp" }
 
-# Who a connection is: whoever its `hello` says (dev only; deployments verify credentials).
+# Who a connection is: the subject of a credential control signed (`player:<id>` from a lease,
+# a dirigent's owner, or in dev whoever control's `declared` auth signs for at `POST /token`),
+# verified with its key's public half (`control keygen`, the `keys` process).
 [auth]
-mode = "declared"
+mode = "jwt"
 
-# Who may read and insert a session's events: its subjects in control's `session_access` (its
-# users, and the player holding its lease), followed from Postgres (db/postgres). `url` comes
+[[auth.issuers]]
+issuer = "dirigent-control"
+audiences = ["chlive"]
+jwks_file = ".dnvr/control-key/jwks.json"
+algorithms = ["EdDSA"]
+
+# Deployed, humans present Google's ID tokens (control's `--auth oidc` takes the same), as
+# `user:<email>`; Google's say either `iss`:
+# [[auth.issuers]]
+# issuer = "https://accounts.google.com"
+# audiences = ["<web client id>", "<ios client id>", "<macos client id>"]
+# jwks_url = "https://www.googleapis.com/oauth2/v3/certs"
+# algorithms = ["RS256"]
+# subject_claim = "email"
+# subject_prefix = "user:"
+# required_claims = { email_verified = true, hd = "adamchol.com" }
+# [[auth.issuers]]
+# issuer = "accounts.google.com"
+# ... the same
+
+# Who may read a session's events: its subjects in control's `session_access` (its owner, its
+# viewers, and the player holding its lease), followed from Postgres (db/postgres). `url` comes
 # as a flag.
 [security]
 default = "deny"
@@ -43,9 +65,14 @@ provider = "pg"
 column = "session_id"
 grants = "SELECT session_id FROM session_access WHERE subject = {subject:String}"
 
+# Who may insert them: into the sessions one owns or plays, and of the kinds one may (an owner
+# its inputs, a player all of them; `insert_kinds`).
 [tables.session_events.insert]
 # set by chlive, to who inserts
 user = "author"
 # a session's events stay in one partition
 key = "session_id"
-rows = { column = "session_id", provider = "pg", grants = "SELECT session_id FROM session_access WHERE subject = {subject:String}" }
+rows = [
+  { column = "session_id", provider = "pg", grants = "SELECT session_id FROM session_access WHERE subject = {subject:String} AND role IN ('owner', 'player')" },
+  { column = "kind", provider = "pg", grants = "SELECT kind FROM insert_kinds WHERE subject = {subject:String}" },
+]

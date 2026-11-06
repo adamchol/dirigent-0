@@ -86,3 +86,20 @@ test("failures are errors, and an unreadable row doesn't stop the rest", () => {
     { t: "note", key: "f", tone: "error", text: "player failed: no clone", detail: undefined },
   ]);
 });
+
+test("a dirigent's message says via whom, and a session update is an input a turn takes", () => {
+  const t = timeline([
+    row("m", "user_message", { text: "go", via: "d1" }, "user:dev"),
+    row("u", "session_update", {
+      session: "s2",
+      offset: 9,
+      update: { what: "turn_ended", reason: "completed" },
+      reply: "done",
+    }),
+    row("u2", "session_update", { session: "s2", offset: 12, update: { what: "player_detached" } }),
+    row("t", "turn_started", { input: "u" }),
+  ]);
+  expect(t.items[0]).toMatchObject({ t: "user", via: "d1", queued: true });
+  expect(t.items[1]).toMatchObject({ t: "update", session: "s2", what: "turn completed", reply: "done", queued: false });
+  expect(t.items[2]).toMatchObject({ t: "update", what: "stopped", queued: true });
+});

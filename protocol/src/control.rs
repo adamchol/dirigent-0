@@ -26,6 +26,25 @@ pub struct SessionSpec {
     /// Where the workspace's files come from; `None`, an empty workspace.
     #[serde(default)]
     pub source: Option<Source>,
+    /// What the session's player plays.
+    #[serde(default, skip_serializing_if = "Part::is_coder")]
+    pub part: Part,
+}
+
+/// What a session's player plays: a coder, in its workspace; or the dirigent, directing other
+/// sessions as the session's owner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Part {
+    #[default]
+    Coder,
+    Dirigent,
+}
+
+impl Part {
+    fn is_coder(&self) -> bool {
+        *self == Part::Coder
+    }
 }
 
 fn default_model() -> String {
@@ -42,7 +61,18 @@ impl Default for SessionSpec {
             model: default_model(),
             effort: default_effort(),
             source: None,
+            part: Part::Coder,
         }
+    }
+}
+
+impl SessionSpec {
+    /// Why it can't run, if it can't: a dirigent has no source.
+    pub fn check(&self) -> Result<(), String> {
+        if self.part == Part::Dirigent && self.source.is_some() {
+            return Err("a dirigent's session has no source".into());
+        }
+        Ok(())
     }
 }
 
@@ -77,6 +107,10 @@ impl From<SessionSpec> for pb::SessionSpec {
                     r#ref: reference,
                 }),
             }),
+            part: match spec.part {
+                Part::Coder => pb::Part::Coder,
+                Part::Dirigent => pb::Part::Dirigent,
+            } as i32,
         }
     }
 }
@@ -109,6 +143,11 @@ impl TryFrom<pb::SessionSpec> for SessionSpec {
                     reference: g.r#ref,
                 },
             }),
+            part: match pb::Part::try_from(spec.part) {
+                Ok(pb::Part::Coder | pb::Part::Unspecified) => Part::Coder,
+                Ok(pb::Part::Dirigent) => Part::Dirigent,
+                Err(_) => return Err(format!("a spec with part {}, not one there is", spec.part)),
+            },
         })
     }
 }
@@ -124,7 +163,7 @@ impl From<Effort> for pb::Effort {
     }
 }
 
-/// A session, as control's HTTP API shows it (`GET /sessions/{id}`, `GET /sessions`).
+/// A session, as control's HTTP API shows it to a caller (`GET /sessions/{id}`, `GET /sessions`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -133,9 +172,21 @@ pub struct SessionInfo {
     pub epoch: i64,
     /// The player holding its lease: none, the session is idle.
     pub player: Option<Holder>,
-    /// The subjects with access to it, besides its player.
+    /// Who made it: the user who writes its inputs, and starts and stops it.
+    pub owner: String,
+    /// Who else may read it.
     #[serde(default)]
-    pub users: Vec<String>,
+    pub viewers: Vec<String>,
+    /// The caller's.
+    pub role: Role,
+}
+
+/// A user's part in a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    Owner,
+    Viewer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,7 +210,9 @@ mod tests {
                 subject: "player:p".into(),
                 attached: false,
             }),
-            users: vec!["user:u".into()],
+            owner: "user:o".into(),
+            viewers: vec!["user:v".into()],
+            role: Role::Viewer,
         };
         let wire = serde_json::to_value(&info).unwrap();
         assert_eq!(
@@ -207,6 +260,7 @@ mod tests {
                     url: "u".into(),
                     reference: Some("main".into()),
                 }),
+                part: Part::Coder,
             },
             SessionSpec {
                 model: "m".into(),
@@ -215,6 +269,13 @@ mod tests {
                     url: "u".into(),
                     reference: None,
                 }),
+                part: Part::Coder,
+            },
+            SessionSpec {
+                model: "m".into(),
+                effort: None,
+                source: None,
+                part: Part::Dirigent,
             },
         ];
         for spec in specs {
@@ -226,6 +287,7 @@ mod tests {
             model: "m".into(),
             effort: Some(pb::Effort::Unspecified as i32),
             source: None,
+            part: 0,
         };
         assert!(SessionSpec::try_from(unspecified).is_err());
         assert!(SessionSpec::try_from(pb::SessionSpec::default()).is_err());

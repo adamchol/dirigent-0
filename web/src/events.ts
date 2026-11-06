@@ -43,7 +43,19 @@ export type Event =
   | { kind: "workspace_restored"; data: { snapshot: string } }
   | { kind: "checkpoint"; data: { turn: string; snapshot: string } }
   | { kind: "checkpoint_failed"; data: { turn: string; error: string } }
-  | { kind: "user_message"; data: { text: string } }
+  | { kind: "user_message"; data: { text: string; via?: string } }
+  | {
+      kind: "session_update";
+      data: {
+        session: string;
+        offset: number;
+        update:
+          | { what: "turn_ended"; reason: "completed" | "aborted" | "failed" }
+          | { what: "player_failed"; error: string }
+          | { what: "player_detached" };
+        reply?: string;
+      };
+    }
   | { kind: "user_interrupt"; data: { turn: string } }
   | { kind: "turn_started"; data: { input: string } }
   | { kind: "steered"; data: { input: string } }
@@ -63,8 +75,10 @@ export type Event =
 
 /** One thing the timeline shows. `key` is stable across updates (row ids, call ids). */
 export type Item =
-  /** `queued` until a turn takes it. */
-  | { t: "user"; key: string; author: string; ts: string | Date; text: string; queued: boolean }
+  /** `queued` until a turn takes it; `via`, the dirigent session that wrote it as its author. */
+  | { t: "user"; key: string; author: string; ts: string | Date; text: string; queued: boolean; via?: string }
+  /** What happened in a session a dirigent directs: an input of its, as a message is. */
+  | { t: "update"; key: string; session: string; what: string; reply?: string; queued: boolean }
   | { t: "text"; key: string; text: string }
   | { t: "thinking"; key: string; text: string }
   /** A tool call with its result, once there is one. */
@@ -97,7 +111,7 @@ export function parse(row: EventRow): Event {
 /** The log's rows, in order, as a timeline. */
 export function timeline(rows: readonly EventRow[]): Timeline {
   const items: Item[] = [];
-  const users = new Map<string, Extract<Item, { t: "user" }>>();
+  const users = new Map<string, { queued: boolean }>();
   const tools = new Map<string, Extract<Item, { t: "tool" }>>();
   let openTurn: string | undefined;
   let usage = NO_USAGE;
@@ -121,9 +135,30 @@ export function timeline(rows: readonly EventRow[]): Timeline {
           ts: row.ts,
           text: e.data.text,
           queued: true,
+          ...(e.data.via ? { via: e.data.via } : {}),
         };
         users.set(row.id, user);
         items.push(user);
+        break;
+      }
+      case "session_update": {
+        const u = e.data.update;
+        const what =
+          u.what === "turn_ended"
+            ? `turn ${u.reason}`
+            : u.what === "player_failed"
+              ? `player failed: ${u.error}`
+              : "stopped";
+        const update: Extract<Item, { t: "update" }> = {
+          t: "update",
+          key: row.id,
+          session: e.data.session,
+          what,
+          queued: true,
+          ...(e.data.reply ? { reply: e.data.reply } : {}),
+        };
+        users.set(row.id, update);
+        items.push(update);
         break;
       }
       case "turn_started":
@@ -215,7 +250,7 @@ export function timeline(rows: readonly EventRow[]): Timeline {
   return { items, openTurn };
 }
 
-function taken(users: Map<string, Extract<Item, { t: "user" }>>, input: string) {
+function taken(users: Map<string, { queued: boolean }>, input: string) {
   const u = users.get(input);
   if (u) u.queued = false;
 }

@@ -1,0 +1,17 @@
+{{- if not (.Capabilities.APIVersions.Has "postgresql.cnpg.io/v1") }}
+{{- fail "dirigent needs CloudNativePG (postgresql.cnpg.io/v1): its Postgres is a CNPG Cluster" }}
+{{- end }}
+{{- if not (.Capabilities.APIVersions.Has "kubevirt.io/v1") }}
+{{- fail "dirigent needs KubeVirt (kubevirt.io/v1): its players run in VMs" }}
+{{- end }}
+{{- if not (has .Values.auth.mode (list "oidc" "declared")) }}
+{{- fail "auth.mode is oidc or declared" }}
+{{- end }}
+{{- if and (eq .Values.auth.mode "oidc") (empty .Values.auth.google.clientIds) }}
+{{- fail "auth.google.clientIds is required in oidc auth" }}
+{{- end }}
+{{- $_ := required "clickhouse.adminSecret" .Values.clickhouse.adminSecret }}
+{{- $_ := required "kafka.bootstrapServers" .Values.kafka.bootstrapServers }}
+{{- if le (int .Values.player.stopGrace) (int .Values.player.checkpointMargin) }}
+{{- fail "player.stopGrace must exceed player.checkpointMargin" }}
+{{- end }}

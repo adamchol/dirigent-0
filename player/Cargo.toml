@@ -30,8 +30,8 @@ globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 libc = "0.2"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 
 [dev-dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
 tempfile = "3"
 http = "1"

@@ -38,6 +38,8 @@ let
     ];
     # each row also stores its message's partition, offset and timestamp (db/clickhouse),
     # which chlive reads from the messages for live rows (nix/chlive.toml)
+    # chlive verifies control's credentials with its key's public half (nix/chlive.toml)
+    chliveEnv.KEYS = "dnvr://keys/ready";
     connectorSettings.session_events = {
       transforms = "kafka";
       "transforms.kafka.type" = "org.apache.kafka.connect.transforms.InsertField$Value";
@@ -56,6 +58,11 @@ let
     export DIRIGENT_CONTROL_HTTP="''${DIRIGENT_CONTROL_HTTP:-$(dnvr-state get control.url)}"
     export DIRIGENT_CONTROL_URL="''${DIRIGENT_CONTROL_URL:-$(dnvr-state get control.grpcUrl)}"
     export DIRIGENT_KOPIA_TOKEN="''${DIRIGENT_KOPIA_TOKEN:-$(dnvr-state get kopia-repo.token)}"
+    export DIRIGENT_SIGNING_KEY="''${DIRIGENT_SIGNING_KEY:-$DNVR_ROOT/.dnvr/control-key/key.pem}"
+    # who the scripts are to control (its `declared` auth)
+    export DIRIGENT_USER="''${DIRIGENT_USER:-user:dev}"
+    # shellcheck disable=SC2034 # not every script calls control
+    caller=(-H "dirigent-user: $DIRIGENT_USER")
   '';
 in
 { ... }:
@@ -97,6 +104,20 @@ in
   inherit (stack) prerun;
 
   processes = stack.processes // {
+    # Control's signing key, made once in .dnvr/control-key (kept by `reset-data`): `key.pem`,
+    # and `jwks.json`, its public half, which chlive verifies control's credentials with.
+    # Publishes `ready`; then idles.
+    keys = {
+      command = ''
+        cd "$DNVR_ROOT"
+        cargo build -q -p dirigent-control
+        target/debug/control keygen .dnvr/control-key
+        dnvr-state set ready 1
+        echo "[keys] ready"
+        exec tail -f /dev/null
+      '';
+    };
+
     # The control plane, as Postgres' `dirigent_control` role, running the started sessions'
     # players as local processes, each in .dnvr/sessions/<id> (its output in player.log). On the
     # mock provider unless DIRIGENT_PLAYER_ARGS says otherwise, e.g. `DIRIGENT_PLAYER_ARGS= dnvr
@@ -106,6 +127,7 @@ in
       env = {
         PG_URL = "dnvr://postgres/url";
         MIGRATED = "dnvr://migrate-postgres/ready";
+        KEYS = "dnvr://keys/ready";
         # for the players
         CHLIVE_URL = "dnvr://chlive/url";
         DIRIGENT_KOPIA_TOKEN = "dnvr://kopia-repo/token";
@@ -121,6 +143,7 @@ in
         # shellcheck disable=SC2086
         exec target/debug/control --listen "127.0.0.1:$port" --grpc-listen "127.0.0.1:$grpc" \
           --postgres "''${PG_URL/:\/\/*@/://dirigent_control@}" \
+          --signing-key .dnvr/control-key/key.pem \
           --players .dnvr/sessions --player target/debug/player \
           -- ''${DIRIGENT_PLAYER_ARGS---mock}
       '';
@@ -186,13 +209,13 @@ in
       '';
     };
 
-    # $DIRIGENT_SESSION, made and started through control with `user:dev` its user; then idles.
+    # $DIRIGENT_SESSION, made and started through control, `user:dev`'s; then idles.
     dev-session = {
       env.CONTROL = "dnvr://control/url";
       command = ''
         curl -fsS --retry 60 --retry-connrefused --retry-delay 1 \
-          -X PUT "$CONTROL/sessions/$DIRIGENT_SESSION" \
-          -H 'content-type: application/json' -d '{"users": ["user:dev"], "start": true}'
+          -X PUT "$CONTROL/sessions/$DIRIGENT_SESSION" -H 'dirigent-user: user:dev' \
+          -H 'content-type: application/json' -d '{"start": true}'
         dnvr-state set ready 1
         echo "[dev-session] $DIRIGENT_SESSION"
         exec tail -f /dev/null
@@ -211,7 +234,7 @@ in
       '';
     };
     session = {
-      description = "Make a session through control: session [--start] [--git <url> [--ref <ref>]] [--model <m>] [--effort <e>] [<uuid> [<user>]] (a new id, user:dev); prints its id. Started, control starts a player for it";
+      description = "Make a session through control, $DIRIGENT_USER's (user:dev): session [--start] [--dirigent] [--git <url> [--ref <ref>]] [--model <m>] [--effort <e>] [--viewer <subject>]... [<uuid>] (a new id); prints its id. Started, control starts a player for it";
       runtimeInputs = [
         dnvrState
         pkgs.curl
@@ -224,6 +247,8 @@ in
         while [ $# -gt 0 ]; do
           case "$1" in
             --start) spec=$(jq -c '.start = true' <<<"$spec"); shift ;;
+            --dirigent) spec=$(jq -c '.part = "dirigent"' <<<"$spec"); shift ;;
+            --viewer) spec=$(jq -c --arg v "$2" '.viewers += [$v]' <<<"$spec"); shift 2 ;;
             --git) spec=$(jq -c --arg u "$2" '.source.git.url = $u' <<<"$spec"); shift 2 ;;
             --ref) spec=$(jq -c --arg r "$2" '.source.git.ref = $r' <<<"$spec"); shift 2 ;;
             --model) spec=$(jq -c --arg m "$2" '.model = $m' <<<"$spec"); shift 2 ;;
@@ -232,14 +257,13 @@ in
           esac
         done
         id="''${1:-$(uuidgen)}"
-        body=$(jq -c --arg u "''${2:-user:dev}" '.users = [$u]' <<<"$spec")
-        curl -fsS -X PUT "$DIRIGENT_CONTROL_HTTP/sessions/$id" \
-          -H 'content-type: application/json' -d "$body"
+        curl -fsS -X PUT "$DIRIGENT_CONTROL_HTTP/sessions/$id" "''${caller[@]}" \
+          -H 'content-type: application/json' -d "$spec"
         echo "$id"
       '';
     };
     sessions = {
-      description = "The sessions control has: id, epoch and the player holding it (- when idle)";
+      description = "The sessions $DIRIGENT_USER (user:dev) owns or views: id, part, epoch, the player holding it (- when idle), and their role";
       runtimeInputs = [
         dnvrState
         pkgs.curl
@@ -247,8 +271,8 @@ in
       ];
       text = ''
         ${stackEnv}
-        curl -fsS "$DIRIGENT_CONTROL_HTTP/sessions" | jq -r \
-          '.[] | [.id, .epoch, (.player | if . then .subject + (if .attached then "" else " (away)" end) else "-" end)] | @tsv'
+        curl -fsS "$DIRIGENT_CONTROL_HTTP/sessions" "''${caller[@]}" | jq -r \
+          '.[] | [.id, (.spec.part // "coder"), .epoch, (.player | if . then .subject + (if .attached then "" else " (away)" end) else "-" end), .role] | @tsv'
       '';
     };
     start = {
@@ -259,7 +283,7 @@ in
       ];
       text = ''
         ${stackEnv}
-        curl -fsS -X POST "$DIRIGENT_CONTROL_HTTP/sessions/''${1:?a session id}/start"
+        curl -fsS -X POST "$DIRIGENT_CONTROL_HTTP/sessions/''${1:?a session id}/start" "''${caller[@]}"
       '';
     };
     stop = {
@@ -275,7 +299,7 @@ in
           now=true
           shift
         fi
-        curl -fsS -X POST "$DIRIGENT_CONTROL_HTTP/sessions/''${1:?a session id}/stop" \
+        curl -fsS -X POST "$DIRIGENT_CONTROL_HTTP/sessions/''${1:?a session id}/stop" "''${caller[@]}" \
           -H 'content-type: application/json' -d "{\"now\": $now}"
       '';
     };
@@ -286,6 +310,18 @@ in
         bun install --frozen-lockfile
         bun x tsc --noEmit
         exec bun test
+      '';
+    };
+    token = {
+      description = "A chlive credential for $DIRIGENT_USER (user:dev), which control signs in its declared auth";
+      runtimeInputs = [
+        dnvrState
+        pkgs.curl
+        pkgs.jq
+      ];
+      text = ''
+        ${stackEnv}
+        curl -fsS -X POST "$DIRIGENT_CONTROL_HTTP/token" "''${caller[@]}" | jq -r .token
       '';
     };
     e2e = {

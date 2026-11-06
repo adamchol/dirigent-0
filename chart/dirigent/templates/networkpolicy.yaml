@@ -1,0 +1,55 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- /* The players run what the model says: in the cluster they reach only control, chlive, S3
+and DNS; outside it, anything. Nothing reaches them. */}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dirigent-player
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dirigent.selector" . | nindent 6 }}
+      app.kubernetes.io/component: player
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "dirigent.selector" . | nindent 14 }}
+              app.kubernetes.io/component: control
+      ports:
+        - { protocol: TCP, port: 8090 }
+        - { protocol: TCP, port: 8091 }
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "dirigent.selector" . | nindent 14 }}
+              app.kubernetes.io/component: chlive
+      ports:
+        - { protocol: TCP, port: 8080 }
+    {{- if .Values.checkpoints.rustfs.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "dirigent.selector" . | nindent 14 }}
+              app.kubernetes.io/component: rustfs
+      ports:
+        - { protocol: TCP, port: 9000 }
+    {{- end }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- toYaml .Values.networkPolicy.clusterCIDRs | nindent 14 }}
+{{- end }}

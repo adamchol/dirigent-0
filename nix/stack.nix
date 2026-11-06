@@ -32,6 +32,8 @@
   connectorSettings ? { },
   # more data directories for `reset-data` to delete, relative to DNVR_ROOT
   extraData ? [ ],
+  # more env for the chlive server, e.g. refs to what its config needs first
+  chliveEnv ? { },
 }:
 let
   dir = n: ".dnvr/${n}";
@@ -367,7 +369,8 @@ in
         KAFKA_BROKERS = "dnvr://redpanda/bootstrap";
         PG_URL = "dnvr://postgres/url";
         MIGRATED = "dnvr://migrate-postgres/ready";
-      };
+      }
+      // chliveEnv;
       command = ''
         cd "$DNVR_ROOT"
         port=$(dnvr-state pick-port)

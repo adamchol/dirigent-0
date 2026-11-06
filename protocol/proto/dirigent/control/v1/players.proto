@@ -12,17 +12,25 @@ service Players {
   //   FAILED_PRECONDITION  another player holds it
   //   ABORTED              the lease the player resumes is gone (it expired, or the session was
   //                        stopped meanwhile): the player must stop
-  // The player ending its stream gives the lease back; the call breaking (the connection lost,
-  // HTTP/2 keepalive timing out) keeps it for a grace period, in which the same player may
-  // resume it with its epoch. Each new holder gets the session's next epoch.
+  // The player ending its stream gives the lease back (after a `Handoff`, to the next player
+  // control starts); the call breaking (the connection lost, HTTP/2 keepalive timing out) keeps
+  // it for a grace period, in which the same player may resume it with its epoch. Each new
+  // holder gets the session's next epoch. A control that leases only the players it started
+  // (`--reserved-only`) ends an `Acquire` without an epoch with PERMISSION_DENIED.
   rpc Lease(stream FromPlayer) returns (stream ToPlayer);
 }
 
 message FromPlayer {
   oneof msg {
     Acquire acquire = 1;
+    Handoff handoff = 2;
   }
 }
+
+// Sent last, before ending the stream: the player is stopped from outside (its machine is
+// going: a node drained, its VM deleted), not by control. The session stays active: control
+// starts the next player, unless the session was stopped meanwhile.
+message Handoff {}
 
 // Hold `session` (a UUID) as `player` (its id; to chlive and in the session's grants it's the
 // subject `player:<id>`).
@@ -38,6 +46,7 @@ message ToPlayer {
   oneof msg {
     Acquired acquired = 1;
     Detach detach = 2;
+    Tokens tokens = 3;
   }
 }
 
@@ -45,6 +54,18 @@ message ToPlayer {
 message Acquired {
   int64 epoch = 1;
   SessionSpec spec = 2;
+  reserved 3;
+  Tokens tokens = 4;
+}
+
+// The player's credentials, signed by control and good for minutes: in `Acquired`, then sent
+// afresh well before they expire, for as long as the lease is held.
+message Tokens {
+  // For chlive, as `player:<id>`.
+  string player = 1;
+  // A dirigent's: for chlive and control's API, as the session's owner, whom it acts for (the
+  // player in its `act` claim).
+  optional string owner = 2;
 }
 
 // Any time after `Acquired`: the session was stopped. The player finishes the turn running
@@ -62,6 +83,14 @@ message SessionSpec {
   oneof source {
     GitSource git = 3;
   }
+  // What its player plays (unspecified: a coder).
+  Part part = 4;
+}
+
+enum Part {
+  PART_UNSPECIFIED = 0;
+  PART_CODER = 1;
+  PART_DIRIGENT = 2;
 }
 
 enum Effort {

@@ -127,6 +127,7 @@ impl Entry {
             | Event::Checkpoint { .. }
             | Event::CheckpointFailed { .. }
             | Event::UserInterrupt { .. }
+            | Event::SessionUpdate { .. }
             | Event::TurnStarted { .. }
             | Event::Steered { .. }
             | Event::ModelDelta { .. }
@@ -410,7 +411,10 @@ mod tests {
     use serde_json::{json, Value};
 
     fn user(text: &str) -> Event {
-        Event::UserMessage { text: text.into() }
+        Event::UserMessage {
+            text: text.into(),
+            via: None,
+        }
     }
 
     fn interrupt() -> Event {

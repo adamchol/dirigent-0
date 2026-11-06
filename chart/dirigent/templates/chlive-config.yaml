@@ -1,0 +1,92 @@
+{{- /* chlive: the sessions' logs, live, from ClickHouse and Kafka; who may read and write them
+from control's grants in Postgres. Its config as in dev (nix/chlive.toml), with the deployment's
+issuers: control, and Google in oidc auth. */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dirigent-chlive
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+data:
+  chlive.toml: |
+    [server]
+    listen = "0.0.0.0:8080"
+
+    [clickhouse]
+    url = {{ include "dirigent.clickhouseUrl" . | quote }}
+    user = "chlive_ro"
+    password_env = "CHLIVE_RO_PASSWORD"
+    snapshot_user = "chlive_snap"
+    snapshot_password_env = "CHLIVE_SNAP_PASSWORD"
+    snapshot_database = "chlive_snapshots"
+
+    [kafka]
+    brokers = {{ .Values.kafka.bootstrapServers | quote }}
+
+    [kafka.properties]
+    {{- range $k, $v := .Values.kafka.properties }}
+    {{ $k | quote }} = {{ toString $v | quote }}
+    {{- end }}
+
+    [pause_server]
+    url = {{ include "dirigent.pauseServerUrl" . | quote }}
+
+    [cache]
+    dir = "/var/cache/chlive"
+
+    [tables]
+    database = "dirigent"
+
+    [tables.session_events]
+    [tables.session_events.columns]
+    offset = { kafka = "offset" }
+    partition = { kafka = "partition" }
+    ts = { kafka = "timestamp" }
+
+    [auth]
+    mode = "jwt"
+
+    [[auth.issuers]]
+    issuer = "dirigent-control"
+    audiences = ["chlive"]
+    jwks_url = "http://dirigent-control:8090/.well-known/jwks.json"
+    algorithms = ["EdDSA"]
+    {{- if eq .Values.auth.mode "oidc" }}
+    {{- range $iss := list "https://accounts.google.com" "accounts.google.com" }}
+
+    [[auth.issuers]]
+    issuer = {{ $iss | quote }}
+    audiences = {{ toJson $.Values.auth.google.clientIds }}
+    jwks_url = "https://www.googleapis.com/oauth2/v3/certs"
+    algorithms = ["RS256"]
+    subject_claim = "email"
+    subject_prefix = "user:"
+    [auth.issuers.required_claims]
+    email_verified = true
+    {{- range $k, $v := $.Values.auth.google.requiredClaims }}
+    {{ $k | quote }} = {{ toJson $v }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+
+    [security]
+    default = "deny"
+
+    [security.providers.pg]
+    kind = "postgres"
+    schema = "dirigent"
+    publication = "dirigent_chlive"
+    slot = "chlive"
+
+    [tables.session_events.security]
+    provider = "pg"
+    column = "session_id"
+    grants = "SELECT session_id FROM session_access WHERE subject = {subject:String}"
+
+    [tables.session_events.insert]
+    user = "author"
+    key = "session_id"
+    rows = [
+      { column = "session_id", provider = "pg", grants = "SELECT session_id FROM session_access WHERE subject = {subject:String} AND role IN ('owner', 'player')" },
+      { column = "kind", provider = "pg", grants = "SELECT kind FROM insert_kinds WHERE subject = {subject:String}" },
+    ]

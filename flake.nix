@@ -54,9 +54,44 @@
           inherit (inputs'.chlive.packages) clickhouse;
           inherit (inputs'.openmig.packages) openmig;
           postgresql = pkgs.postgresql_17;
+          # TODO: drop once chlive's package has them: its fileset misses the `wasm` workspace
+          # member (cargo can't load the workspace), and reqwest's native-tls needs OpenSSL
+          chlive = inputs'.chlive.packages.chlive.overrideAttrs (old: {
+            src = inputs.chlive;
+            buildInputs = old.buildInputs ++ [ pkgs.openssl ];
+          });
+          dirigent = pkgs.callPackage ./nix/packages/dirigent.nix { };
+          web = pkgs.callPackage ./nix/packages/web.nix { chliveSrc = inputs.chlive; };
+          # the chart, with continuous-backup's vendored in (its dependency)
+          chart = pkgs.runCommand "dirigent-chart" { } ''
+            cp -r ${./chart/dirigent} $out
+            chmod -R u+w $out
+            mkdir -p $out/charts
+            cp -r ${inputs.continuous-backup}/chart $out/charts/durable-clickhouse-sink
+          '';
+          images = import ./nix/images.nix {
+            inherit
+              pkgs
+              lib
+              dirigent
+              web
+              chlive
+              openmig
+              ;
+            inherit (inputs) nixpkgs;
+            version = "0.1.0";
+          };
         in
         {
           formatter = pkgs.nixfmt;
+
+          packages = {
+            inherit dirigent web chart;
+            default = dirigent;
+          }
+          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
+            lib.mapAttrs' (name: lib.nameValuePair "${name}-image") images
+          );
 
           # The migrations match the schema: `openmig check` replays them into scratch servers.
           checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
@@ -94,12 +129,7 @@
               postgresql
               ;
             inherit (inputs) continuous-backup;
-            # TODO: drop once chlive's package has them: its fileset misses the `wasm` workspace
-            # member (cargo can't load the workspace), and reqwest's native-tls needs OpenSSL
-            chlive = inputs'.chlive.packages.chlive.overrideAttrs (old: {
-              src = inputs.chlive;
-              buildInputs = old.buildInputs ++ [ pkgs.openssl ];
-            });
+            inherit chlive;
           };
         };
     };

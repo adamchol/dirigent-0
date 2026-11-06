@@ -5,8 +5,10 @@
 //! player for it (`runner`); stopping one, it tells the player to detach. A player it started
 //! that's lost without giving the lease back is started again once the lease expires.
 
+mod auth;
 mod leases;
 mod runner;
+mod token;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -14,13 +16,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use auth::{Auth, OidcArgs};
+use axum::extract::{FromRequestParts, Path, State};
+use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use dirigent_protocol::control::pb::players_server::{Players, PlayersServer};
-use dirigent_protocol::control::{pb, player_subject, SessionInfo, SessionSpec};
+use dirigent_protocol::control::{pb, player_subject, Part, Role, SessionInfo, SessionSpec};
 use serde::Deserialize;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
@@ -29,7 +33,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::leases::{Acquire, Put, Reserve, Store};
-use crate::runner::{Local, Runner};
+use crate::runner::{Kube, Local, Runner};
+use crate::token::{Signer, CHLIVE, CONTROL};
 
 /// How often a player's connection is pinged, and how long it may go unanswered before the
 /// connection (and its lease's call) counts as broken.
@@ -39,8 +44,16 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const ASK_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Parser, Debug)]
-#[command(name = "control", about = "dirigent's control plane")]
+#[command(
+    name = "control",
+    about = "dirigent's control plane",
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
+)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     #[arg(
         long,
         env = "DIRIGENT_CONTROL_LISTEN",
@@ -57,8 +70,8 @@ struct Cli {
     grpc_listen: SocketAddr,
 
     /// Postgres, as the `dirigent_control` role.
-    #[arg(long, env = "DIRIGENT_CONTROL_POSTGRES")]
-    postgres: String,
+    #[arg(long, env = "DIRIGENT_CONTROL_POSTGRES", required = true)]
+    postgres: Option<String>,
 
     /// How long a dropped player keeps its session, in seconds.
     #[arg(long, default_value_t = 10)]
@@ -73,19 +86,76 @@ struct Cli {
     #[arg(long, default_value = "player")]
     player: PathBuf,
 
+    /// Run players in KubeVirt VMs instead, each a VirtualMachineInstance made from this
+    /// template (JSON; Helm's): its volume `dirigent`'s NoCloud user data is the player's
+    /// environment, which the player's own lines are added to.
+    #[arg(long, env = "DIRIGENT_KUBE_TEMPLATE", conflicts_with = "players")]
+    kube_template: Option<PathBuf>,
+
+    /// The namespace of the players' VMs; the service account's when absent.
+    #[arg(long, env = "DIRIGENT_KUBE_NAMESPACE")]
+    kube_namespace: Option<String>,
+
+    /// Which control's VMs they are (their `dirigent.dev/runner` label): one per install.
+    #[arg(long, env = "DIRIGENT_KUBE_NAME", default_value = "dirigent")]
+    kube_name: String,
+
     /// How long a player control started has to take its lease, in seconds.
     #[arg(long, default_value_t = 60)]
     startup: u64,
+
+    /// Lease sessions only to the players control started (who know their reserved epoch):
+    /// otherwise anything that reaches the gRPC service may take an idle session.
+    #[arg(long, env = "DIRIGENT_RESERVED_ONLY")]
+    reserved_only: bool,
+
+    /// How callers of the HTTP API are known (besides by control's own tokens): `declared`, by
+    /// the `dirigent-user` header, unverified (dev only; `POST /token` then signs a chlive token
+    /// for them); `oidc`, by an OpenID provider's ID token (`--oidc-*`).
+    #[arg(long, value_enum, default_value_t = AuthMode::Declared)]
+    auth: AuthMode,
+
+    #[command(flatten)]
+    oidc: OidcArgs,
+
+    /// The key control signs credentials with: Ed25519, PKCS#8 PEM (`control keygen`).
+    #[arg(long, env = "DIRIGENT_SIGNING_KEY", required = true)]
+    signing_key: Option<PathBuf>,
+
+    /// The `iss` of control's credentials (chlive's issuer for them says the same).
+    #[arg(long, env = "DIRIGENT_ISSUER", default_value = "dirigent-control")]
+    issuer: String,
+
+    /// How long control's credentials are good for, in seconds; a lease's are sent afresh
+    /// halfway.
+    #[arg(long, default_value_t = 600)]
+    token_ttl: u64,
 
     /// More arguments for each player (e.g. `-- --mock`).
     #[arg(last = true)]
     player_args: Vec<String>,
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Make a signing key in `dir` (`key.pem`), unless it has one, and write its public half
+    /// (`jwks.json`, chlive's `jwks_file`).
+    Keygen { dir: PathBuf },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthMode {
+    Declared,
+    Oidc,
+}
+
 struct Control {
     store: Store,
+    auth: Auth,
     runner: Option<&'static dyn Runner>,
     startup: Duration,
+    /// Whether only the players it started get leases (`--reserved-only`).
+    reserved_only: bool,
     /// The connection holding each session's lease. Held across taking a lease and noting its
     /// connection here, and across a stop's looking here and dropping the lease: a stop either
     /// finds the connection or drops a lease no one is connected for.
@@ -110,9 +180,26 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli: &'static Cli = Box::leak(Box::new(Cli::parse()));
-    let store = Store::connect(&cli.postgres, Duration::from_secs(cli.grace)).await?;
+    if let Some(Command::Keygen { dir }) = &cli.command {
+        return token::keygen(dir);
+    }
+    let postgres = cli.postgres.as_deref().expect("required");
+    let signing_key = cli.signing_key.as_deref().expect("required");
+    let signer = Signer::load(signing_key, &cli.issuer, Duration::from_secs(cli.token_ttl))?;
+    let oidc = match cli.auth {
+        AuthMode::Declared => None,
+        AuthMode::Oidc => Some(auth::Oidc::start(&cli.oidc).await?),
+    };
+    let store = Store::connect(postgres, Duration::from_secs(cli.grace)).await?;
     let detached = store.detach_all().await?;
+    let kube: Option<&'static Kube> = match &cli.kube_template {
+        Some(template) => Some(Box::leak(Box::new(
+            Kube::new(&cli.kube_name, cli.kube_namespace.as_deref(), template).await?,
+        ))),
+        None => None,
+    };
     let runner: Option<&'static dyn Runner> = match &cli.players {
+        _ if kube.is_some() => kube.map(|k| k as &'static dyn Runner),
         Some(root) => {
             std::fs::create_dir_all(root)?;
             let root = root.canonicalize()?;
@@ -122,12 +209,22 @@ async fn main() -> anyhow::Result<()> {
                 program: cli.player.clone(),
                 args: cli.player_args.clone(),
                 control_url: format!("http://{}", cli.grpc_listen),
+                control_http: format!("http://{}", cli.listen),
             })))
         }
         None => None,
     };
-    let control = control(store, runner, Duration::from_secs(cli.startup));
+    let control = control(
+        store,
+        Auth { signer, oidc },
+        runner,
+        Duration::from_secs(cli.startup),
+        cli.reserved_only,
+    );
     tokio::spawn(sweep(control));
+    if let Some(kube) = kube {
+        tokio::spawn(kube.clear(&control.store, control.startup, Duration::from_secs(30)));
+    }
     let listener = tokio::net::TcpListener::bind(cli.listen).await?;
     let grpc = tokio::net::TcpListener::bind(cli.grpc_listen).await?;
     info!(
@@ -135,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
         grpc = %cli.grpc_listen,
         grace = cli.grace,
         runner = runner.map(|r| r.id()),
+        auth = ?cli.auth,
         detached,
         "control started"
     );
@@ -148,13 +246,17 @@ async fn main() -> anyhow::Result<()> {
 
 fn control(
     store: Store,
+    auth: Auth,
     runner: Option<&'static dyn Runner>,
     startup: Duration,
+    reserved_only: bool,
 ) -> &'static Control {
     Box::leak(Box::new(Control {
         store,
+        auth,
         runner,
         startup,
+        reserved_only,
         attached: Default::default(),
         connections: AtomicU64::new(0),
     }))
@@ -166,7 +268,44 @@ fn router(control: &'static Control) -> Router {
         .route("/sessions/{id}", get(get_session).put(put_session))
         .route("/sessions/{id}/start", post(start_session))
         .route("/sessions/{id}/stop", post(stop_session))
+        .route(
+            "/sessions/{id}/viewers/{subject}",
+            axum::routing::put(add_viewer).delete(remove_viewer),
+        )
+        .route("/auth", get(auth_mode))
+        .route("/token", post(chlive_token))
+        .route("/.well-known/jwks.json", get(jwks))
         .with_state(control)
+}
+
+/// How the API's callers are known, for clients to sign in by: `{"mode": "declared"}`, or
+/// `{"mode": "oidc", "google_client_id": <the web's client id>}`.
+async fn auth_mode(State(control): State<&'static Control>) -> Json<serde_json::Value> {
+    Json(match &control.auth.oidc {
+        None => serde_json::json!({ "mode": "declared" }),
+        Some(oidc) => serde_json::json!({ "mode": "oidc", "google_client_id": oidc.client_id() }),
+    })
+}
+
+/// In `declared` auth (dev), a chlive credential for the caller, standing in for the OpenID
+/// provider's: `{"token": …}`.
+async fn chlive_token(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+) -> Result<Json<serde_json::Value>, Failed> {
+    if control.auth.oidc.is_some() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "chlive takes the OpenID provider's tokens".into(),
+        ));
+    }
+    let token = control.auth.signer.sign(&caller, &[CHLIVE], None);
+    Ok(Json(serde_json::json!({ "token": token })))
+}
+
+/// Control's public key, which its credentials are verified with.
+async fn jwks(State(control): State<&'static Control>) -> Json<serde_json::Value> {
+    Json(control.auth.signer.jwks())
 }
 
 /// Deletes the expired leases, every second, and starts another player for each that one of
@@ -224,18 +363,35 @@ async fn start(control: &'static Control, session: Uuid) -> anyhow::Result<Start
         Reserve::Held => return Ok(Started::Active),
         Reserve::Unknown => return Ok(Started::Unknown),
     };
-    if let Err(e) = runner.start(session, &player, epoch) {
+    if let Err(e) = runner.start(session, &player, epoch).await {
         control.store.drop_lease(session).await?;
         return Err(e);
     }
     Ok(Started::Player(epoch))
 }
 
+/// Who calls the HTTP API (a subject, `user:<name>`), as [`Auth::caller`] tells.
+struct Caller(String);
+
+impl FromRequestParts<&'static Control> for Caller {
+    type Rejection = Failed;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        control: &&'static Control,
+    ) -> Result<Self, Failed> {
+        match control.auth.caller(&parts.headers).await {
+            Ok(caller) => Ok(Caller(caller)),
+            Err(why) => Err((StatusCode::UNAUTHORIZED, why)),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct NewSession {
-    /// The subjects with access to it.
+    /// Who else may read it.
     #[serde(default)]
-    users: Vec<String>,
+    viewers: Vec<String>,
     #[serde(flatten)]
     spec: SessionSpec,
     /// Start it too, as `POST …/start` does.
@@ -254,14 +410,37 @@ fn not_found() -> Failed {
     (StatusCode::NOT_FOUND, "no such session".into())
 }
 
+fn not_owner() -> Failed {
+    (StatusCode::FORBIDDEN, "only the session's owner may".into())
+}
+
+/// Unless `caller` owns the session `id`: why not (it views it, or it's none of theirs).
+async fn owned(control: &Control, id: Uuid, caller: &str) -> Result<(), Failed> {
+    match control.store.role(id, caller).await {
+        Ok(Some(Role::Owner)) => Ok(()),
+        Ok(Some(Role::Viewer)) => Err(not_owner()),
+        Ok(None) => Err(not_found()),
+        Err(e) => Err(failed(&format!("reading the session {id}"), e)),
+    }
+}
+
+/// Make the session `id`, the caller's, or find it as they made it.
 async fn put_session(
     State(control): State<&'static Control>,
+    Caller(caller): Caller,
     Path(id): Path<Uuid>,
     Json(body): Json<NewSession>,
 ) -> Result<StatusCode, Failed> {
-    let status = match control.store.put_session(id, &body.spec, &body.users).await {
+    body.spec
+        .check()
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let put = control
+        .store
+        .put_session(id, &body.spec, &caller, &body.viewers)
+        .await;
+    let status = match put {
         Ok(Put::Made) => {
-            info!(session = %id, users = ?body.users, spec = ?body.spec, "session made");
+            info!(session = %id, owner = caller, viewers = ?body.viewers, spec = ?body.spec, "session made");
             StatusCode::CREATED
         }
         Ok(Put::Exists) => StatusCode::OK,
@@ -270,6 +449,9 @@ async fn put_session(
                 StatusCode::CONFLICT,
                 "the session exists, with another spec".into(),
             ))
+        }
+        Ok(Put::NotOwner) => {
+            return Err((StatusCode::FORBIDDEN, "the session is another's".into()))
         }
         Err(e) => return Err(failed(&format!("putting the session {id}"), e)),
     };
@@ -296,10 +478,12 @@ fn started(id: Uuid, r: anyhow::Result<Started>) -> Result<(), Failed> {
     }
 }
 
+/// The sessions the caller owns or views.
 async fn list_sessions(
     State(control): State<&'static Control>,
+    Caller(caller): Caller,
 ) -> Result<Json<Vec<SessionInfo>>, Failed> {
-    match control.store.sessions().await {
+    match control.store.sessions(&caller).await {
         Ok(sessions) => Ok(Json(sessions)),
         Err(e) => Err(failed("listing the sessions", e)),
     }
@@ -307,9 +491,10 @@ async fn list_sessions(
 
 async fn get_session(
     State(control): State<&'static Control>,
+    Caller(caller): Caller,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SessionInfo>, Failed> {
-    match control.store.session(id).await {
+    match control.store.session(id, &caller).await {
         Ok(Some(info)) => Ok(Json(info)),
         Ok(None) => Err(not_found()),
         Err(e) => Err(failed(&format!("reading the session {id}"), e)),
@@ -319,8 +504,10 @@ async fn get_session(
 /// Start (or resume) the session: a player for it, unless it's active.
 async fn start_session(
     State(control): State<&'static Control>,
+    Caller(caller): Caller,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, Failed> {
+    owned(control, id, &caller).await?;
     started(id, start(control, id).await)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -336,9 +523,11 @@ struct Stop {
 /// come yet) loses the lease.
 async fn stop_session(
     State(control): State<&'static Control>,
+    Caller(caller): Caller,
     Path(id): Path<Uuid>,
     body: Option<Json<Stop>>,
 ) -> Result<StatusCode, Failed> {
+    owned(control, id, &caller).await?;
     let now = body.map(|b| b.0).unwrap_or_default().now;
     let attached = control.attached.lock().await;
     if let Some(a) = attached.get(&id) {
@@ -355,12 +544,33 @@ async fn stop_session(
             info!(session = %id, "session stopped; its player wasn't connected");
             Ok(StatusCode::NO_CONTENT)
         }
-        Ok(false) => match control.store.exists(id).await {
-            Ok(true) => Ok(StatusCode::NO_CONTENT),
-            Ok(false) => Err(not_found()),
-            Err(e) => Err(failed(&format!("stopping the session {id}"), e)),
-        },
+        Ok(false) => Ok(StatusCode::NO_CONTENT),
         Err(e) => Err(failed(&format!("stopping the session {id}"), e)),
+    }
+}
+
+/// Let `subject` read the session (the caller's).
+async fn add_viewer(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path((id, subject)): Path<(Uuid, String)>,
+) -> Result<StatusCode, Failed> {
+    owned(control, id, &caller).await?;
+    match control.store.add_viewer(id, &subject).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(e) => Err(failed(&format!("adding a viewer to {id}"), e)),
+    }
+}
+
+async fn remove_viewer(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path((id, subject)): Path<(Uuid, String)>,
+) -> Result<StatusCode, Failed> {
+    owned(control, id, &caller).await?;
+    match control.store.remove_viewer(id, &subject).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(e) => Err(failed(&format!("removing a viewer of {id}"), e)),
     }
 }
 
@@ -400,11 +610,16 @@ impl Players for Lessor {
         let session = Uuid::parse_str(&ask.session).map_err(|_| {
             Status::invalid_argument(format!("{:?} isn't a session id", ask.session))
         })?;
+        if control.reserved_only && ask.epoch.is_none() {
+            return Err(Status::permission_denied(
+                "control leases sessions only to the players it started",
+            ));
+        }
         let subject = player_subject(&ask.player);
         let conn = control.connections.fetch_add(1, Ordering::Relaxed);
         let mut attached = control.attached.lock().await;
-        let (epoch, spec) = match control.store.acquire(session, &subject, ask.epoch).await {
-            Ok(Acquire::Acquired(epoch, spec)) => (epoch, spec),
+        let (epoch, spec, owner) = match control.store.acquire(session, &subject, ask.epoch).await {
+            Ok(Acquire::Acquired(epoch, spec, owner)) => (epoch, spec, owner),
             Ok(Acquire::Held) => {
                 return Err(Status::failed_precondition(
                     "another player holds the session",
@@ -425,32 +640,81 @@ impl Players for Lessor {
         attached.insert(session, Attached { conn, detach });
         drop(attached);
         let (tx, rx) = mpsc::channel(4);
+        // a dirigent acts as its owner
+        let delegate = (spec.part == Part::Dirigent).then_some(owner);
         let acquired = pb::ToPlayer {
             msg: Some(pb::to_player::Msg::Acquired(pb::Acquired {
                 epoch,
                 spec: Some(spec.into()),
+                tokens: Some(tokens(control, &subject, delegate.as_deref())),
             })),
         };
         tx.send(Ok(acquired)).await.expect("the receiver is here");
-        tokio::spawn(hold(control, session, subject, conn, inbound, tx, detached));
+        let held = Held {
+            session,
+            subject,
+            delegate,
+            conn,
+        };
+        tokio::spawn(hold(control, held, inbound, tx, detached));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
+/// The player's credentials: as `subject`, and, `delegate`, as that owner too.
+fn tokens(control: &Control, subject: &str, delegate: Option<&str>) -> pb::Tokens {
+    let signer = &control.auth.signer;
+    pb::Tokens {
+        player: signer.sign(subject, &[CHLIVE], None),
+        owner: delegate.map(|owner| signer.sign(owner, &[CHLIVE, CONTROL], Some(subject))),
+    }
+}
+
+/// A lease held on a call.
+struct Held {
+    session: Uuid,
+    /// The player's.
+    subject: String,
+    /// Who it acts as, a dirigent's: its owner.
+    delegate: Option<String>,
+    /// Which connection.
+    conn: u64,
+}
+
 /// A held lease, until its call ends: then given back (the player ended its stream) or kept
-/// for the grace period (the call broke).
+/// for the grace period (the call broke). Meanwhile the player's credentials are sent afresh
+/// halfway through their life. Given back after a `Handoff`, the next player is started at
+/// once, unless the session was stopped.
 async fn hold(
     control: &'static Control,
-    session: Uuid,
-    subject: String,
-    conn: u64,
+    held: Held,
     mut inbound: Streaming<pb::FromPlayer>,
     tx: mpsc::Sender<Result<pb::ToPlayer, Status>>,
     mut detached: watch::Receiver<Option<bool>>,
 ) {
+    let Held {
+        session,
+        subject,
+        delegate,
+        conn,
+    } = held;
+    let half = control.auth.signer.ttl / 2;
+    let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
+    let mut handoff = false;
     let closed = loop {
         tokio::select! {
+            _ = renew.tick() => {
+                let tokens = pb::ToPlayer {
+                    msg: Some(pb::to_player::Msg::Tokens(tokens(control, &subject, delegate.as_deref()))),
+                };
+                if tx.send(Ok(tokens)).await.is_err() {
+                    break false;
+                }
+            }
             msg = inbound.message() => match msg {
+                Ok(Some(pb::FromPlayer { msg: Some(pb::from_player::Msg::Handoff(_)) })) => {
+                    handoff = true;
+                }
                 Ok(Some(_)) => continue, // nothing more to ask once held
                 Ok(None) => break true,
                 Err(_) => break false,
@@ -479,9 +743,18 @@ async fn hold(
         false => control.store.detach(session, &subject).await,
     };
     match r {
-        Ok(()) if closed => info!(session = %session, subject, "lease given back"),
+        Ok(()) if closed => info!(session = %session, subject, handoff, "lease given back"),
         Ok(()) => info!(session = %session, subject, "player dropped; lease kept for now"),
-        Err(e) => error!(session = %session, subject, "ending a lease: {e:#}"),
+        Err(e) => {
+            error!(session = %session, subject, "ending a lease: {e:#}");
+            return;
+        }
+    }
+    if closed && handoff && detached.borrow().is_none() {
+        match start(control, session).await {
+            Ok(started) => info!(session = %session, ?started, "handed over"),
+            Err(e) => error!(session = %session, "starting the next player: {e:#}"),
+        }
     }
 }
 
@@ -492,6 +765,8 @@ async fn hold(
 /// isn't tested here.)
 #[cfg(test)]
 mod e2e {
+    use std::sync::Arc;
+
     use dirigent_protocol::control::pb::players_client::PlayersClient;
     use tonic::Code;
 
@@ -519,6 +794,11 @@ mod e2e {
         Detach {
             now: bool,
         },
+        /// Fresh credentials, as their subjects: the player's, and, a dirigent's, its owner's.
+        Tokens {
+            player: String,
+            owner: Option<String>,
+        },
         /// The call ended with this status.
         Refused(Code),
     }
@@ -533,6 +813,8 @@ mod e2e {
     struct Conn {
         grpc: String,
         call: Option<Call>,
+        /// What the last `Acquired` came with.
+        tokens: Option<pb::Tokens>,
     }
 
     struct Call {
@@ -565,6 +847,16 @@ mod e2e {
             end.await.expect("control didn't end the call");
             proxy.abort();
         }
+
+        /// Hand the session over (its machine is going), then end the stream.
+        async fn handoff(self) {
+            let call = self.call.as_ref().expect("a lease");
+            let handoff = pb::FromPlayer {
+                msg: Some(pb::from_player::Msg::Handoff(pb::Handoff {})),
+            };
+            call.tx.send(handoff).await.unwrap();
+            self.close().await;
+        }
     }
 
     impl Drop for Conn {
@@ -585,13 +877,23 @@ mod e2e {
                 spec: a.spec.expect("a spec").try_into().unwrap(),
             },
             pb::to_player::Msg::Detach(d) => Reply::Detach { now: d.now },
+            pb::to_player::Msg::Tokens(t) => Reply::Tokens {
+                player: claims(&t.player).sub,
+                owner: t.owner.as_deref().map(|o| claims(o).sub),
+            },
         }
+    }
+
+    /// A token's claims, unverified.
+    fn claims(token: &str) -> token::Claims {
+        jsonwebtoken::dangerous::insecure_decode_claims(token).unwrap()
     }
 
     async fn connect(ctl: &Ctl) -> Conn {
         Conn {
             grpc: ctl.grpc.clone(),
             call: None,
+            tokens: None,
         }
     }
 
@@ -621,7 +923,12 @@ mod e2e {
             Err(status) => return Reply::Refused(status.code()),
         };
         let got = match tokio::time::timeout(Duration::from_secs(10), inbound.message()).await {
-            Ok(Ok(Some(msg))) => reply(msg),
+            Ok(Ok(Some(msg))) => {
+                if let Some(pb::to_player::Msg::Acquired(a)) = &msg.msg {
+                    conn.tokens = a.tokens.clone();
+                }
+                reply(msg)
+            }
             Ok(Err(status)) => return Reply::Refused(status.code()),
             other => panic!("no reply: {other:?}"),
         };
@@ -649,12 +956,13 @@ mod e2e {
         fail: bool,
     }
 
+    #[async_trait::async_trait]
     impl Runner for Recorder {
         fn id(&self) -> &str {
             &self.id
         }
 
-        fn start(&self, session: Uuid, player: &str, epoch: i64) -> anyhow::Result<()> {
+        async fn start(&self, session: Uuid, player: &str, epoch: i64) -> anyhow::Result<()> {
             anyhow::ensure!(!self.fail, "the runner fails");
             self.started
                 .lock()
@@ -685,8 +993,22 @@ mod e2e {
     }
 
     /// A control on ports of its own, with `runner` (given the gRPC address players use).
-    async fn start_with(runner: impl FnOnce(&str) -> &'static dyn Runner) -> Option<Ctl> {
+    async fn start_with(runner: impl FnOnce(&Ctl) -> &'static dyn Runner) -> Option<Ctl> {
+        start_full(None, Duration::from_secs(600), false, runner).await
+    }
+
+    /// The same, in `oidc` auth with `oidc`, its credentials good for `ttl`. It signs with the
+    /// stack's key (`DIRIGENT_SIGNING_KEY`), which chlive takes, as the stack's control.
+    async fn start_full(
+        oidc: Option<Arc<auth::Oidc>>,
+        ttl: Duration,
+        reserved_only: bool,
+        runner: impl FnOnce(&Ctl) -> &'static dyn Runner,
+    ) -> Option<Ctl> {
         std::env::var_os("DIRIGENT_E2E")?;
+        let key = std::env::var("DIRIGENT_SIGNING_KEY")
+            .expect("DIRIGENT_SIGNING_KEY (the `e2e` script sets it)");
+        let signer = Signer::load(key.as_ref(), "dirigent-control", ttl).unwrap();
         let url = std::env::var("DIRIGENT_CONTROL_POSTGRES")
             .expect("DIRIGENT_CONTROL_POSTGRES (the `e2e` script sets it)");
         let store = Store::connect(&url, Duration::from_secs(1)).await.unwrap();
@@ -694,36 +1016,70 @@ mod e2e {
         let http = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let grpc_addr = format!("127.0.0.1:{}", grpc.local_addr().unwrap().port());
-        let control = control(store, Some(runner(&grpc_addr)), Duration::from_secs(1));
+        let ctl = Ctl {
+            http,
+            grpc: grpc_addr,
+        };
+        let control = control(
+            store,
+            Auth { signer, oidc },
+            Some(runner(&ctl)),
+            Duration::from_secs(1),
+            reserved_only,
+        );
         tokio::spawn(sweep(control));
         tokio::spawn(async move { axum::serve(listener, router(control)).await });
         tokio::spawn(players(control).serve_with_incoming(TcpListenerStream::new(grpc)));
-        Some(Ctl {
-            http,
-            grpc: grpc_addr,
-        })
+        Some(ctl)
     }
 
     async fn start_recording(runner: &'static Recorder) -> Option<Ctl> {
         start_with(|_| runner).await
     }
 
-    async fn put(base: &Ctl, session: Uuid, users: &[&str]) -> reqwest::StatusCode {
-        put_json(base, session, serde_json::json!({ "users": users })).await
+    /// Who the tests call the API as, unless they say.
+    const A: &str = "user:a";
+    const B: &str = "user:b";
+
+    /// A request to the API as `user`.
+    fn call(
+        user: &str,
+        method: reqwest::Method,
+        base: &Ctl,
+        path: &str,
+    ) -> reqwest::RequestBuilder {
+        reqwest::Client::new()
+            .request(method, format!("http://{base}{path}"))
+            .header(auth::CALLER, user)
     }
 
-    async fn put_json(base: &Ctl, session: Uuid, body: serde_json::Value) -> reqwest::StatusCode {
-        reqwest::Client::new()
-            .put(format!("http://{base}/sessions/{session}"))
-            .json(&body)
-            .send()
-            .await
-            .unwrap()
-            .status()
+    /// Make `session`, `A`'s, with the default spec.
+    async fn put(base: &Ctl, session: Uuid) -> reqwest::StatusCode {
+        put_json(base, session, A, serde_json::json!({})).await
+    }
+
+    async fn put_json(
+        base: &Ctl,
+        session: Uuid,
+        user: &str,
+        body: serde_json::Value,
+    ) -> reqwest::StatusCode {
+        let path = format!("/sessions/{session}");
+        let req = call(user, reqwest::Method::PUT, base, &path).json(&body);
+        req.send().await.unwrap().status()
     }
 
     async fn post(base: &Ctl, path: &str, body: Option<serde_json::Value>) -> reqwest::StatusCode {
-        let req = reqwest::Client::new().post(format!("http://{base}{path}"));
+        post_as(A, base, path, body).await
+    }
+
+    async fn post_as(
+        user: &str,
+        base: &Ctl,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> reqwest::StatusCode {
+        let req = call(user, reqwest::Method::POST, base, path);
         let req = match body {
             Some(b) => req.json(&b),
             None => req,
@@ -732,7 +1088,23 @@ mod e2e {
     }
 
     async fn info(base: &Ctl, session: Uuid) -> SessionInfo {
-        let res = reqwest::get(format!("http://{base}/sessions/{session}"))
+        let res = call(
+            A,
+            reqwest::Method::GET,
+            base,
+            &format!("/sessions/{session}"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+        res.json().await.unwrap()
+    }
+
+    /// The sessions `user` sees.
+    async fn list(base: &Ctl, user: &str) -> Vec<SessionInfo> {
+        let res = call(user, reqwest::Method::GET, base, "/sessions")
+            .send()
             .await
             .unwrap();
         assert_eq!(res.status(), reqwest::StatusCode::OK);
@@ -797,15 +1169,19 @@ mod e2e {
             return;
         };
         let s = Uuid::new_v4();
+        assert_eq!(put(&base, s).await, reqwest::StatusCode::CREATED);
+        let viewers = serde_json::json!({ "viewers": [B] });
         assert_eq!(
-            put(&base, s, &["user:a"]).await,
-            reqwest::StatusCode::CREATED
-        );
-        assert_eq!(
-            put(&base, s, &["user:a", "user:b"]).await,
+            put_json(&base, s, A, viewers.clone()).await,
             reqwest::StatusCode::OK
         );
-        assert_eq!(info(&base, s).await.users, ["user:a", "user:b"]);
+        let got = info(&base, s).await;
+        assert_eq!((got.owner.as_str(), got.viewers), (A, vec![B.to_string()]));
+        // another's
+        assert_eq!(
+            put_json(&base, s, B, viewers).await,
+            reqwest::StatusCode::FORBIDDEN
+        );
         let mut ws = connect(&base).await;
         assert_eq!(acquire(&mut ws, Uuid::new_v4(), "p", None).await, UNKNOWN);
     }
@@ -821,16 +1197,20 @@ mod e2e {
             "effort": "high",
             "source": { "git": { "url": "https://example.com/r.git", "ref": "dev" } },
         });
-        let mut body = spec.clone();
-        body["users"] = serde_json::json!(["user:a"]);
         assert_eq!(
-            put_json(&base, s, body.clone()).await,
+            put_json(&base, s, A, spec.clone()).await,
             reqwest::StatusCode::CREATED
         );
-        assert_eq!(put_json(&base, s, body).await, reqwest::StatusCode::OK);
         assert_eq!(
-            put(&base, s, &["user:b"]).await,
-            reqwest::StatusCode::CONFLICT
+            put_json(&base, s, A, spec.clone()).await,
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(put(&base, s).await, reqwest::StatusCode::CONFLICT);
+        // a dirigent has no source
+        let dirigent = serde_json::json!({ "part": "dirigent", "source": spec["source"] });
+        assert_eq!(
+            put_json(&base, Uuid::new_v4(), A, dirigent).await,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
         );
         let mut ws = connect(&base).await;
         assert_eq!(
@@ -848,7 +1228,7 @@ mod e2e {
             return;
         };
         let s = Uuid::new_v4();
-        put(&base, s, &[]).await;
+        put(&base, s).await;
         let mut a = connect(&base).await;
         let mut b = connect(&base).await;
         assert_eq!(acquire(&mut a, s, "a", None).await, acquired(1));
@@ -866,7 +1246,7 @@ mod e2e {
             return;
         };
         let s = Uuid::new_v4();
-        put(&base, s, &[]).await;
+        put(&base, s).await;
         let mut a = connect(&base).await;
         assert_eq!(acquire(&mut a, s, "a", None).await, acquired(1));
         drop(a); // no Close frame
@@ -885,7 +1265,7 @@ mod e2e {
             return;
         };
         let s = Uuid::new_v4();
-        put(&base, s, &[]).await;
+        put(&base, s).await;
         let mut a = connect(&base).await;
         assert_eq!(acquire(&mut a, s, "a", None).await, acquired(1));
         drop(a);
@@ -907,8 +1287,11 @@ mod e2e {
             return;
         };
         let s = Uuid::new_v4();
-        let body = serde_json::json!({ "users": ["user:a"], "start": true });
-        assert_eq!(put_json(&base, s, body).await, reqwest::StatusCode::CREATED);
+        let body = serde_json::json!({ "start": true });
+        assert_eq!(
+            put_json(&base, s, A, body).await,
+            reqwest::StatusCode::CREATED
+        );
         let [(p, 1)] = &runner.of(s)[..] else {
             panic!("{:?}", runner.of(s))
         };
@@ -934,7 +1317,7 @@ mod e2e {
             return;
         };
         let s = Uuid::new_v4();
-        put(&base, s, &[]).await;
+        put(&base, s).await;
         let path = format!("/sessions/{s}/start");
         assert_eq!(
             post(&base, &path, None).await,
@@ -956,7 +1339,7 @@ mod e2e {
             return;
         };
         let s = Uuid::new_v4();
-        put(&base, s, &[]).await;
+        put(&base, s).await;
         post(&base, &format!("/sessions/{s}/start"), None).await;
         let (p, _) = runner.of(s).remove(0);
         let mut ws = connect(&base).await;
@@ -973,7 +1356,7 @@ mod e2e {
             return;
         };
         let s = Uuid::new_v4();
-        put(&base, s, &[]).await;
+        put(&base, s).await;
         post(&base, &format!("/sessions/{s}/start"), None).await;
         let (p, _) = runner.of(s).remove(0);
         let mut ws = connect(&base).await;
@@ -998,13 +1381,60 @@ mod e2e {
     }
 
     #[tokio::test]
+    async fn e2e_a_session_handed_over_goes_to_the_next_player_at_once_unless_stopped() {
+        let runner = recorder(false);
+        let Some(base) = start_recording(runner).await else {
+            return;
+        };
+        let s = Uuid::new_v4();
+        put(&base, s).await;
+        post(&base, &format!("/sessions/{s}/start"), None).await;
+        let (p, _) = runner.of(s).remove(0);
+        let mut ws = connect(&base).await;
+        assert_eq!(acquire(&mut ws, s, &p, Some(1)).await, acquired(1));
+        ws.handoff().await;
+        let got = started_n(runner, s, 2).await;
+        assert_eq!(got[1].1, 2, "{got:?}");
+
+        // stopped first, it stays stopped
+        let mut ws = connect(&base).await;
+        assert_eq!(acquire(&mut ws, s, &got[1].0, Some(2)).await, acquired(2));
+        post(&base, &format!("/sessions/{s}/stop"), None).await;
+        assert_eq!(next(&mut ws).await, Reply::Detach { now: false });
+        ws.handoff().await;
+        info_until(&base, s, |i| i.player.is_none()).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(runner.of(s).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn e2e_reserved_only_control_leases_only_the_players_it_started() {
+        let runner = recorder(false);
+        let Some(base) = start_full(None, Duration::from_secs(600), true, |_| runner).await else {
+            return;
+        };
+        let s = Uuid::new_v4();
+        put(&base, s).await;
+        let mut ws = connect(&base).await;
+        let anyone = Uuid::new_v4().to_string();
+        assert_eq!(
+            acquire(&mut ws, s, &anyone, None).await,
+            Reply::Refused(Code::PermissionDenied)
+        );
+        post(&base, &format!("/sessions/{s}/start"), None).await;
+        let (p, _) = runner.of(s).remove(0);
+        assert_eq!(acquire(&mut ws, s, &p, Some(1)).await, acquired(1));
+        ws.close().await;
+    }
+
+    #[tokio::test]
     async fn e2e_stopping_a_session_whose_player_is_away_takes_its_lease() {
         let runner = recorder(false);
         let Some(base) = start_recording(runner).await else {
             return;
         };
         let s = Uuid::new_v4();
-        put(&base, s, &[]).await;
+        put(&base, s).await;
         let mut a = connect(&base).await;
         assert_eq!(acquire(&mut a, s, "a", None).await, acquired(1));
         drop(a);
@@ -1025,7 +1455,7 @@ mod e2e {
             return;
         };
         let s = Uuid::new_v4();
-        put(&base, s, &[]).await;
+        put(&base, s).await;
         let path = format!("/sessions/{s}/start");
         assert_eq!(
             post(&base, &path, None).await,
@@ -1046,31 +1476,297 @@ mod e2e {
                 reqwest::StatusCode::NOT_FOUND
             );
         }
-        let res = reqwest::get(format!("http://{base}/sessions/{s}"))
+        let res = call(A, reqwest::Method::GET, &base, &format!("/sessions/{s}"))
+            .send()
             .await
             .unwrap();
         assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
-        put(&base, s, &[]).await;
-        let all: Vec<SessionInfo> = reqwest::get(format!("http://{base}/sessions"))
+        put(&base, s).await;
+        assert!(list(&base, A).await.iter().any(|i| i.id == s.to_string()));
+    }
+
+    #[tokio::test]
+    async fn e2e_only_a_sessions_owner_and_viewers_see_it_and_only_its_owner_runs_it() {
+        let runner = recorder(false);
+        let Some(base) = start_recording(runner).await else {
+            return;
+        };
+        let s = Uuid::new_v4();
+        put(&base, s).await;
+        let mine = |l: Vec<SessionInfo>| l.into_iter().find(|i| i.id == s.to_string());
+        // another user sees nothing of it, and can't run it
+        assert_eq!(mine(list(&base, B).await), None);
+        for action in ["start", "stop"] {
+            let path = format!("/sessions/{s}/{action}");
+            assert_eq!(
+                post_as(B, &base, &path, None).await,
+                reqwest::StatusCode::NOT_FOUND
+            );
+        }
+        // a viewer sees it, but can't run it either
+        let viewer = format!("/sessions/{s}/viewers/{B}");
+        let add = call(A, reqwest::Method::PUT, &base, &viewer)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(add.status(), reqwest::StatusCode::NO_CONTENT);
+        let seen = mine(list(&base, B).await).unwrap();
+        assert_eq!((seen.role, seen.owner.as_str()), (Role::Viewer, A));
+        assert_eq!(mine(list(&base, A).await).unwrap().role, Role::Owner);
+        let start = format!("/sessions/{s}/start");
+        assert_eq!(
+            post_as(B, &base, &start, None).await,
+            reqwest::StatusCode::FORBIDDEN
+        );
+        // nor add viewers
+        let more = format!("/sessions/{s}/viewers/user:c");
+        let add = call(B, reqwest::Method::PUT, &base, &more)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(add.status(), reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(runner.of(s), []);
+        // removed, it sees nothing again
+        let gone = call(A, reqwest::Method::DELETE, &base, &viewer)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(mine(list(&base, B).await), None);
+        // and without saying who calls, nobody may
+        let anon = reqwest::get(format!("http://{base}/sessions"))
+            .await
+            .unwrap();
+        assert_eq!(anon.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn e2e_a_lease_comes_with_credentials_sent_afresh_while_its_held() {
+        let runner = recorder(false);
+        let Some(base) = start_full(None, Duration::from_secs(2), false, |_| runner).await else {
+            return;
+        };
+        let coder = Uuid::new_v4();
+        put(&base, coder).await;
+        let mut ws = connect(&base).await;
+        let player = Uuid::new_v4().to_string();
+        assert_eq!(acquire(&mut ws, coder, &player, None).await, acquired(1));
+        let tokens = ws.tokens.clone().expect("credentials");
+        let c = claims(&tokens.player);
+        assert_eq!(
+            (c.sub.as_str(), c.aud.as_slice(), c.iss.as_str()),
+            (
+                player_subject(&player).as_str(),
+                &[CHLIVE.to_string()][..],
+                "dirigent-control"
+            )
+        );
+        assert_eq!(tokens.owner, None);
+        // halfway through their life
+        let fresh = Reply::Tokens {
+            player: player_subject(&player),
+            owner: None,
+        };
+        assert_eq!(next(&mut ws).await, fresh);
+        assert_eq!(next(&mut ws).await, fresh);
+
+        // a dirigent's act as its owner too, for chlive and control's API
+        let dirigent = Uuid::new_v4();
+        let body = serde_json::json!({ "part": "dirigent" });
+        assert_eq!(
+            put_json(&base, dirigent, A, body).await,
+            reqwest::StatusCode::CREATED
+        );
+        let mut ws = connect(&base).await;
+        let player = Uuid::new_v4().to_string();
+        assert!(matches!(
+            acquire(&mut ws, dirigent, &player, None).await,
+            Reply::Acquired { .. }
+        ));
+        let owner = claims(&ws.tokens.clone().unwrap().owner.expect("an owner's"));
+        assert_eq!(owner.sub, A);
+        assert_eq!(owner.aud, [CHLIVE, CONTROL]);
+        assert_eq!(owner.act.unwrap().sub, player_subject(&player));
+        assert_eq!(
+            next(&mut ws).await,
+            Reply::Tokens {
+                player: player_subject(&player),
+                owner: Some(A.into()),
+            }
+        );
+    }
+
+    /// A request to the API with `token`.
+    fn bearer(
+        token: &str,
+        method: reqwest::Method,
+        base: &Ctl,
+        path: &str,
+    ) -> reqwest::RequestBuilder {
+        reqwest::Client::new()
+            .request(method, format!("http://{base}{path}"))
+            .bearer_auth(token)
+    }
+
+    #[tokio::test]
+    async fn e2e_in_oidc_auth_callers_are_who_the_providers_tokens_say() {
+        use auth::test_provider::{Provider, CLIENT};
+        let provider = Provider::new();
+        let oidc = auth::Oidc::start(&provider.args()).await.unwrap();
+        let runner = recorder(false);
+        let Some(base) = start_full(Some(oidc), Duration::from_secs(600), false, |_| runner).await
+        else {
+            return;
+        };
+        let me = provider.id_token("me@x.com");
+        let s = Uuid::new_v4();
+        let put = bearer(&me, reqwest::Method::PUT, &base, &format!("/sessions/{s}"))
+            .json(&serde_json::json!({ "part": "dirigent" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), reqwest::StatusCode::CREATED);
+        let listed: Vec<SessionInfo> = bearer(&me, reqwest::Method::GET, &base, "/sessions")
+            .send()
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
-        assert!(all.iter().any(|i| i.id == s.to_string()));
+        let mine = listed.iter().find(|i| i.id == s.to_string()).unwrap();
+        assert_eq!(mine.owner, "user:me@x.com");
+
+        // the header says nothing here; nor do the provider's tokens unverified, or for another
+        let unverified = Provider::token_by(
+            &provider.signer,
+            serde_json::json!({ "aud": CLIENT, "email": "me@x.com", "email_verified": false }),
+        );
+        let elsewhere = Provider::token_by(
+            &provider.signer,
+            serde_json::json!({ "aud": "elsewhere", "email": "me@x.com", "email_verified": true }),
+        );
+        assert_eq!(
+            call("user:me@x.com", reqwest::Method::GET, &base, "/sessions")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        for t in [&unverified, &elsewhere] {
+            let res = bearer(t, reqwest::Method::GET, &base, "/sessions")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
+        }
+        // chlive takes the provider's tokens: control signs none for callers
+        let token = bearer(&me, reqwest::Method::POST, &base, "/token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(token.status(), reqwest::StatusCode::NOT_FOUND);
+        let mode: serde_json::Value = reqwest::get(format!("http://{base}/auth"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            mode,
+            serde_json::json!({ "mode": "oidc", "google_client_id": CLIENT })
+        );
+
+        // the dirigent's player: as its owner, with the token for that; not with its own
+        let mut ws = connect(&base).await;
+        let player = Uuid::new_v4().to_string();
+        assert!(matches!(
+            acquire(&mut ws, s, &player, None).await,
+            Reply::Acquired { .. }
+        ));
+        let tokens = ws.tokens.clone().unwrap();
+        let res = bearer(&tokens.player, reqwest::Method::GET, &base, "/sessions")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let listed: Vec<SessionInfo> = bearer(
+            &tokens.owner.unwrap(),
+            reqwest::Method::GET,
+            &base,
+            "/sessions",
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert!(listed.iter().any(|i| i.id == s.to_string()));
+    }
+
+    #[tokio::test]
+    async fn e2e_in_declared_auth_control_signs_callers_chlive_credentials() {
+        let Some(base) = start_recording(recorder(false)).await else {
+            return;
+        };
+        let mode: serde_json::Value = reqwest::get(format!("http://{base}/auth"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(mode, serde_json::json!({ "mode": "declared" }));
+        let got: serde_json::Value = call(A, reqwest::Method::POST, &base, "/token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let token = got["token"].as_str().unwrap();
+        // verified with the JWKS control publishes
+        let jwks: jsonwebtoken::jwk::JwkSet =
+            reqwest::get(format!("http://{base}/.well-known/jwks.json"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let key = jsonwebtoken::DecodingKey::from_jwk(&jwks.keys[0]).unwrap();
+        let mut v = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
+        v.set_audience(&[CHLIVE]);
+        v.set_issuer(&["dirigent-control"]);
+        let c = jsonwebtoken::decode::<token::Claims>(token, &key, &v)
+            .unwrap()
+            .claims;
+        assert_eq!(c.sub, A);
+        // for chlive only, not control's API
+        let res = bearer(token, reqwest::Method::GET, &base, "/sessions")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let anon = reqwest::Client::new()
+            .post(format!("http://{base}/token"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anon.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
 
     /// A control running mock players (`target/debug/player`, which `e2e` builds) in `root`, on
     /// the stack's chlive; its address.
     async fn start_local(root: &std::path::Path) -> Option<Ctl> {
         let root = root.to_path_buf();
-        start_with(|addr| {
+        start_with(|ctl| {
             Box::leak(Box::new(Local {
                 id: format!("local:{}", root.display()),
                 root: root.clone(),
                 program: concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/player").into(),
                 args: vec!["--mock".into()],
-                control_url: format!("http://{addr}"),
+                control_url: format!("http://{}", ctl.grpc),
+                control_http: format!("http://{}", ctl.http),
             }))
         })
         .await
@@ -1084,7 +1780,10 @@ mod e2e {
         };
         let s = Uuid::new_v4();
         let body = serde_json::json!({ "start": true });
-        assert_eq!(put_json(&base, s, body).await, reqwest::StatusCode::CREATED);
+        assert_eq!(
+            put_json(&base, s, A, body).await,
+            reqwest::StatusCode::CREATED
+        );
         let attached = |epoch| {
             move |i: &SessionInfo| i.epoch == epoch && i.player.as_ref().is_some_and(|p| p.attached)
         };
@@ -1113,6 +1812,31 @@ mod e2e {
     }
 
     #[tokio::test]
+    async fn e2e_a_local_player_stopped_from_outside_hands_the_session_over() {
+        let root = tempfile::tempdir().unwrap();
+        let Some(base) = start_local(root.path()).await else {
+            return;
+        };
+        let s = Uuid::new_v4();
+        let body = serde_json::json!({ "start": true });
+        put_json(&base, s, A, body).await;
+        let attached = |epoch| {
+            move |i: &SessionInfo| i.epoch == epoch && i.player.as_ref().is_some_and(|p| p.attached)
+        };
+        info_until(&base, s, attached(1)).await;
+        let pid = player_pid(s).expect("the player's process");
+        // SAFETY: a plain kill(2)
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        info_until(&base, s, attached(2)).await;
+        // handed over, not lost and started again past the grace period
+        let log =
+            std::fs::read_to_string(root.path().join(s.to_string()).join("player.log")).unwrap();
+        assert!(log.contains("handing the session over"), "{log}");
+        post(&base, &format!("/sessions/{s}/stop"), None).await;
+        info_until(&base, s, |i| i.player.is_none()).await;
+    }
+
+    #[tokio::test]
     async fn e2e_a_local_player_that_fails_gives_the_session_back() {
         let root = tempfile::tempdir().unwrap();
         let Some(base) = start_local(root.path()).await else {
@@ -1124,7 +1848,10 @@ mod e2e {
             "start": true,
             "source": { "git": { "url": format!("file://{}", missing.display()) } },
         });
-        assert_eq!(put_json(&base, s, body).await, reqwest::StatusCode::CREATED);
+        assert_eq!(
+            put_json(&base, s, A, body).await,
+            reqwest::StatusCode::CREATED
+        );
         info_until(&base, s, |i| i.epoch == 1 && i.player.is_none()).await;
         // given back, not lost: it isn't started again
         tokio::time::sleep(Duration::from_secs(3)).await;

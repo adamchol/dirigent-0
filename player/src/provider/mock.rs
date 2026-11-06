@@ -114,7 +114,8 @@ impl Provider for MockProvider {
 }
 
 /// Fallback when no script is queued (`--mock` demos): echo the latest user
-/// text after a short delay, or run `Bash` for text starting with `!`.
+/// text after a short delay, run `Bash` for text starting with `!`, or call
+/// any tool for `!!<tool> <json input>`.
 fn echo(req: &Request, n: u64) -> Script {
     let delay = Duration::from_millis(300);
     let Some(last) = req
@@ -136,7 +137,20 @@ fn echo(req: &Request, n: u64) -> Script {
             _ => None,
         })
         .unwrap_or_default();
-    if let Some(command) = text.trim().strip_prefix('!') {
+    let call = if let Some(call) = text.trim().strip_prefix("!!") {
+        let (name, input) = call.split_once(char::is_whitespace).unwrap_or((call, "{}"));
+        let input = serde_json::from_str(input.trim())
+            .unwrap_or_else(|e| serde_json::json!({ "__error": e.to_string() }));
+        Some((name.to_string(), input))
+    } else {
+        text.trim().strip_prefix('!').map(|command| {
+            (
+                "Bash".to_string(),
+                serde_json::json!({ "command": command.trim() }),
+            )
+        })
+    };
+    if let Some((name, input)) = call {
         return Script::Deltas {
             delay,
             deltas: vec![
@@ -144,8 +158,8 @@ fn echo(req: &Request, n: u64) -> Script {
                     index: 0,
                     block: ContentBlock::ToolCall {
                         id: format!("mock-{n}"),
-                        name: "Bash".into(),
-                        input: serde_json::json!({ "command": command.trim() }),
+                        name,
+                        input,
                     },
                 },
                 Delta::BlockStop { index: 0 },
