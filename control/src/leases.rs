@@ -430,7 +430,7 @@ const SESSIONS: &str = "SELECT s.id, s.spec, s.epoch, p.subject, p.expires_at IS
      coalesce(o.subject, ''), \
      ARRAY(SELECT v.subject FROM dirigent.session_access v \
            WHERE v.session_id = s.id AND v.role = 'viewer' ORDER BY v.subject), \
-     me.role \
+     me.role, (extract(epoch FROM s.created) * 1000)::bigint \
      FROM dirigent.sessions s \
      JOIN dirigent.session_access me \
        ON me.session_id = s.id AND me.subject = $1 AND me.role IN ('owner', 'viewer') \
@@ -451,6 +451,7 @@ fn session_info(row: &Row) -> anyhow::Result<SessionInfo> {
         owner: row.get(5),
         viewers: row.get(6),
         role: role(row.get(7)),
+        created: row.get(8),
     })
 }
 

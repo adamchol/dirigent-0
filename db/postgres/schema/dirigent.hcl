@@ -35,6 +35,12 @@ table "dirigent.sessions" {
     null    = false
     default = sql("'{}'::jsonb")
   }
+  # When it was made (clients list a new session first, before it has any events).
+  column "created" {
+    type    = timestamptz
+    null    = false
+    default = sql("now()")
+  }
   primary_key { columns = [column.id] }
 }
 

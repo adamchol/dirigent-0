@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
     let mut signals = stop::signals();
 
     let provider: Arc<dyn Provider> = if cli.mock {
-        Arc::new(provider::mock::MockProvider::default())
+        Arc::new(provider::mock::MockProvider::long())
     } else {
         let key = cli
             .api_key

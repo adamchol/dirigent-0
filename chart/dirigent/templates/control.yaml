@@ -70,6 +70,7 @@ spec:
       annotations:
         checksum/player: {{ include (print $.Template.BasePath "/player.yaml") . | sha256sum }}
     spec:
+      {{- include "dirigent.pullSecrets" . | nindent 6 }}
       serviceAccountName: dirigent-control
       initContainers:
         {{- include "dirigent.migrate" . }}

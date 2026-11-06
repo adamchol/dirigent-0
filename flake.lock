@@ -17,11 +17,11 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1793906053,
-        "narHash": "sha256-Fva47vDzLbFUA060v1T3j0dEHqrmN9xZ7iMHUtgEQn4=",
+        "lastModified": 1793922897,
+        "narHash": "sha256-p3PN6I+ueoI8SHyZeTrITvcsCyS8GqyIQGFxTswk0k4=",
         "ref": "master",
-        "rev": "e746d70ea220403d7859d4055c978cb8a6bbd47a",
-        "revCount": 130,
+        "rev": "9743d4300a4c38e9a77f2fb7f8e37fd0ea9ccc96",
+        "revCount": 131,
         "type": "git",
         "url": "https://github.com/dialohq/chlive"
       },

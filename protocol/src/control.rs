@@ -179,6 +179,9 @@ pub struct SessionInfo {
     pub viewers: Vec<String>,
     /// The caller's.
     pub role: Role,
+    /// When it was made, in milliseconds since the Unix epoch.
+    #[serde(default)]
+    pub created: i64,
 }
 
 /// A user's part in a session.
@@ -213,6 +216,7 @@ mod tests {
             owner: "user:o".into(),
             viewers: vec!["user:v".into()],
             role: Role::Viewer,
+            created: 0,
         };
         let wire = serde_json::to_value(&info).unwrap();
         assert_eq!(

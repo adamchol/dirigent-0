@@ -53,6 +53,7 @@ spec:
         {{- include "dirigent.selector" . | nindent 8 }}
         app.kubernetes.io/component: checkpoints
     spec:
+      {{- include "dirigent.pullSecrets" . | nindent 6 }}
       serviceAccountName: dirigent-checkpoints
       restartPolicy: OnFailure
       containers:

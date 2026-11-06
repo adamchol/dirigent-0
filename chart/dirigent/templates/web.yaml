@@ -29,21 +29,19 @@ spec:
       labels:
         {{- include "dirigent.selector" . | nindent 8 }}
         app.kubernetes.io/component: web
-      annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/web-config.yaml") . | sha256sum }}
     spec:
+      {{- include "dirigent.pullSecrets" . | nindent 6 }}
       containers:
         - name: web
           image: {{ include "dirigent.image" (list . "web") }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
-          args: [-c, /etc/nginx/nginx.conf]
           ports:
             - { name: http, containerPort: 8080 }
-          volumeMounts:
-            - { name: config, mountPath: /etc/nginx, readOnly: true }
-      volumes:
-        - name: config
-          configMap: { name: dirigent-web }
+          env:
+            - { name: CONTROL, value: "http://dirigent-control:8090" }
+            - { name: CHLIVE_URL, value: "ws://dirigent-chlive:8080/live" }
+          readinessProbe:
+            httpGet: { path: /, port: http }
 {{- with .Values.web.ingress }}
 {{- if .enabled }}
 ---

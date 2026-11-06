@@ -463,9 +463,11 @@ mod e2e {
                         .iter()
                         .filter(|b| matches!(b, ContentBlock::ToolCall { .. }))
                         .count();
+                    // its first line: `--mock`'s replies go on with random paragraphs
+                    let text = Message::assistant(content).text();
                     format!(
                         "assistant:{}{}",
-                        Message::assistant(content).text(),
+                        text.lines().next().unwrap_or_default(),
                         "+tool".repeat(calls)
                     )
                 }

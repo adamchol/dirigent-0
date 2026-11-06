@@ -1,0 +1,8 @@
+# bun-plugin-tailwind's peer `bun` (the npm package, a binary download) isn't needed: this is Bun
+[install]
+peer = false
+
+# Tailwind, and chlive's .wasm as an asset (wasm-url.ts), for the HTML imports the server bundles
+# (src/server.ts)
+[serve.static]
+plugins = ["bun-plugin-tailwind", "./wasm-url.ts"]

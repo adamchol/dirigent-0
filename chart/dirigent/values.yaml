@@ -9,6 +9,9 @@ images:
   # the chart's appVersion when empty
   tag: ""
   pullPolicy: IfNotPresent
+  # Secrets (docker-registry) to pull them with, e.g. for private ghcr packages; the ingestion's
+  # are its own: ingestion.imagePullSecrets ([{name: …}])
+  pullSecrets: []
 
 # Who signs in. `oidc`: with Google, as `user:<email>`; `declared`: whoever the web's box says,
 # unverified (dev only).
@@ -118,6 +121,12 @@ ingestion:
   pauseServerUrl: ""
   fullnameOverride: dirigent-ingest
   stateNamespace: dirigent
+  # the flake's `ingest` image (continuous-backup's own isn't published); images.registry and
+  # images.tag don't reach a subchart, so change these with them
+  connect:
+    image:
+      repository: ghcr.io/adamchol/dirigent-ingest
+      tag: 0.1.0
   kafka:
     bootstrapServers: ""
     existingSecret: ""

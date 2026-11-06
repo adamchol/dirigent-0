@@ -43,6 +43,7 @@ spec:
         {{- include "dirigent.selector" . | nindent 8 }}
         app.kubernetes.io/component: rustfs
     spec:
+      {{- include "dirigent.pullSecrets" . | nindent 6 }}
       containers:
         - name: rustfs
           image: {{ include "dirigent.image" (list . "rustfs") }}

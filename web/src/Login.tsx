@@ -22,7 +22,7 @@ interface Gsi {
     auto_select?: boolean;
     use_fedcm_for_prompt?: boolean;
   }): void;
-  renderButton(el: HTMLElement, options: { theme?: string; size?: string }): void;
+  renderButton(el: HTMLElement, options: { theme?: string; size?: string; shape?: string }): void;
   prompt(): void;
   disableAutoSelect(): void;
 }
@@ -31,6 +31,12 @@ declare global {
   interface Window {
     google?: { accounts: { id: Gsi } };
   }
+}
+
+/** Google's button, in the page's theme. */
+function buttonStyle() {
+  const dark = document.documentElement.classList.contains("dark");
+  return { theme: dark ? "filled_black" : "outline", size: "large", shape: "pill" };
 }
 
 let loading: Promise<Gsi> | null = null;
@@ -83,7 +89,7 @@ export function useGoogle(clientId: string): {
           auto_select: true,
           use_fedcm_for_prompt: true,
         });
-        if (button.current) g.renderButton(button.current, { theme: "outline", size: "large" });
+        if (button.current) g.renderButton(button.current, buttonStyle());
         g.prompt();
       },
       (e) => setError((e as Error).message),
@@ -96,7 +102,7 @@ export function useGoogle(clientId: string): {
   // renew it before it expires; expired, it's gone
   useEffect(() => {
     if (!token) {
-      if (button.current && id.current) id.current.renderButton(button.current, { theme: "outline", size: "large" });
+      if (button.current && id.current) id.current.renderButton(button.current, buttonStyle());
       return;
     }
     const exp = (claims(token).exp ?? 0) * 1000;

@@ -54,3 +54,12 @@ dirigent-rustfs
 {{- required "ingestion.pauseServerUrl (ingestion disabled)" .Values.ingestion.pauseServerUrl -}}
 {{- end -}}
 {{- end }}
+
+{{- define "dirigent.pullSecrets" -}}
+{{- with .Values.images.pullSecrets }}
+imagePullSecrets:
+{{- range . }}
+  - name: {{ . }}
+{{- end }}
+{{- end }}
+{{- end }}

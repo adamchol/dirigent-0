@@ -1,4 +1,4 @@
-// Control's HTTP API (control/src/main.rs), through the dev server's `/api` proxy, as `Who`
+// Control's HTTP API (control/src/main.rs), through the web server's `/api` proxy, as `Who`
 // says: in control's `declared` auth the user chosen at the top (the `dirigent-user` header), in
 // its `oidc` auth whoever signed in with Google (their ID token).
 
@@ -28,6 +28,8 @@ export interface SessionInfo {
   viewers: string[];
   /** The caller's. */
   role: "owner" | "viewer";
+  /** When it was made, in milliseconds since the Unix epoch. */
+  created: number;
 }
 
 /** How control knows its callers (`GET /auth`). */
@@ -100,4 +102,19 @@ export async function addViewer(who: Who, id: string, viewer: string) {
 
 export async function removeViewer(who: Who, id: string, viewer: string) {
   await call(who, "DELETE", `/sessions/${id}/viewers/${encodeURIComponent(viewer)}`);
+}
+
+/** A git URL's repository as `owner/name`, or the URL without its scheme. */
+export function repo(url: string): string {
+  const path = url.replace(/^[a-z+]+:\/\/|^git@/, "").replace(/\.git$/, "");
+  const parts = path.split(/[/:]/).filter(Boolean);
+  return parts.length >= 3 ? parts.slice(-2).join("/") : path;
+}
+
+/** What a session is called: its repository (and ref), or what it is without one. */
+export function title(s: SessionInfo): string {
+  if (part(s) === "dirigent") return "Dirigent";
+  const git = s.spec.source?.git;
+  if (!git) return "Empty workspace";
+  return git.ref ? `${repo(git.url)}@${git.ref}` : repo(git.url);
 }

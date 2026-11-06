@@ -9,10 +9,25 @@
   continuous-backup,
   clickhouse,
   chlive,
+  chliveClient,
   openmig,
   postgresql,
 }:
 let
+  # chlive's TS client into web/chlive-client, where web/tsconfig.json has it: $CHLIVE_CLIENT's (a
+  # chlive checkout's client/, its wasm/ built), or the flake's. Only when it changed, and swapped
+  # in whole: the running dev server watches it.
+  chliveClientCopy = ''
+    from=''${CHLIVE_CLIENT:-${chliveClient}}
+    to="$DNVR_ROOT/web/chlive-client"
+    if ! diff -rq "$from/src" "$to/src" >/dev/null 2>&1 || ! diff -rq "$from/wasm" "$to/wasm" >/dev/null 2>&1; then
+      rm -rf "$to.new"
+      mkdir "$to.new"
+      cp -r --no-preserve=mode "$from/src" "$from/wasm" "$to.new/"
+      rm -rf "$to"
+      mv "$to.new" "$to"
+    fi
+  '';
   stack = import ./stack.nix {
     inherit
       pkgs
@@ -192,8 +207,7 @@ in
       '';
     };
 
-    # The web UI (web/): Vite's dev server, with chlive's client from its checkout
-    # ($CHLIVE_CLIENT, by default /root/chlive/client), proxying `/live` to chlive and `/api` to
+    # The web UI (web/): its Bun server, hot-reloaded, proxying `/live` to chlive and `/api` to
     # control. Publishes `url`.
     web = {
       env = {
@@ -205,7 +219,8 @@ in
         port=54340
         dnvr-state set url "http://127.0.0.1:$port"
         bun install --frozen-lockfile
-        exec bun x vite --host 127.0.0.1 --port "$port" --strictPort
+        ${chliveClientCopy}
+        HOST=127.0.0.1 PORT=$port exec bun --hot src/server.ts
       '';
     };
 
@@ -308,8 +323,8 @@ in
       text = ''
         cd "$DNVR_ROOT/web"
         bun install --frozen-lockfile
-        bun x tsc --noEmit
-        exec bun test
+        ${chliveClientCopy}
+        bun x tsc --noEmit && exec bun test
       '';
     };
     token = {
@@ -333,6 +348,26 @@ in
         pkgs.util-linux
       ];
       text = ''exec bash ${./kube-test/kube-test.sh} "$@"'';
+    };
+    push-images = {
+      description = "Push the chart's images and the chart to a registry (ghcr.io/adamchol): push-images [registry], logged in with `skopeo login` and `helm registry login`";
+      runtimeInputs = [
+        pkgs.skopeo
+        pkgs.kubernetes-helm
+      ];
+      text = ''
+        registry=''${1:-ghcr.io/adamchol}
+        cd "$DNVR_ROOT"
+        chart=$(nix build .#chart --no-link --print-out-paths)
+        version=$(sed -n 's/^appVersion: //p' "$chart/Chart.yaml")
+        for image in control chlive web migrations kube-tools rustfs ingest player-vm; do
+          archive=$(nix build ".#$image-image" --no-link --print-out-paths)
+          skopeo copy "docker-archive:$archive" "docker://$registry/dirigent-$image:$version"
+        done
+        out=$(mktemp -d)
+        helm package "$chart" -d "$out"
+        exec helm push "$out"/dirigent-*.tgz "oci://$registry/charts"
+      '';
     };
     e2e = {
       description = "Run the control plane's and the player's tests against the running stack (mock provider)";

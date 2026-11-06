@@ -47,22 +47,21 @@ in
     config.Entrypoint = [ (lib.getExe' chlive "chlive") ];
   };
 
-  # the static UI, served by nginx with the chart's config (it proxies /api and /live)
+  # the UI's Bun server (web/src/server.ts): the app, and its proxies to control and chlive
   web = image "web" {
-    contents = [
-      pkgs.nginx
-      pkgs.fakeNss
-    ];
-    extraCommands = ''
-      mkdir -p srv tmp var/cache/nginx var/log/nginx
-      chmod 1777 tmp var/cache/nginx var/log/nginx
-      ln -s ${web} srv/web
-    '';
-    config.Entrypoint = [
-      (lib.getExe pkgs.nginx)
-      "-g"
-      "daemon off;"
-    ];
+    config = {
+      # its bundle finds its files from the working directory
+      WorkingDir = "${web}";
+      Entrypoint = [
+        (lib.getExe pkgs.bun)
+        "server.js"
+      ];
+      Env = [
+        "HOST=0.0.0.0"
+        "PORT=8080"
+      ];
+      User = "65532";
+    };
   };
 
   # the schema migrations (openmig.toml, db/), run by the chart's hook Jobs

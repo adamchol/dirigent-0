@@ -61,7 +61,18 @@
             buildInputs = old.buildInputs ++ [ pkgs.openssl ];
           });
           dirigent = pkgs.callPackage ./nix/packages/dirigent.nix { };
-          web = pkgs.callPackage ./nix/packages/web.nix { chliveSrc = inputs.chlive; };
+          # chlive's TS client, as the web UI takes it (web/chlive-client): its src/, and wasm/, its
+          # WebAssembly core
+          chliveClient = pkgs.runCommand "chlive-client" { } ''
+            mkdir $out
+            cp -r ${inputs.chlive}/client/src $out/src
+            # TODO: drop the override once chlive pins it: wasm-bindgen's CLI must be its
+            # Cargo.lock's crate
+            cp -r ${
+              inputs'.chlive.packages.chlive-wasm.override { wasm-bindgen-cli = pkgs.wasm-bindgen-cli_0_2_127; }
+            } $out/wasm
+          '';
+          web = pkgs.callPackage ./nix/packages/web.nix { inherit chliveClient; };
           # the chart, with continuous-backup's vendored in (its dependency)
           chart = pkgs.runCommand "dirigent-chart" { } ''
             cp -r ${./chart/dirigent} $out
@@ -129,7 +140,7 @@
               postgresql
               ;
             inherit (inputs) continuous-backup;
-            inherit chlive;
+            inherit chlive chliveClient;
           };
         };
     };

@@ -1,13 +1,11 @@
-# The web UI (web/), built: static files for any web server (the chart's nginx). chlive's client
-# comes from its flake input, copied inside the app so its own imports find the app's
-# node_modules. Its WebAssembly core (client/wasm, built in chlive's shell, not a package of its
-# flake) is a stub that fails to load: the client then only doesn't show inserts before chlive
-# has them.
+# The web UI (web/), built: its Bun server with the app bundled in (web/build.ts), run as
+# `bun server.js`. chlive's client (chliveClient: its src/ and its WebAssembly core) is copied
+# inside the app, where web/tsconfig.json has it, so its own imports find the app's node_modules.
 {
   lib,
   stdenvNoCC,
   bun,
-  chliveSrc,
+  chliveClient,
 }:
 let
   src = lib.fileset.toSource {
@@ -15,9 +13,10 @@ let
     fileset = lib.fileset.unions [
       ../../web/package.json
       ../../web/bun.lock
-      ../../web/index.html
+      ../../web/bunfig.toml
       ../../web/tsconfig.json
-      ../../web/vite.config.ts
+      ../../web/build.ts
+      ../../web/wasm-url.ts
       ../../web/src
     ];
   };
@@ -36,7 +35,7 @@ let
     installPhase = "cp -r node_modules $out";
     outputHashMode = "recursive";
     outputHashAlgo = "sha256";
-    outputHash = "sha256-udPbPi5sxMsMzS8CsoCVAIDTbvrAfPtyEmPikudtEBM=";
+    outputHash = "sha256-s7Lozn5DBVbdbyZtvV1fj+ouVrwdshH6PEJ1fbrs5K4=";
   };
 in
 stdenvNoCC.mkDerivation {
@@ -49,15 +48,8 @@ stdenvNoCC.mkDerivation {
     cp -r ${nodeModules} node_modules
     chmod -R u+w node_modules
     patchShebangs node_modules
-    mkdir chlive-client
-    cp -r ${chliveSrc}/client/src chlive-client/src
-    mkdir chlive-client/wasm
-    cat > chlive-client/wasm/chlive_wasm.js <<'EOF'
-    export default async function init() {
-      throw new Error("chlive-core isn't in this build");
-    }
-    EOF
-    CHLIVE_CLIENT=$PWD/chlive-client bun node_modules/vite/bin/vite.js build
+    cp -r --no-preserve=mode ${chliveClient} chlive-client
+    bun build.ts
   '';
   installPhase = "cp -r dist $out";
 }

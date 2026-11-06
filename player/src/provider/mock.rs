@@ -62,6 +62,19 @@ pub struct MockProvider {
     scripts: Mutex<VecDeque<Script>>,
     requests: Mutex<Vec<Request>>,
     calls: Mutex<u64>,
+    /// Text replies go on after their first line with paragraphs of random
+    /// length (`--mock`: something to watch stream); not in tests.
+    long: bool,
+}
+
+impl MockProvider {
+    /// The player's `--mock`: long replies.
+    pub fn long() -> Self {
+        MockProvider {
+            long: true,
+            ..Default::default()
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // scripting/inspection are test-only
@@ -90,7 +103,7 @@ impl Provider for MockProvider {
             *c
         };
         let script = self.scripts.lock().unwrap().pop_front();
-        let script = script.unwrap_or_else(|| echo(req, n));
+        let script = script.unwrap_or_else(|| echo(req, n, self.long));
         match script {
             Script::Deltas { delay, deltas } => {
                 tokio::time::sleep(delay).await;
@@ -114,9 +127,9 @@ impl Provider for MockProvider {
 }
 
 /// Fallback when no script is queued (`--mock` demos): echo the latest user
-/// text after a short delay, run `Bash` for text starting with `!`, or call
-/// any tool for `!!<tool> <json input>`.
-fn echo(req: &Request, n: u64) -> Script {
+/// text after a short delay, run `Bash` for text starting with `!`, call any
+/// tool for `!!<tool> <json input>`, or stream a longer reply for `?demo`.
+fn echo(req: &Request, n: u64, long: bool) -> Script {
     let delay = Duration::from_millis(300);
     let Some(last) = req
         .messages
@@ -124,7 +137,7 @@ fn echo(req: &Request, n: u64) -> Script {
         .rev()
         .find(|m| m.role == super::Role::User)
     else {
-        return streamed(&format!("mock reply #{n}"), delay);
+        return streamed(&format!("mock reply #{n}"), delay, long);
     };
     // The newest text block is the latest prompt (an aborted turn can leave
     // tool results and a marker in the same user message).
@@ -137,6 +150,9 @@ fn echo(req: &Request, n: u64) -> Script {
             _ => None,
         })
         .unwrap_or_default();
+    if text.trim() == "?demo" {
+        return demo(delay);
+    }
     let call = if let Some(call) = text.trim().strip_prefix("!!") {
         let (name, input) = call.split_once(char::is_whitespace).unwrap_or((call, "{}"));
         let input = serde_json::from_str(input.trim())
@@ -183,34 +199,216 @@ fn echo(req: &Request, n: u64) -> Script {
         } else {
             format!("mock reply #{n}: ran it, and you said: {text}")
         };
-        return streamed(&reply, delay);
+        return streamed(&reply, delay, long);
     }
-    streamed(&format!("mock reply #{n} to: {text}"), delay)
+    streamed(&format!("mock reply #{n} to: {text}"), delay, long)
 }
 
 /// A text reply streamed word by word.
-fn streamed(text: &str, delay: Duration) -> Script {
+fn streamed(text: &str, delay: Duration, long: bool) -> Script {
+    let mut rng = Rng::seeded();
+    let text = if long {
+        format!("{text}\n\n{}", lorem(&mut rng))
+    } else {
+        text.to_string()
+    };
     let mut deltas = vec![Delta::BlockStart {
         index: 0,
         block: ContentBlock::Text {
             text: String::new(),
         },
     }];
-    deltas.extend(text.split_inclusive(' ').map(|word| Delta::Text {
-        index: 0,
-        text: word.to_string(),
-    }));
+    // long: a few words at a time, as a model's tokens come
+    let words: Vec<&str> = text.split_inclusive([' ', '\n']).collect();
+    let mut i = 0;
+    while i < words.len() {
+        let take = if long { 1 + rng.below(3) } else { 1 };
+        let piece = words[i..(i + take).min(words.len())].concat();
+        deltas.push(Delta::Text {
+            index: 0,
+            text: piece,
+        });
+        i += take;
+    }
     deltas.push(Delta::BlockStop { index: 0 });
     deltas.push(Delta::Usage(Usage {
         input: 10,
-        output: 5,
+        // long: about as many tokens as words
+        output: if long { words.len() as u64 } else { 5 },
         cache_read: 0,
         cache_write: 0,
     }));
     deltas.push(Delta::Stop(StopReason::EndTurn));
     Script::Paced {
         delay,
-        gap: Duration::from_millis(50),
+        gap: Duration::from_millis(if long { 35 } else { 50 }),
         deltas,
+    }
+}
+
+/// `?demo`: a reply worth watching stream, thinking and then Markdown with
+/// code, a few characters at a time.
+fn demo(delay: Duration) -> Script {
+    const THINKING: &str = "The user wants to see a reply stream. I'll think for a moment, then \
+        answer with a list and some code, so every part of the timeline shows.";
+    const TEXT: &str = "Here's what a streamed reply looks like:\n\n\
+        - **Thinking** shows first, its latest lines fading in above\n\
+        - then the text, as *Markdown*, piece by piece\n\
+        - and code, highlighted as it comes:\n\n\
+        ```rust\nfn main() {\n    for n in 1..=3 {\n        println!(\"turn {n}\");\n    }\n}\n```\n\n\
+        Once the reply is whole, it takes the streamed one's place.";
+    let pieces = |text: &'static str| {
+        text.split_inclusive([' ', '\n'])
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let mut deltas = vec![Delta::BlockStart {
+        index: 0,
+        block: ContentBlock::Thinking {
+            text: String::new(),
+            provider_data: serde_json::Value::Null,
+        },
+    }];
+    deltas.extend(
+        pieces(THINKING)
+            .into_iter()
+            .map(|text| Delta::Thinking { index: 0, text }),
+    );
+    deltas.push(Delta::BlockStop { index: 0 });
+    deltas.push(Delta::BlockStart {
+        index: 1,
+        block: ContentBlock::Text {
+            text: String::new(),
+        },
+    });
+    deltas.extend(
+        pieces(TEXT)
+            .into_iter()
+            .map(|text| Delta::Text { index: 1, text }),
+    );
+    deltas.push(Delta::BlockStop { index: 1 });
+    deltas.push(Delta::Usage(Usage {
+        input: 40,
+        output: 120,
+        cache_read: 0,
+        cache_write: 0,
+    }));
+    deltas.push(Delta::Stop(StopReason::EndTurn));
+    Script::Paced {
+        delay,
+        gap: Duration::from_millis(60),
+        deltas,
+    }
+}
+
+/// A few paragraphs of Lorem ipsum, of random number and length, now and
+/// then with a list: a long reply's body.
+fn lorem(rng: &mut Rng) -> String {
+    const WORDS: &[&str] = &[
+        "lorem",
+        "ipsum",
+        "dolor",
+        "sit",
+        "amet",
+        "consectetur",
+        "adipiscing",
+        "elit",
+        "sed",
+        "do",
+        "eiusmod",
+        "tempor",
+        "incididunt",
+        "ut",
+        "labore",
+        "et",
+        "dolore",
+        "magna",
+        "aliqua",
+        "enim",
+        "ad",
+        "minim",
+        "veniam",
+        "quis",
+        "nostrud",
+        "exercitation",
+        "ullamco",
+        "laboris",
+        "nisi",
+        "aliquip",
+        "ex",
+        "ea",
+        "commodo",
+        "consequat",
+        "duis",
+        "aute",
+        "irure",
+        "in",
+        "reprehenderit",
+        "voluptate",
+        "velit",
+        "esse",
+        "cillum",
+        "fugiat",
+        "nulla",
+        "pariatur",
+        "excepteur",
+        "sint",
+        "occaecat",
+        "cupidatat",
+        "non",
+        "proident",
+        "sunt",
+        "culpa",
+        "qui",
+        "officia",
+        "deserunt",
+        "mollit",
+        "anim",
+        "id",
+        "est",
+        "laborum",
+    ];
+    let sentence = |rng: &mut Rng, min: usize, max: usize| {
+        let n = min + rng.below(max - min + 1);
+        let words: Vec<&str> = (0..n).map(|_| WORDS[rng.below(WORDS.len())]).collect();
+        let s = words.join(" ");
+        let mut c = s.chars();
+        c.next()
+            .map(|f| f.to_uppercase().chain(c).collect::<String>())
+            .unwrap_or_default()
+    };
+    let mut parts = Vec::new();
+    for _ in 0..1 + rng.below(4) {
+        let sentences: Vec<String> = (0..2 + rng.below(4))
+            .map(|_| format!("{}.", sentence(rng, 6, 16)))
+            .collect();
+        parts.push(sentences.join(" "));
+        if rng.below(4) == 0 {
+            let items: Vec<String> = (0..2 + rng.below(3))
+                .map(|_| format!("- {}", sentence(rng, 3, 8)))
+                .collect();
+            parts.push(items.join("\n"));
+        }
+    }
+    parts.join("\n\n")
+}
+
+/// A small xorshift generator: the mock's randomness needs no quality.
+struct Rng(u64);
+
+impl Rng {
+    fn seeded() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.as_nanos() as u64);
+        Rng(nanos | 1)
+    }
+
+    /// A number in `0..n`.
+    fn below(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % n as u64) as usize
     }
 }

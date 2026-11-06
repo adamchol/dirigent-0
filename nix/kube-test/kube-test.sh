@@ -30,6 +30,9 @@ up() {
     setsid k3s server --data-dir "$dir/data" --write-kubeconfig "$KUBECONFIG" \
       --write-kubeconfig-mode 600 --disable traefik --disable metrics-server \
       --node-name dirigent-test --cluster-cidr 10.42.0.0/16 --service-cidr 10.43.0.0/16 \
+      `# a dev machine's disk: images loaded here can't be pulled again, so they're kept` \
+      --kubelet-arg=image-gc-high-threshold=98 --kubelet-arg=image-gc-low-threshold=97 \
+      --kubelet-arg='eviction-hard=nodefs.available<2%,imagefs.available<2%' \
       >"$dir/k3s.log" 2>&1 </dev/null &
     echo $! >"$dir/k3s.pid"
   fi

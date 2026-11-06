@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { timeline, type EventRow } from "./events.ts";
+import { callStart, streamed, timeline, type EventRow } from "./events.ts";
 
 let offset = 0;
 function row(id: string, kind: string, data?: unknown, author = "player:p"): EventRow {
@@ -82,8 +82,8 @@ test("failures are errors, and an unreadable row doesn't stop the rest", () => {
   const bad = { ...row("x", "user_message"), data: "{" };
   const t = timeline([bad, row("f", "player_failed", { epoch: 1, error: "no clone" })]);
   expect(t.items).toEqual([
-    { t: "note", key: "x", tone: "error", text: "unreadable user_message event", detail: "{" },
-    { t: "note", key: "f", tone: "error", text: "player failed: no clone", detail: undefined },
+    { t: "note", key: "x", kind: "user_message", tone: "error", text: "unreadable user_message event", detail: "{" },
+    { t: "note", key: "f", kind: "player_failed", tone: "error", text: "player failed: no clone", detail: undefined },
   ]);
 });
 
@@ -102,4 +102,33 @@ test("a dirigent's message says via whom, and a session update is an input a tur
   expect(t.items[0]).toMatchObject({ t: "user", via: "d1", queued: true });
   expect(t.items[1]).toMatchObject({ t: "update", session: "s2", what: "turn completed", reply: "done", queued: false });
   expect(t.items[2]).toMatchObject({ t: "update", what: "stopped", queued: true });
+});
+
+test("deltas make the reply being written; its call starts after the last boundary", () => {
+  const d = (delta: unknown, offset: number) => ({ offset, id: `d${offset}`, data: JSON.stringify({ delta }) });
+  const blocks = streamed([
+    d({ type: "block_start", index: 0, block: { type: "thinking", text: "" } }, 10),
+    d({ type: "thinking", index: 0, text: "hm, " }, 11),
+    d({ type: "thinking", index: 0, text: "ok" }, 12),
+    d({ type: "block_start", index: 1, block: { type: "text", text: "" } }, 13),
+    d({ type: "text", index: 1, text: "Hello " }, 14),
+    d({ type: "text", index: 1, text: "there" }, 15),
+    d({ type: "block_start", index: 2, block: { type: "tool_call", id: "c", name: "Bash", input: {} } }, 16),
+    d({ type: "tool_call_args", index: 2, json: '{"command": "l' }, 17),
+    d({ type: "tool_call_args", index: 2, json: '{"command": "ls"}' }, 18),
+    d({ type: "usage", input: 1, output: 1, cache_read: 0, cache_write: 0 }, 19),
+  ]);
+  expect(blocks).toEqual([
+    { t: "thinking", key: "stream:0", text: "hm, ok" },
+    { t: "text", key: "stream:1", text: "Hello there" },
+    { t: "tool", key: "stream:2", name: "Bash", input: { command: "ls" } },
+  ]);
+
+  offset = 0;
+  const rows = [
+    row("m", "user_message", { text: "hi" }, "user:dev"),
+    row("t", "turn_started", { input: "m" }),
+    row("u", "user_message", { text: "and" }, "user:dev"),
+  ];
+  expect(callStart(rows)).toBe(1);
 });

@@ -33,6 +33,10 @@ period to finish its turn, checkpoint and hand the session over: it isn't migrat
   (dict "name" "dirigent" "cloudInitNoCloud" (dict "userData" (join "\n" $env)))
   (dict "name" "work" "emptyDisk" (dict "capacity" .Values.player.workspaceSize))
 }}
+{{- /* KubeVirt takes one, for the VM's image */}}
+{{- with .Values.images.pullSecrets }}
+{{- $_ := set (index $volumes 0).containerDisk "imagePullSecret" (first .) }}
+{{- end }}
 {{- range $i, $s := $secrets }}
 {{- $disks = append $disks (dict "name" (printf "secret%d" $i) "serial" (printf "dirigent-secret%d" $i) "disk" (dict "bus" "virtio")) }}
 {{- $volumes = append $volumes (dict "name" (printf "secret%d" $i) "secret" (dict "secretName" $s)) }}

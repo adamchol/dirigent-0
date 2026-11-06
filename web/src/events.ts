@@ -85,7 +85,7 @@ export type Item =
   | { t: "tool"; key: string; name: string; input: unknown; result?: { content: string; isError: boolean } }
   | { t: "turn"; key: string; reason: string; interrupted: boolean; usage: Usage }
   /** Anything else: `dim` for the player's own doings, `error` for failures. */
-  | { t: "note"; key: string; tone: "dim" | "error"; text: string; detail?: string };
+  | { t: "note"; key: string; kind: string; tone: "dim" | "error"; text: string; detail?: string };
 
 export interface Timeline {
   items: Item[];
@@ -115,15 +115,15 @@ export function timeline(rows: readonly EventRow[]): Timeline {
   const tools = new Map<string, Extract<Item, { t: "tool" }>>();
   let openTurn: string | undefined;
   let usage = NO_USAGE;
-  const note = (key: string, tone: "dim" | "error", text: string, detail?: string) =>
-    items.push({ t: "note", key, tone, text, detail });
+  const note = (row: EventRow, tone: "dim" | "error", text: string, detail?: string) =>
+    items.push({ t: "note", key: row.id, kind: row.kind, tone, text, detail });
 
   for (const row of rows) {
     let e: Event;
     try {
       e = parse(row);
     } catch {
-      note(row.id, "error", `unreadable ${row.kind} event`, row.data);
+      note(row, "error", `unreadable ${row.kind} event`, row.data);
       continue;
     }
     switch (e.kind) {
@@ -202,49 +202,49 @@ export function timeline(rows: readonly EventRow[]): Timeline {
         openTurn = undefined;
         break;
       case "model_cancelled":
-        note(row.id, "dim", "model call cancelled");
+        note(row, "dim", "model call cancelled");
         break;
       case "error":
         if (e.data.retry_in_ms !== undefined)
-          note(row.id, "dim", `model error, retrying in ${(e.data.retry_in_ms / 1000).toFixed(1)}s`, e.data.message);
-        else if (e.data.compact) note(row.id, "dim", "context too long, compacting", e.data.message);
-        else note(row.id, "error", `model error: ${e.data.message}`);
+          note(row, "dim", `model error, retrying in ${(e.data.retry_in_ms / 1000).toFixed(1)}s`, e.data.message);
+        else if (e.data.compact) note(row, "dim", "context too long, compacting", e.data.message);
+        else note(row, "error", `model error: ${e.data.message}`);
         break;
       case "compacted":
-        note(row.id, "dim", "context compacted", e.data.summary);
+        note(row, "dim", "context compacted", e.data.summary);
         break;
       case "compaction_failed":
-        note(row.id, "error", `compaction failed: ${e.data.message}`);
+        note(row, "error", `compaction failed: ${e.data.message}`);
         break;
       case "player_attached":
-        note(row.id, "dim", `${row.author} attached (epoch ${e.data.epoch})`);
+        note(row, "dim", `${subject(row.author)} attached (epoch ${e.data.epoch})`);
         break;
       case "player_detached":
-        note(row.id, "dim", `${row.author} detached (epoch ${e.data.epoch})`);
+        note(row, "dim", `${subject(row.author)} detached (epoch ${e.data.epoch})`);
         // a stopped player's open turn won't end
         openTurn = undefined;
         break;
       case "player_failed":
-        note(row.id, "error", `player failed: ${e.data.error}`);
+        note(row, "error", `player failed: ${e.data.error}`);
         openTurn = undefined;
         break;
       case "workspace_ready": {
         const from = e.data.source ? `${e.data.source.git.url}${e.data.source.git.ref ? `@${e.data.source.git.ref}` : ""}` : "empty";
         const head = e.data.head ? ` at ${e.data.head.slice(0, 12)}` : "";
-        note(row.id, e.data.recreated ? "error" : "dim", `workspace ${e.data.recreated ? "recreated (changes lost)" : "ready"}: ${from}${head}`);
+        note(row, e.data.recreated ? "error" : "dim", `workspace ${e.data.recreated ? "recreated (changes lost)" : "ready"}: ${from}${head}`);
         break;
       }
       case "workspace_restored":
-        note(row.id, "dim", `workspace restored from ${e.data.snapshot.slice(0, 12)}`);
+        note(row, "dim", `workspace restored from ${e.data.snapshot.slice(0, 12)}`);
         break;
       case "checkpoint":
-        note(row.id, "dim", `checkpoint ${e.data.snapshot.slice(0, 12)}`);
+        note(row, "dim", `checkpoint ${e.data.snapshot.slice(0, 12)}`);
         break;
       case "checkpoint_failed":
-        note(row.id, "error", `checkpoint failed: ${e.data.error}`);
+        note(row, "error", `checkpoint failed: ${e.data.error}`);
         break;
       default:
-        note(row.id, "dim", (e as { kind: string }).kind);
+        note(row, "dim", (e as { kind: string }).kind);
     }
   }
   return { items, openTurn };
@@ -253,4 +253,112 @@ export function timeline(rows: readonly EventRow[]): Timeline {
 function taken(users: Map<string, { queued: boolean }>, input: string) {
   const u = users.get(input);
   if (u) u.queued = false;
+}
+
+/** A subject, short: a player's id cut to its first part (`player:7f6bc753`). */
+function subject(s: string): string {
+  const m = /^(player:[0-9a-f]{8})-[0-9a-f-]+$/.exec(s);
+  return m ? m[1]! : s;
+}
+
+/** The model call running's streaming pieces (`model_delta`, which `LOG_QUERY` leaves out): the
+ * session's deltas after `after`, the offset of the log's last row before that call began
+ * (`callStart`). */
+export const DELTAS_QUERY =
+  "select offset, id, data from session_events " +
+  "where session_id = {session:UUID} and kind = 'model_delta' and offset > {after:UInt64} " +
+  "order by offset";
+
+export interface DeltaRow {
+  offset: string | number;
+  id: string;
+  /** `{"delta": …}`: protocol/src/lib.rs, `Delta`. */
+  data: string;
+}
+
+/** What ends a model call, or starts one: the deltas after the last of these are the running
+ * call's (a retried call's start over after its error). */
+const CALL_BOUNDARIES = new Set([
+  "turn_started",
+  "assistant_message",
+  "model_cancelled",
+  "error",
+  "turn_ended",
+  "player_attached",
+]);
+
+/** The offset the running model call's deltas come after. */
+export function callStart(rows: readonly EventRow[]): number {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i]!;
+    if (CALL_BOUNDARIES.has(row.kind)) return Number(row.offset);
+  }
+  return 0;
+}
+
+/** A block of the reply being written, as its deltas have it so far. */
+export type Streamed =
+  | { t: "text"; key: string; text: string }
+  | { t: "thinking"; key: string; text: string }
+  /** `input` as far as its arguments parse yet. */
+  | { t: "tool"; key: string; name: string; input: unknown };
+
+type Delta =
+  | { type: "block_start"; index: number; block: { type: string; text?: string; name?: string; input?: unknown } }
+  | { type: "text" | "thinking"; index: number; text: string }
+  | { type: "tool_call_args"; index: number; json: string }
+  | { type: string; index?: number };
+
+/** The deltas, in order, as the blocks they make. */
+export function streamed(rows: readonly DeltaRow[]): Streamed[] {
+  const blocks: (Streamed | undefined)[] = [];
+  for (const row of rows) {
+    let d: Delta;
+    try {
+      d = JSON.parse(row.data).delta;
+    } catch {
+      continue;
+    }
+    const key = `stream:${d.index}`;
+    if (d.type === "block_start" && "block" in d) {
+      const b = d.block;
+      blocks[d.index] =
+        b.type === "text"
+          ? { t: "text", key, text: b.text ?? "" }
+          : b.type === "thinking"
+            ? { t: "thinking", key, text: b.text ?? "" }
+            : b.type === "tool_call"
+              ? { t: "tool", key, name: b.name ?? "", input: b.input }
+              : undefined;
+    } else if ((d.type === "text" || d.type === "thinking") && "text" in d) {
+      const b = blocks[d.index];
+      if (b && b.t === d.type) b.text += d.text;
+    } else if (d.type === "tool_call_args" && "json" in d) {
+      const b = blocks[d.index];
+      if (b?.t === "tool") {
+        try {
+          b.input = JSON.parse(d.json);
+        } catch {
+          // not whole yet: the last that parsed stays
+        }
+      }
+    }
+  }
+  return blocks.filter((b): b is Streamed => b !== undefined);
+}
+
+/** Each session's latest event (its streaming deltas aside), of those the user may read: how
+ * recently it was active. */
+export const ACTIVITY_QUERY =
+  "select session_id, max(ts) as last from session_events where kind != 'model_delta' group by session_id";
+
+export interface ActivityRow {
+  session_id: string;
+  last: string | Date;
+}
+
+/** A row's timestamp (the client's parsed one, or ClickHouse's DateTime64 text, UTC) in
+ * milliseconds since the Unix epoch; NaN if it isn't one. */
+export function millis(ts: string | Date): number {
+  return ts instanceof Date ? ts.getTime() : Date.parse(ts.includes("T") ? ts : `${ts.replace(" ", "T")}Z`);
 }
