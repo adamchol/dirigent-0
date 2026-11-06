@@ -23,11 +23,6 @@ data:
     [kafka]
     brokers = {{ .Values.kafka.bootstrapServers | quote }}
 
-    [kafka.properties]
-    {{- range $k, $v := .Values.kafka.properties }}
-    {{ $k | quote }} = {{ toString $v | quote }}
-    {{- end }}
-
     [pause_server]
     url = {{ include "dirigent.pauseServerUrl" . | quote }}
 
@@ -90,3 +85,9 @@ data:
       { column = "session_id", provider = "pg", grants = "SELECT session_id FROM session_access WHERE subject = {subject:String} AND role IN ('owner', 'player')" },
       { column = "kind", provider = "pg", grants = "SELECT kind FROM insert_kinds WHERE subject = {subject:String}" },
     ]
+
+    # last: the Secret's properties (kafka.existingSecret) are added after these at start
+    [kafka.properties]
+    {{- range $k, $v := .Values.kafka.properties }}
+    {{ $k | quote }} = {{ toString $v | quote }}
+    {{- end }}

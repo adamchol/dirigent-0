@@ -9,6 +9,7 @@
   web,
   chlive,
   openmig,
+  continuous-backup,
   version,
 }:
 let
@@ -81,6 +82,51 @@ in
     '';
     config.WorkingDir = "/dirigent";
   };
+
+  # continuous-backup's ingestion (Kafka Connect with the ClickHouse sink, and the pause server),
+  # as its own image, which isn't published yet: the chart's ingestion.connect.image
+  ingest =
+    let
+      backup = (pkgs.callPackage "${continuous-backup}/nix/backup.nix" { }).overrideAttrs (_: {
+        doCheck = false;
+      });
+      connector = pkgs.callPackage "${continuous-backup}/nix/clickhouse-kafka-connect.nix" { };
+    in
+    image "ingest" {
+      contents = pkgs.buildEnv {
+        name = "connect-runtime";
+        paths = with pkgs; [
+          apacheKafka
+          jre
+          bash
+          coreutils
+          curl
+          jq
+          dockerTools.caCertificates
+          backup
+          connector
+        ];
+        pathsToLink = [
+          "/bin"
+          "/lib"
+          "/plugins"
+          "/etc"
+        ];
+      };
+      extraCommands = "mkdir -p tmp && chmod 1777 tmp";
+      config = {
+        Cmd = [
+          "${pkgs.apacheKafka}/bin/connect-distributed.sh"
+          "/etc/durable-clickhouse/connect-distributed.properties"
+        ];
+        User = "65532:65532";
+        Env = [
+          "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+          # Kafka Connect's default heap is 2 GiB
+          "KAFKA_HEAP_OPTS=-Xms128M -Xmx512M"
+        ];
+      };
+    };
 
   # the chart's RustFS (checkpoints.rustfs.enabled), instead of your S3
   rustfs = image "rustfs" {

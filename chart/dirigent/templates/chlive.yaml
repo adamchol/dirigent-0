@@ -35,11 +35,40 @@ spec:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/chlive-config.yaml") . | sha256sum }}
     spec:
+      initContainers:
+        # chlive starts only with every issuer's keys: control's first
+        - name: control-keys
+          image: {{ include "dirigent.image" (list . "kube-tools") }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["bash", "-c"]
+          args:
+            - timeout 900 bash -c 'until curl -fsS -o /dev/null http://dirigent-control:8090/.well-known/jwks.json; do sleep 2; done'
+      {{- if .Values.kafka.existingSecret }}
+        # the Kafka credentials (librdkafka properties, e.g. sasl.password) join the config here, so
+        # they're only ever in the Secret
+        - name: kafka-properties
+          image: {{ include "dirigent.image" (list . "kube-tools") }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["bash", "-euo", "pipefail", "-c"]
+          args:
+            - |
+              cp /etc/chlive/chlive.toml /run/chlive/chlive.toml
+              while IFS= read -r line || [ -n "$line" ]; do
+                line=${line%$'\r'}
+                case "$line" in ''|'#'*|'!'*) continue ;; esac
+                key=${line%%=*}; value=${line#*=}
+                printf '%s = %s\n' "$(jq -Rn --arg s "$key" '$s | gsub("^\\s+|\\s+$"; "")')" "$(jq -Rn --arg s "$value" '$s | sub("^\\s+"; "")')"
+              done < /etc/kafka/client.properties >> /run/chlive/chlive.toml
+          volumeMounts:
+            - { name: config, mountPath: /etc/chlive, readOnly: true }
+            - { name: kafka, mountPath: /etc/kafka, readOnly: true }
+            - { name: run, mountPath: /run/chlive }
+      {{- end }}
       containers:
         - name: chlive
           image: {{ include "dirigent.image" (list . "chlive") }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
-          args: [--config, /etc/chlive/chlive.toml]
+          args: [--config, {{ ternary "/run/chlive/chlive.toml" "/etc/chlive/chlive.toml" (not (empty .Values.kafka.existingSecret)) }}]
           env:
             - name: CHLIVE_RO_PASSWORD
               valueFrom: { secretKeyRef: { name: dirigent-clickhouse, key: chlive_ro } }
@@ -58,8 +87,20 @@ spec:
           volumeMounts:
             - { name: config, mountPath: /etc/chlive, readOnly: true }
             - { name: cache, mountPath: /var/cache/chlive }
+            {{- if .Values.kafka.existingSecret }}
+            - { name: run, mountPath: /run/chlive, readOnly: true }
+            {{- end }}
       volumes:
         - name: config
           configMap: { name: dirigent-chlive }
         - name: cache
           emptyDir: { sizeLimit: {{ .Values.chlive.cacheSize }} }
+        {{- with .Values.kafka.existingSecret }}
+        - name: kafka
+          secret:
+            secretName: {{ . }}
+            items:
+              - { key: {{ $.Values.kafka.propertiesKey }}, path: client.properties }
+        - name: run
+          emptyDir: { medium: Memory }
+        {{- end }}

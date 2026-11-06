@@ -42,9 +42,14 @@ clickhouse:
 # Yours, required.
 kafka:
   bootstrapServers: ""
-  # librdkafka properties for chlive (e.g. security.protocol); the ingestion's are its own
-  # (ingestion.kafka.existingSecret)
+  # librdkafka properties for chlive, not secret (e.g. security.protocol)
   properties: {}
+  # A Secret with chlive's secret ones, a properties file (key=value lines, e.g.
+  # sasl.username, sasl.password). The ingestion has its own (ingestion.kafka.existingSecret);
+  # one Secret can serve both, its `client.properties` for Kafka Connect, its
+  # `librdkafka.properties` for chlive.
+  existingSecret: ""
+  propertiesKey: librdkafka.properties
 
 # The workspaces' checkpoints: a kopia repository in S3.
 checkpoints:

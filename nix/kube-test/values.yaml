@@ -1,0 +1,53 @@
+# The chart on the test cluster (nix/kube-test): the images loaded into k3s, the stand-ins'
+# ClickHouse and Kafka, RustFS, mock players, small everything.
+images:
+  registry: docker.io/library
+  pullPolicy: Never
+auth:
+  mode: declared
+clickhouse:
+  host: clickhouse
+  port: 8123
+  secure: false
+  adminSecret: clickhouse-admin
+kafka:
+  bootstrapServers: redpanda:9092
+checkpoints:
+  rustfs:
+    enabled: true
+    storage: 2Gi
+postgres:
+  storage: 1Gi
+player:
+  mock: true
+  cpu: 1
+  memory: 1Gi
+  workspaceSize: 2Gi
+  stopGrace: 120
+  checkpointMargin: 60
+chlive:
+  cacheSize: 1Gi
+ingestion:
+  kafka:
+    bootstrapServers: redpanda:9092
+    replicationFactor: 1
+    internalTopicReplicationFactor: 1
+  clickhouse:
+    host: clickhouse
+    port: 8123
+    secure: false
+  connect:
+    image:
+      repository: docker.io/library/dirigent-ingest
+      tag: 0.1.0
+      pullPolicy: Never
+    replicas: 1
+    errors:
+      deadLetterQueue:
+        replicationFactor: 1
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { memory: 1Gi }
+  pauseServer:
+    replicas: 1
+    keeperAddress: clickhouse:9181

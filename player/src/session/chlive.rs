@@ -404,12 +404,22 @@ mod e2e {
         session: &str,
         done: impl Fn(&[EventRow]) -> bool,
     ) -> Vec<EventRow> {
+        log_within(stack, session, Duration::from_secs(60), done).await
+    }
+
+    /// The same, within `within`.
+    async fn log_within(
+        stack: &Stack,
+        session: &str,
+        within: Duration,
+        done: impl Fn(&[EventRow]) -> bool,
+    ) -> Vec<EventRow> {
         let client = client(stack, USER);
         let mut rows = client
             .query(LOG_QUERY)
             .param("session", session)
             .rows::<EventRow>();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + within;
         let mut last = Vec::new();
         loop {
             match tokio::time::timeout_at(deadline.into(), rows.next()).await {
@@ -910,5 +920,98 @@ mod e2e {
         );
         assert_eq!(std::fs::read_to_string(dir.join("file")).unwrap(), "main\n");
         second.stop().await;
+    }
+
+    /// The chart on the test cluster (`kube-test e2e`, which forwards control's and chlive's
+    /// ports): players in KubeVirt VMs, started by control; skipped unless `DIRIGENT_KUBE_E2E` is set.
+    fn kube_stack() -> Option<Stack> {
+        std::env::var_os("DIRIGENT_KUBE_E2E")?;
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name}"));
+        Some(Stack {
+            chlive: var("CHLIVE_URL"),
+            control: var("DIRIGENT_CONTROL_HTTP"),
+            control_ws: String::new(),
+            kopia: String::new(),
+        })
+    }
+
+    /// kubectl on the test cluster, in its namespace; its output.
+    fn kubectl(args: &[&str]) -> String {
+        let out = std::process::Command::new("kubectl")
+            .args(["-n", "dirigent"])
+            .args(args)
+            .output()
+            .expect("kubectl");
+        assert!(
+            out.status.success(),
+            "kubectl {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// The session's VMs, by name.
+    fn vms(session: &str) -> Vec<String> {
+        let label = format!("dirigent.dev/session={session}");
+        kubectl(&["get", "vmi", "-l", &label, "-o", "name"])
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn kube_e2e_a_player_in_a_vm_finishes_its_turn_when_the_vm_goes_and_hands_over() {
+        let Some(stack) = kube_stack() else { return };
+        let session = put_session(&stack, serde_json::json!({ "start": true })).await;
+        let user = User::new(&stack, &session);
+        // a turn that outlasts the VM: it's deleted while the command runs
+        user.say("!sleep 20 && echo slept > note.txt").await;
+        let boot = Duration::from_secs(300);
+        log_within(&stack, &session, boot, |r| {
+            r.iter().any(|r| r.kind == "assistant_message")
+        })
+        .await;
+        let [vm] = &vms(&session)[..] else {
+            panic!("{:?}", vms(&session))
+        };
+        kubectl(&["delete", vm, "--wait=false"]);
+
+        // the turn finished, was checkpointed, and the next player came, in a new VM
+        let log = log_within(&stack, &session, boot, |r| attached(r) == [1, 2]).await;
+        assert_eq!(
+            kinds(&log),
+            [
+                "user:!sleep 20 && echo slept > note.txt",
+                "turn_started",
+                "assistant:+tool",
+                "tool:ok",
+                "assistant:mock reply #2: ran it",
+                "end:Completed",
+                "player_detached",
+            ]
+        );
+
+        // its workspace is the first's, restored from the checkpoint
+        user.say("!cat note.txt").await;
+        let log = log_within(&stack, &session, boot, |r| turns_ended(r) == 2).await;
+        let read = log.iter().rev().find(|r| r.kind == "tool_result").unwrap();
+        assert!(read.data.contains("slept"), "{}", read.data);
+
+        // stopped, its VM powers off and control clears it away
+        let stop = api(
+            &stack,
+            reqwest::Method::POST,
+            &format!("/sessions/{session}/stop"),
+        );
+        assert!(stop.send().await.unwrap().status().is_success());
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while !vms(&session).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the VMs stay: {:?}",
+                vms(&session)
+            );
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
     }
 }

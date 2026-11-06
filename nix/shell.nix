@@ -324,6 +324,16 @@ in
         curl -fsS -X POST "$DIRIGENT_CONTROL_HTTP/token" "''${caller[@]}" | jq -r .token
       '';
     };
+    kube-test = {
+      description = "The chart on a test cluster here (k3s, KubeVirt, CloudNativePG; mock players): kube-test up|install|load|down|kubectl …, see nix/kube-test/kube-test.sh";
+      runtimeInputs = [
+        pkgs.k3s
+        pkgs.kubernetes-helm
+        pkgs.curl
+        pkgs.util-linux
+      ];
+      text = ''exec bash ${./kube-test/kube-test.sh} "$@"'';
+    };
     e2e = {
       description = "Run the control plane's and the player's tests against the running stack (mock provider)";
       runtimeInputs = [ dnvrState ];

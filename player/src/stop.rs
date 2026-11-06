@@ -19,16 +19,20 @@ pub struct Stop {
 }
 
 /// Control's word (`control`, the lease's `detach`), with `signals` from outside, cutting the
-/// turn `grace` after the first.
+/// turn `grace` after the first (or after the start, `stopped` by one already).
 pub fn watch(
     mut control: watch::Receiver<Option<bool>>,
     mut signals: mpsc::Receiver<()>,
     grace: Duration,
+    stopped: bool,
 ) -> Stop {
     let (when_tx, when) = watch::channel(*control.borrow_and_update());
-    let (outside_tx, outside) = watch::channel(false);
+    let (outside_tx, outside) = watch::channel(stopped);
+    if stopped {
+        stop(&when_tx, Some(false));
+    }
     tokio::spawn(async move {
-        let mut cut: Option<Pin<Box<Sleep>>> = None;
+        let mut cut: Option<Pin<Box<Sleep>>> = stopped.then(|| Box::pin(tokio::time::sleep(grace)));
         let (mut from_control, mut from_outside) = (true, true);
         loop {
             tokio::select! {
@@ -109,7 +113,7 @@ mod tests {
     async fn from_outside_the_turn_may_finish_until_the_grace_period_is_up() {
         let (_control, detach) = watch::channel(None);
         let (signal, signals) = mpsc::channel(4);
-        let stop = watch(detach, signals, Duration::from_secs(60));
+        let stop = watch(detach, signals, Duration::from_secs(60), false);
         settle().await;
         assert_eq!((*stop.when.borrow(), *stop.outside.borrow()), (None, false));
         signal.send(()).await.unwrap();
@@ -125,10 +129,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn stopped_while_acquiring_it_starts_stopped_from_outside() {
+        let (_control, detach) = watch::channel(None);
+        let (_signal, signals) = mpsc::channel(4);
+        let stop = watch(detach, signals, Duration::from_secs(60), true);
+        assert_eq!(
+            (*stop.when.borrow(), *stop.outside.borrow()),
+            (Some(false), true)
+        );
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(*stop.when.borrow(), Some(true));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_second_signal_cuts_the_turn_at_once() {
         let (_control, detach) = watch::channel(None);
         let (signal, signals) = mpsc::channel(4);
-        let stop = watch(detach, signals, Duration::from_secs(60));
+        let stop = watch(detach, signals, Duration::from_secs(60), false);
         signal.send(()).await.unwrap();
         signal.send(()).await.unwrap();
         settle().await;
@@ -139,7 +156,7 @@ mod tests {
     async fn controls_word_stops_it_without_handing_over() {
         let (control, detach) = watch::channel(None);
         let (_signal, signals) = mpsc::channel(4);
-        let stop = watch(detach, signals, Duration::from_secs(60));
+        let stop = watch(detach, signals, Duration::from_secs(60), false);
         control.send_replace(Some(false));
         settle().await;
         assert_eq!(

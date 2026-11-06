@@ -11,6 +11,8 @@ database "chlive_snapshots" {}
 # `offset`, `partition` and `ts` are the message's, added by the sink's InsertField transform
 # (nix/shell.nix); `id` is set by the writer, `kind` is the event's type and `data` its fields.
 # Streaming deltas are for live display only, so they expire after a day.
+# The sink's exactly-once delivery retries an insert with the same block: the window lets
+# ClickHouse drop it (a MergeTree keeps none by default; continuous-backup's preflight checks).
 table "dirigent.session_events" {
   engine = MergeTree
   column "session_id" { type = UUID }
@@ -23,6 +25,7 @@ table "dirigent.session_events" {
   column "data" { type = String }
   order_by = [column.session_id, column.offset]
   ttl      = "toDateTime(ts) + toIntervalDay(1) WHERE kind = 'model_delta'"
+  settings = { non_replicated_deduplication_window = 1000 }
 }
 
 # The sink's exactly-once state (the connector's `zkDatabase` / `zkPath`), as continuous-backup

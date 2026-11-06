@@ -71,6 +71,8 @@ spec:
         checksum/player: {{ include (print $.Template.BasePath "/player.yaml") . | sha256sum }}
     spec:
       serviceAccountName: dirigent-control
+      initContainers:
+        {{- include "dirigent.migrate" . }}
       containers:
         - name: control
           image: {{ include "dirigent.image" (list . "control") }}

@@ -185,14 +185,26 @@ async fn main() -> anyhow::Result<()> {
         control = cli.control_url,
         "acquiring the session"
     );
-    let lease = tokio::select! {
-        lease = Lease::acquire(&cli.control_url, &id, &player, cli.epoch) => lease?,
+    // Stopped meanwhile, the lease control may be granting is still taken (for a while), to be
+    // handed over at once: left, the session would wait out its grace period.
+    let acquire = Lease::acquire(&cli.control_url, &id, &player, cli.epoch);
+    tokio::pin!(acquire);
+    let (lease, stopped) = tokio::select! {
+        lease = &mut acquire => (lease?, false),
         _ = signals.recv() => {
-            info!("stopped before holding the session");
-            return Ok(());
+            info!("stopped while acquiring the session");
+            match tokio::time::timeout(Duration::from_secs(30), &mut acquire).await {
+                Ok(lease) => (lease?, true),
+                Err(_) => return Ok(()),
+            }
         }
     };
-    let stop = stop::watch(lease.detach(), signals, Duration::from_secs(cli.stop_grace));
+    let stop = stop::watch(
+        lease.detach(),
+        signals,
+        Duration::from_secs(cli.stop_grace),
+        stopped,
+    );
     let spec: &'static SessionSpec = Box::leak(Box::new(lease.spec.clone()));
     let mut session = ChliveSession::new(&id, lease.epoch, &cli.chlive_url, lease.tokens());
     let run = async {

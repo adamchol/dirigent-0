@@ -1,0 +1,125 @@
+# The test cluster's stand-ins for what a deployment brings: ClickHouse (with an embedded Keeper,
+# for the sink's KeeperMap state and the pause server) and Kafka (Redpanda), one node each, no
+# persistence. Not for anything but the test.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: clickhouse-admin
+stringData:
+  username: admin
+  password: admin-test
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse
+data:
+  test.xml: |
+    <clickhouse>
+      <listen_host>0.0.0.0</listen_host>
+      <keeper_server>
+        <tcp_port>9181</tcp_port>
+        <server_id>1</server_id>
+        <log_storage_path>/var/lib/clickhouse/coordination/log</log_storage_path>
+        <snapshot_storage_path>/var/lib/clickhouse/coordination/snapshots</snapshot_storage_path>
+        <raft_configuration>
+          <server><id>1</id><hostname>127.0.0.1</hostname><port>9234</port></server>
+        </raft_configuration>
+      </keeper_server>
+      <zookeeper>
+        <node><host>127.0.0.1</host><port>9181</port></node>
+      </zookeeper>
+      <keeper_map_path_prefix>/clickhouse/keeper_map</keeper_map_path_prefix>
+    </clickhouse>
+  users.xml: |
+    <clickhouse>
+      <users>
+        <admin>
+          <password>admin-test</password>
+          <networks><ip>::/0</ip></networks>
+          <profile>default</profile>
+          <quota>default</quota>
+          <access_management>1</access_management>
+          <named_collection_control>1</named_collection_control>
+        </admin>
+      </users>
+    </clickhouse>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+spec:
+  selector: { app: clickhouse }
+  ports:
+    - { name: http, port: 8123 }
+    - { name: keeper, port: 9181 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: clickhouse }
+  template:
+    metadata:
+      labels: { app: clickhouse }
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:25.8
+          ports:
+            - { containerPort: 8123 }
+            - { containerPort: 9181 }
+          readinessProbe:
+            httpGet: { path: /ping, port: 8123 }
+          resources:
+            requests: { memory: 512Mi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/clickhouse-server/config.d/test.xml, subPath: test.xml }
+            - { name: config, mountPath: /etc/clickhouse-server/users.d/admin.xml, subPath: users.xml }
+      volumes:
+        - name: config
+          configMap: { name: clickhouse }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda
+spec:
+  selector: { app: redpanda }
+  ports:
+    - { name: kafka, port: 9092 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redpanda
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: redpanda }
+  template:
+    metadata:
+      labels: { app: redpanda }
+    spec:
+      containers:
+        - name: redpanda
+          image: docker.redpanda.com/redpandadata/redpanda:v25.2.10
+          args:
+            - redpanda
+            - start
+            - --mode=dev-container
+            - --smp=1
+            - --memory=768M
+            - --overprovisioned
+            - --kafka-addr=0.0.0.0:9092
+            - --advertise-kafka-addr=redpanda:9092
+          ports:
+            - { containerPort: 9092 }
+          readinessProbe:
+            tcpSocket: { port: 9092 }

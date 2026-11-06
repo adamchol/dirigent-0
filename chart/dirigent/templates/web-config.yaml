@@ -7,6 +7,7 @@ metadata:
     {{- include "dirigent.labels" . | nindent 4 }}
 data:
   nginx.conf: |
+    user nobody nobody;
     worker_processes 1;
     error_log stderr;
     pid /tmp/nginx.pid;

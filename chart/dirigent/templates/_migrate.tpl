@@ -1,28 +1,7 @@
 {{- /* The schema migrations (openmig.toml, db/), as Postgres' superuser and ClickHouse's admin,
 then ClickHouse's users for chlive and the ingestion (what scripts/clickhouse-dev-access.sql
-does in dev). Before an upgrade's new manifests, after an install's. */}}
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: dirigent-migrate
-  labels:
-    {{- include "dirigent.labels" . | nindent 4 }}
-    app.kubernetes.io/component: migrate
-  annotations:
-    helm.sh/hook: post-install,pre-upgrade
-    helm.sh/hook-weight: "0"
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
-spec:
-  backoffLimit: 10
-  activeDeadlineSeconds: 1800
-  template:
-    metadata:
-      labels:
-        {{- include "dirigent.selector" . | nindent 8 }}
-        app.kubernetes.io/component: migrate
-    spec:
-      restartPolicy: OnFailure
-      containers:
+does in dev): before control starts, every time (they're no-ops when done). */}}
+{{- define "dirigent.migrate" }}
         - name: migrate
           image: {{ include "dirigent.image" (list . "migrations") }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
@@ -71,3 +50,4 @@ spec:
             - name: {{ $env }}
               valueFrom: { secretKeyRef: { name: dirigent-clickhouse, key: {{ $user }} } }
             {{- end }}
+{{- end }}

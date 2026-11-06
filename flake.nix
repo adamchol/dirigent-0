@@ -78,7 +78,7 @@
               chlive
               openmig
               ;
-            inherit (inputs) nixpkgs;
+            inherit (inputs) nixpkgs continuous-backup;
             version = "0.1.0";
           };
         in
