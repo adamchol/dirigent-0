@@ -113,7 +113,7 @@ function "dirigent.grant_insert_kinds" {
     DECLARE
       who text;
       wanted text[];
-      inputs text[] := ARRAY['user_message', 'user_interrupt'];
+      inputs text[] := ARRAY['user_message', 'user_interrupt', 'titled'];
       every_kind text[] := inputs || ARRAY[
         'player_attached', 'player_detached', 'player_failed', 'workspace_ready',
         'workspace_restored', 'checkpoint', 'checkpoint_failed', 'turn_started', 'steered',

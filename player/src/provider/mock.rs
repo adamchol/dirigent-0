@@ -62,6 +62,10 @@ pub struct MockProvider {
     scripts: Mutex<VecDeque<Script>>,
     requests: Mutex<Vec<Request>>,
     calls: Mutex<u64>,
+    /// Title calls are answered apart, so the turns' scripts and requests are only theirs:
+    /// by these scripts, then by naming the session after its text's first words.
+    title_scripts: Mutex<VecDeque<Script>>,
+    titles: Mutex<Vec<Request>>,
     /// Text replies go on after their first line with paragraphs of random
     /// length (`--mock`: something to watch stream); not in tests.
     long: bool,
@@ -87,6 +91,15 @@ impl MockProvider {
     pub fn requests(&self) -> Vec<Request> {
         self.requests.lock().unwrap().clone()
     }
+
+    /// Replace the remaining title calls' scripts.
+    pub fn reset_titles(&self, scripts: impl IntoIterator<Item = Script>) {
+        *self.title_scripts.lock().unwrap() = scripts.into_iter().collect();
+    }
+
+    pub fn titles(&self) -> Vec<Request> {
+        self.titles.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -96,6 +109,11 @@ impl Provider for MockProvider {
     }
 
     async fn stream(&self, req: &Request) -> Result<DeltaStream, ProviderError> {
+        if req.system.as_deref() == Some(crate::title::INSTRUCTION) {
+            self.titles.lock().unwrap().push(req.clone());
+            let script = self.title_scripts.lock().unwrap().pop_front();
+            return play(script.unwrap_or_else(|| name(req))).await;
+        }
         self.requests.lock().unwrap().push(req.clone());
         let n = {
             let mut c = self.calls.lock().unwrap();
@@ -103,27 +121,48 @@ impl Provider for MockProvider {
             *c
         };
         let script = self.scripts.lock().unwrap().pop_front();
-        let script = script.unwrap_or_else(|| echo(req, n, self.long));
-        match script {
-            Script::Deltas { delay, deltas } => {
-                tokio::time::sleep(delay).await;
-                Ok(futures::stream::iter(deltas.into_iter().map(Ok)).boxed())
-            }
-            Script::Paced { delay, gap, deltas } => {
-                tokio::time::sleep(delay).await;
-                Ok(futures::stream::iter(deltas)
-                    .then(move |d| async move {
-                        tokio::time::sleep(gap).await;
-                        Ok(d)
-                    })
-                    .boxed())
-            }
-            Script::Fail { delay, error } => {
-                tokio::time::sleep(delay).await;
-                Err(error)
-            }
+        play(script.unwrap_or_else(|| echo(req, n, self.long))).await
+    }
+}
+
+/// A script played out: its deltas, or its failure, after its delay.
+async fn play(script: Script) -> Result<DeltaStream, ProviderError> {
+    match script {
+        Script::Deltas { delay, deltas } => {
+            tokio::time::sleep(delay).await;
+            Ok(futures::stream::iter(deltas.into_iter().map(Ok)).boxed())
+        }
+        Script::Paced { delay, gap, deltas } => {
+            tokio::time::sleep(delay).await;
+            Ok(futures::stream::iter(deltas)
+                .then(move |d| async move {
+                    tokio::time::sleep(gap).await;
+                    Ok(d)
+                })
+                .boxed())
+        }
+        Script::Fail { delay, error } => {
+            tokio::time::sleep(delay).await;
+            Err(error)
         }
     }
+}
+
+/// A title call's answer: the session's first six words, and its text clipped.
+fn name(req: &Request) -> Script {
+    let text = req.messages.last().map(|m| m.text()).unwrap_or_default();
+    let session = text
+        .split_once("<session>")
+        .map_or(text.as_str(), |(_, s)| s)
+        .trim_end_matches("</session>")
+        .trim();
+    let words: Vec<&str> = session.split_whitespace().collect();
+    let clipped: String = words.join(" ").chars().take(60).collect();
+    let answer = serde_json::json!({
+        "title": words.iter().take(6).copied().collect::<Vec<_>>().join(" "),
+        "description": format!("mock: {clipped}"),
+    });
+    Script::text(&answer.to_string(), Duration::ZERO)
 }
 
 /// Fallback when no script is queued (`--mock` demos): echo the latest user

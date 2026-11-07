@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { callStart, contextSize, streamed, timeline, type EventRow } from "./events.ts";
+import { callStart, contextSize, streamed, timeline, titles, type EventRow } from "./events.ts";
 
 let offset = 0;
 function row(id: string, kind: string, data?: unknown, author = "player:p"): EventRow {
@@ -143,4 +143,23 @@ test("the context is the last model call's input and output", () => {
     });
   expect(contextSize([])).toBe(0);
   expect(contextSize([call("a", 100, 0, 10), call("b", 20, 110, 5), row("e", "turn_ended", { reason: "completed" })])).toBe(135);
+});
+
+test("a title is a note, a held one a rename, and the latest per session names it", () => {
+  const t = timeline([
+    row("n1", "titled", { title: "Fix login", description: "Makes it pass." }),
+    row("n2", "titled", { title: "Mine", description: "As I named it.", hold: true }, "user:dev"),
+  ]);
+  expect(t.items.map((i) => (i.t === "note" ? [i.text, i.detail] : i.t))).toEqual([
+    ["titled: Fix login", "Makes it pass."],
+    ["renamed: Mine", "As I named it."],
+  ]);
+  const named = titles([
+    { session_id: "a", offset: 7, data: JSON.stringify({ title: "Mine", description: "As I named it.", hold: true }) },
+    { session_id: "a", offset: 3, data: JSON.stringify({ title: "Fix login", description: "Makes it pass." }) },
+    { session_id: "b", offset: 1, data: "not json" },
+    { session_id: "c", offset: 2, data: JSON.stringify({ title: "", description: "untitled" }) },
+  ]);
+  expect([...named.keys()]).toEqual(["a"]);
+  expect(named.get("a")?.hold).toBe(true);
 });

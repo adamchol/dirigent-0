@@ -323,6 +323,8 @@ mod e2e {
                 system: "sys",
                 effort: None,
                 context_window: 1_000_000,
+                title_model: "mock",
+                title_effort: None,
             },
             tools: Arc::new(tools),
             workdir,
@@ -450,11 +452,13 @@ mod e2e {
         rows.iter().filter(|r| r.kind == "turn_ended").count()
     }
 
-    /// What happened, leaving out the players attaching and their workspaces.
+    /// What happened, leaving out the players attaching, their workspaces, and the session's
+    /// titles (which come when their call does).
     fn kinds(rows: &[EventRow]) -> Vec<String> {
         rows.iter()
             .filter(|r| {
-                !["player_attached", "workspace_ready", "checkpoint"].contains(&r.kind.as_str())
+                !["player_attached", "workspace_ready", "checkpoint", "titled"]
+                    .contains(&r.kind.as_str())
             })
             .map(|r| match r.event().unwrap() {
                 Event::UserMessage { text, .. } => format!("user:{text}"),
@@ -710,6 +714,12 @@ mod e2e {
         insert(&owner, Event::UserInterrupt { turn: "t".into() })
             .await
             .unwrap();
+        let renamed = Event::Titled {
+            title: "Mine".into(),
+            description: "As I named it.".into(),
+            hold: true,
+        };
+        insert(&owner, renamed).await.unwrap();
         let forged = Event::AssistantMessage {
             content: vec![ContentBlock::Text {
                 text: "forged".into(),
@@ -730,7 +740,57 @@ mod e2e {
             .fetch::<EventRow>()
             .await
             .unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn e2e_the_player_names_the_session_and_its_owner_renames_it() {
+        let Some(stack) = stack() else { return };
+        let session = new_session(&stack).await;
+        let user = User::new(&stack, &session);
+        let titles = |rows: &[EventRow]| -> Vec<(String, Event)> {
+            rows.iter()
+                .filter(|r| r.kind == "titled")
+                .map(|r| (r.author.clone(), r.event().unwrap()))
+                .collect()
+        };
+
+        let first = start(&stack, &session).await;
+        user.say("fix the flaky login test").await;
+        let log = log_until(&stack, &session, |r| {
+            turns_ended(r) == 1 && !titles(r).is_empty()
+        })
+        .await;
+        let named = titles(&log);
+        assert_eq!(named.len(), 1);
+        assert_ne!(named[0].0, USER);
+        assert_eq!(
+            named[0].1,
+            Event::Titled {
+                title: "fix the flaky login test".into(),
+                description: "mock: fix the flaky login test".into(),
+                hold: false,
+            }
+        );
+        assert_eq!(first.provider.titles().len(), 1);
+
+        // the owner's name, held, is the one a resumed player goes on with
+        let renamed = Event::Titled {
+            title: "Login flake".into(),
+            description: "Why the login test fails one run in ten.".into(),
+            hold: true,
+        };
+        user.send(renamed.clone()).await;
+        log_until(&stack, &session, |r| titles(r).len() == 2).await;
+        first.stop().await;
+        let second = start(&stack, &session).await;
+        user.say("again").await;
+        let log = log_until(&stack, &session, |r| turns_ended(r) == 2).await;
+        let named = titles(&log);
+        assert_eq!(named.len(), 2);
+        assert_eq!((named[1].0.as_str(), &named[1].1), (USER, &renamed));
+        assert!(second.provider.titles().is_empty());
+        second.stop().await;
     }
 
     #[tokio::test]

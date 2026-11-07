@@ -202,6 +202,15 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         interrupt: Option<String>,
     },
+    /// What the session is called and is about, until the next one. From the player (made of
+    /// its first message, and again of each compaction's summary), or from its owner, renaming
+    /// it; `hold`, which only an owner sets, keeps the player from naming it again.
+    Titled {
+        title: String,
+        description: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        hold: bool,
+    },
 }
 
 impl Event {
@@ -227,6 +236,7 @@ impl Event {
         "session_update",
         "tool_result",
         "turn_ended",
+        "titled",
     ];
 
     /// An input's text, as the model reads it: a user's message, or a session update; `None`
@@ -300,7 +310,8 @@ mod tests {
             | Event::CompactionFailed { .. }
             | Event::SessionUpdate { .. }
             | Event::ToolResult { .. }
-            | Event::TurnEnded { .. } => e.kind(),
+            | Event::TurnEnded { .. }
+            | Event::Titled { .. } => e.kind(),
         };
         let s = String::new;
         let usage = Usage::default();
@@ -369,6 +380,11 @@ mod tests {
                 reason: TurnEndReason::Completed,
                 interrupt: None,
             },
+            Event::Titled {
+                title: s(),
+                description: s(),
+                hold: false,
+            },
         ];
         let kinds: Vec<String> = events.iter().map(one).collect();
         assert_eq!(kinds, Event::KINDS);
@@ -401,5 +417,22 @@ mod tests {
             serde_json::json!({"what": "turn_ended", "reason": "completed"})
         );
         assert_eq!(serde_json::from_value::<Event>(wire).unwrap(), ev);
+    }
+
+    #[test]
+    fn a_title_holds_only_when_it_says_so() {
+        let named = |hold| Event::Titled {
+            title: "Fix login".into(),
+            description: "Makes the test pass.".into(),
+            hold,
+        };
+        let wire = serde_json::to_value(named(false)).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"kind": "titled", "data": {"title": "Fix login", "description": "Makes the test pass."}})
+        );
+        assert_eq!(serde_json::from_value::<Event>(wire).unwrap(), named(false));
+        let held = serde_json::json!({"kind": "titled", "data": {"title": "Fix login", "description": "Makes the test pass.", "hold": true}});
+        assert_eq!(serde_json::from_value::<Event>(held).unwrap(), named(true));
     }
 }

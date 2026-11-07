@@ -7,6 +7,7 @@ mod process;
 mod provider;
 mod session;
 mod stop;
+mod title;
 mod tools;
 mod workspace;
 
@@ -22,7 +23,7 @@ use tracing::{info, warn};
 use crate::agent::{Agent, AgentConfig, Detach};
 use crate::checkpoints::Checkpoints;
 use crate::dirigent::Director;
-use crate::provider::Provider;
+use crate::provider::{Effort, Provider};
 use crate::session::chlive::ChliveSession;
 use crate::session::control::Lease;
 use crate::session::Session;
@@ -106,6 +107,12 @@ struct Cli {
     /// it, the provider's: Claude's 200k, or the 272k GPT models take in.
     #[arg(long, env = "DIRIGENT_CONTEXT_WINDOW")]
     context_window: Option<u64>,
+
+    /// The model that names the session (after its first message and each compaction).
+    /// Without it, the provider's: Claude's Haiku, or, on a ChatGPT plan (whose models may
+    /// have no small one), the session's model thinking little.
+    #[arg(long, env = "DIRIGENT_TITLE_MODEL")]
+    title_model: Option<String>,
 
     /// Stopped from outside (SIGTERM: its machine is going), how long the turn running may
     /// take to finish before it's cut, in seconds; then the workspace is checkpointed and the
@@ -225,6 +232,14 @@ async fn main() -> anyhow::Result<()> {
             ModelProvider::Anthropic => 200_000,
             ModelProvider::Chatgpt => 272_000,
         });
+        let (title_model, title_effort): (&'static str, _) = match spec.provider {
+            ModelProvider::Anthropic => ("claude-haiku-5-5", None),
+            ModelProvider::Chatgpt => (&spec.model, Some(Effort::Low)),
+        };
+        let title_model = match &cli.title_model {
+            Some(m) => Box::leak(m.clone().into_boxed_str()),
+            None => title_model,
+        };
         let log = workspace::open(&mut session, workdir, spec.source.as_ref(), checkpoints).await?;
         let (system, tools): (&'static str, Registry) = match spec.part {
             // after the workspace is made: its AGENTS.md is part of the prompt
@@ -250,6 +265,8 @@ async fn main() -> anyhow::Result<()> {
                 system,
                 effort: spec.effort,
                 context_window,
+                title_model,
+                title_effort,
             },
             tools: Arc::new(tools),
             workdir,

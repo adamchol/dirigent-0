@@ -71,7 +71,15 @@ export type Event =
       kind: "tool_result";
       data: { call_id: string; name: string; content: string; is_error: boolean; meta?: unknown };
     }
-  | { kind: "turn_ended"; data: { reason: "completed" | "aborted" | "failed"; interrupt?: string } };
+  | { kind: "turn_ended"; data: { reason: "completed" | "aborted" | "failed"; interrupt?: string } }
+  | { kind: "titled"; data: Named };
+
+/** What a session is called and is about, by its player or (`hold`ing it) its owner. */
+export interface Named {
+  title: string;
+  description: string;
+  hold?: boolean;
+}
 
 /** One thing the timeline shows. `key` is stable across updates (row ids, call ids). */
 export type Item =
@@ -243,6 +251,9 @@ export function timeline(rows: readonly EventRow[]): Timeline {
       case "checkpoint_failed":
         note(row, "error", `checkpoint failed: ${e.data.error}`);
         break;
+      case "titled":
+        note(row, "dim", `${e.data.hold ? "renamed" : "titled"}: ${e.data.title}`, e.data.description);
+        break;
       default:
         note(row, "dim", (e as { kind: string }).kind);
     }
@@ -349,8 +360,34 @@ export function streamed(rows: readonly DeltaRow[]): Streamed[] {
 
 /** Each session's latest event (its streaming deltas aside), of those the user may read: how
  * recently it was active. */
+// a rename isn't activity: it doesn't move the session up the list
 export const ACTIVITY_QUERY =
-  "select session_id, max(ts) as last from session_events where kind != 'model_delta' group by session_id";
+  "select session_id, max(ts) as last from session_events where kind not in ('model_delta', 'titled') group by session_id";
+
+/** Every title the sessions had: a few each (chlive has no `argMax` to keep only the latest). */
+export const TITLES_QUERY = "select session_id, offset, data from session_events where kind = 'titled'";
+
+export interface TitleRow {
+  session_id: string;
+  offset: number;
+  data: string;
+}
+
+/** Each session's latest title (a session's rows share a partition: the last has the highest
+ * offset), leaving out any that doesn't read. */
+export function titles(rows: TitleRow[]): Map<string, Named> {
+  const latest = new Map<string, { offset: number; named: Named }>();
+  for (const r of rows) {
+    try {
+      const named = JSON.parse(r.data) as Named;
+      const seen = latest.get(r.session_id);
+      if (named.title && (!seen || Number(r.offset) > seen.offset)) latest.set(r.session_id, { offset: Number(r.offset), named });
+    } catch {
+      // not a title
+    }
+  }
+  return new Map([...latest].map(([id, { named }]) => [id, named]));
+}
 
 export interface ActivityRow {
   session_id: string;

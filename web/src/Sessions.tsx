@@ -11,6 +11,7 @@ import {
   EllipsisIcon,
   GitBranchIcon,
   OctagonXIcon,
+  PencilIcon,
   PlayIcon,
   PlusIcon,
   SquareIcon,
@@ -48,6 +49,8 @@ import { cn } from "@/lib/utils";
 import * as api from "./api.ts";
 import type { Effort, Me, Model, Part, Provider, SessionInfo } from "./api.ts";
 import { linked } from "./Link.tsx";
+import { useTitles } from "./Rename.tsx";
+import type { Named } from "./events.ts";
 import { ACTIVITY_QUERY, millis, type ActivityRow } from "./events.ts";
 
 const POLL_MS = 2000;
@@ -116,7 +119,13 @@ function act(what: string, f: () => Promise<void>, changed: () => void) {
 
 /** A session's less used things, in a menu: its id, and stopping it (letting the turn finish, or
  * now) for its owner; and starting it, in sight while it's idle. */
-export function SessionMenu(props: { id: string; info?: SessionInfo; who: api.Who; changed: () => void }) {
+export function SessionMenu(props: {
+  id: string;
+  info?: SessionInfo;
+  who: api.Who;
+  changed: () => void;
+  rename: () => void;
+}) {
   const { info, who, changed } = props;
   const owner = info?.role === "owner";
   const idle = info !== undefined && api.state(info) === "idle";
@@ -138,6 +147,11 @@ export function SessionMenu(props: { id: string; info?: SessionInfo; who: api.Wh
               Session
               <span className="font-mono text-[0.7rem] font-normal break-all">{props.id}</span>
             </DropdownMenuLabel>
+            {owner && (
+              <DropdownMenuItem onClick={props.rename}>
+                <PencilIcon /> Rename
+              </DropdownMenuItem>
+            )}
             <DropdownMenuItem onClick={() => navigator.clipboard.writeText(props.id).then(() => toast.success("Session ID copied"))}>
               <CopyIcon /> Copy ID
             </DropdownMenuItem>
@@ -187,12 +201,17 @@ export function SessionsSidebar(props: {
   select: (id: string) => void;
   who: api.Who;
   create: () => void;
+  rename: (id: string) => void;
   account: React.ReactNode;
   className?: string;
 }) {
   const [filter, setFilter] = useState("");
   const sorted = useByActivity(props.sessions.list);
-  const shown = sorted.filter((s) => api.title(s).toLowerCase().includes(filter.trim().toLowerCase()));
+  const titles = useTitles();
+  const wanted = filter.trim().toLowerCase();
+  const shown = sorted.filter((s) =>
+    [api.title(s, titles.get(s.id)), api.place(s)].some((t) => t.toLowerCase().includes(wanted)),
+  );
   const mine = shown.filter((s) => s.role === "owner");
   const shared = shown.filter((s) => s.role !== "owner");
   return (
@@ -215,11 +234,11 @@ export function SessionsSidebar(props: {
             ))}
           </div>
         )}
-        <SessionItems list={mine} {...props} />
+        <SessionItems list={mine} titles={titles} {...props} />
         {shared.length > 0 && (
           <>
             <span className="mt-3 mb-1 px-2 text-[11px] text-dim">Shared with you</span>
-            <SessionItems list={shared} {...props} />
+            <SessionItems list={shared} titles={titles} {...props} />
           </>
         )}
         <button
@@ -237,6 +256,8 @@ export function SessionsSidebar(props: {
 
 function SessionItems(props: {
   list: SessionInfo[];
+  titles: Map<string, Named>;
+  rename: (id: string) => void;
   selected: string;
   select: (id: string) => void;
   who: api.Who;
@@ -249,6 +270,7 @@ function SessionItems(props: {
           const owner = s.role === "owner";
           const st = api.state(s);
           const current = s.id === props.selected;
+          const named = props.titles.get(s.id);
           return (
             <motion.li
               key={s.id}
@@ -262,7 +284,7 @@ function SessionItems(props: {
               <button
                 type="button"
                 onClick={() => props.select(s.id)}
-                title={api.title(s)}
+                title={named ? `${named.title}: ${named.description}` : api.place(s)}
                 aria-current={current ? "page" : undefined}
                 className={cn(
                   "flex w-full items-center gap-2 rounded-[5px] py-1 pr-7 pl-2 text-left transition-colors",
@@ -270,7 +292,10 @@ function SessionItems(props: {
                 )}
               >
                 <StateDot info={s} />
-                <span className="truncate">{api.title(s)}</span>
+                <span className="flex min-w-0 flex-col">
+                  <span className="truncate">{api.title(s, named)}</span>
+                  {named && <span className="truncate text-[11px] text-dim">{api.place(s)}</span>}
+                </span>
                 <span className="sr-only">, {STATE_NAMES[st]}</span>
               </button>
               <DropdownMenu>
@@ -307,6 +332,11 @@ function SessionItems(props: {
                     )}
                   </DropdownMenuGroup>
                   {owner && <DropdownMenuSeparator />}
+                  {owner && (
+                    <DropdownMenuItem onClick={() => props.rename(s.id)}>
+                      <PencilIcon /> Rename
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuItem onClick={() => navigator.clipboard.writeText(s.id).then(() => toast.success("Session ID copied"))}>
                     <CopyIcon /> Copy ID
                   </DropdownMenuItem>

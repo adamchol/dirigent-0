@@ -37,6 +37,7 @@ import type { SessionInfo, Who } from "./api.ts";
 import { ChatGptDialog, useMe } from "./Link.tsx";
 import { useGoogle } from "./Login.tsx";
 import { Session, Viewers, type LiveStatus } from "./Session.tsx";
+import { RenameDialog, useTitles } from "./Rename.tsx";
 import { NewSession, SessionMenu, SessionsSidebar, useSessions } from "./Sessions.tsx";
 import { tokens } from "./Timeline.tsx";
 
@@ -175,6 +176,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
   const [creating, setCreating] = useState(false);
   const [browsing, setBrowsing] = useState(false);
   const [linking, setLinking] = useState(false);
+  const [renaming, setRenaming] = useState<string | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
   const client = useClient(props.who);
   const sessions = useSessions(props.who);
@@ -200,6 +202,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
       }}
       who={props.who}
       create={() => setCreating(true)}
+      rename={setRenaming}
       account={<Account who={props.who} become={props.become} signOut={props.signOut} link={() => setLinking(true)} />}
       className={className}
     />
@@ -220,12 +223,12 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
           <a href="#" className="hidden w-58 shrink-0 items-center px-3.5 font-medium text-strong md:flex">
             dirigent
           </a>
-          <h1 className="flex min-w-0 items-center px-3 text-[13px] font-normal text-strong md:px-4">
-            <span className="truncate">{info ? api.title(info) : selected ? "Session" : ""}</span>
-          </h1>
+          <SessionTitle info={info} selected={selected} />
           <div className="ml-auto flex shrink-0 items-center gap-1 px-2">
             {info?.role === "owner" && <Viewers info={info} who={props.who} changed={sessions.refresh} />}
-            {selected && <SessionMenu id={selected} info={info} who={props.who} changed={sessions.refresh} />}
+            {selected && (
+              <SessionMenu id={selected} info={info} who={props.who} changed={sessions.refresh} rename={() => setRenaming(selected)} />
+            )}
           </div>
         </header>
         <div className="flex min-h-0 flex-1">
@@ -278,8 +281,24 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
           sessions.refresh();
         }}
       />
+      <RenameDialog
+        info={sessions.list.find((s) => s.id === renaming)}
+        client={client}
+        close={() => setRenaming(null)}
+      />
       <ChatGptDialog who={props.who} declared={!!props.become} open={linking} setOpen={setLinking} />
     </LiveClientProvider>
+  );
+}
+
+/** The session open's title, and what it's about where there's room. */
+function SessionTitle({ info, selected }: { info?: SessionInfo; selected: string }) {
+  const named = useTitles().get(selected);
+  return (
+    <h1 className="flex min-w-0 items-baseline gap-2.5 self-center px-3 text-[13px] font-normal md:px-4" title={named?.description}>
+      <span className="max-w-full shrink-0 truncate text-strong">{info ? api.title(info, named) : selected ? "Session" : ""}</span>
+      {named?.description && <span className="hidden truncate text-muted-foreground lg:inline">{named.description}</span>}
+    </h1>
   );
 }
 

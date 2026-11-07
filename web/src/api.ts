@@ -2,7 +2,7 @@
 // says: in control's `declared` auth the user chosen at the top (the `dirigent-user` header), in
 // its `oidc` auth whoever signed in with Google (their ID token).
 
-import type { Source } from "./events.ts";
+import type { Named, Source } from "./events.ts";
 
 export type Effort = "low" | "medium" | "high" | "max";
 export type Part = "coder" | "dirigent";
@@ -146,8 +146,13 @@ export function repo(url: string): string {
   return parts.length >= 3 ? parts.slice(-2).join("/") : path;
 }
 
-/** What a session is called: its repository (and ref), or what it is without one. */
-export function title(s: SessionInfo): string {
+/** What a session is called: its title, once it has one, or else `place`'s. */
+export function title(s: SessionInfo, named?: Named): string {
+  return named?.title || place(s);
+}
+
+/** Where a session works: its repository (and ref), or what it is without one. */
+export function place(s: SessionInfo): string {
   if (part(s) === "dirigent") return "Dirigent";
   const git = s.spec.source?.git;
   if (!git) return "Empty workspace";

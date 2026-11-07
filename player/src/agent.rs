@@ -19,6 +19,7 @@ use crate::provider::{
     StopReason,
 };
 use crate::session::Session;
+use crate::title;
 use crate::tools::{Registry, ToolCtx, ToolOutput};
 use dirigent_protocol::fold::Fold;
 use dirigent_protocol::{Event, TurnEndReason};
@@ -30,6 +31,9 @@ pub struct AgentConfig {
     pub effort: Option<Effort>,
     /// The model's context window, in tokens.
     pub context_window: u64,
+    /// What names the session (see [`title`]): a small model, made to think little.
+    pub title_model: &'static str,
+    pub title_effort: Option<Effort>,
 }
 
 impl AgentConfig {
@@ -55,6 +59,9 @@ pub struct Agent {
 }
 
 pub const ABORTED_TOOL_RESULT: &str = "Tool call aborted by user interrupt";
+
+/// How long a title call may take; then the session goes on unnamed (until the next one).
+const TITLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The word to leave the session (control's, through the lease): `when` becomes `Some(now)`
 /// once it's stopped, and a graceful stop (`false`) may turn into one that's now.
@@ -89,6 +96,9 @@ struct Turn {
 
 type Tx = mpsc::UnboundedSender<Event>;
 
+/// A title call's outcome: the title and description, `None` if it made none.
+type Named = Option<(String, String)>;
+
 impl Agent {
     /// Run one session: user events come from the session, model and tool outcomes from the
     /// tasks this loop spawns. Every event the loop produces is published to the session; only
@@ -116,6 +126,22 @@ impl Agent {
             .collect();
         let tools = serde_json::to_string(self.tools.specs()).map_or(0, |s| s.len());
         let (tx, mut outcomes) = mpsc::unbounded_channel::<Event>();
+        let (named, mut names) = mpsc::unbounded_channel::<Named>();
+        let (title, hold) = match handled.iter().rev().find_map(|(_, ev)| match ev {
+            Event::Titled {
+                title,
+                description,
+                hold,
+            } => Some((title.clone(), description.clone(), *hold)),
+            _ => None,
+        }) {
+            Some((t, d, hold)) => (Some((t, d)), hold),
+            None => (None, false),
+        };
+        let first = handled.iter().find_map(|(_, ev)| match ev {
+            Event::UserMessage { text, .. } => Some(text.clone()),
+            _ => None,
+        });
         let mut run = Run {
             agent: self,
             session,
@@ -125,7 +151,15 @@ impl Agent {
             turn: None,
             queue: fold.queued().iter().cloned().collect(),
             tx,
+            title,
+            hold,
+            titling: None,
+            named,
         };
+        // a session that went unnamed (its title call failed, or came before titles did)
+        if let (None, Some(first)) = (&run.title, first) {
+            run.name(&first);
+        }
         let closing = close_unfinished(&handled, fold.open().and_then(|t| t.interrupt.clone()));
         if !closing.is_empty() {
             warn!("the log ends mid-turn; closing that turn");
@@ -149,18 +183,22 @@ impl Agent {
             if detaching.is_none() {
                 run.next_turn().await;
             }
-            if (!client || detaching.is_some()) && run.turn.is_none() {
+            if (!client || detaching.is_some()) && run.turn.is_none() && run.titling.is_none() {
                 break;
             }
             tokio::select! {
                 biased;
                 Some(ev) = outcomes.recv() => run.handle(ev).await,
+                Some(named) = names.recv() => run.named(named).await,
                 now = told_to_detach(&mut detach.when, detaching), if detaching != Some(true) => {
                     info!(now, "detaching");
                     detaching = Some(now);
                     if let (true, Some(t)) = (now, &mut run.turn) {
                         t.interrupted = true;
                         t.token.cancel();
+                    }
+                    if let (true, Some(naming)) = (now, &run.titling) {
+                        naming.cancel();
                     }
                 }
                 ev = run.session.recv(), if client => match ev {
@@ -246,7 +284,8 @@ fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -> Ve
             | Event::ModelCancelled
             | Event::Error { .. }
             | Event::Compacted { .. }
-            | Event::CompactionFailed { .. } => {}
+            | Event::CompactionFailed { .. }
+            | Event::Titled { .. } => {}
         }
     }
     if !open {
@@ -281,6 +320,13 @@ struct Run<'a> {
     /// Inputs waiting for a turn of their own: `(id, text)`.
     queue: VecDeque<(String, String)>,
     tx: Tx,
+    /// The session's title and description, the log's last; none until it's named.
+    title: Option<(String, String)>,
+    /// Its owner named it and keeps it so: the player doesn't name it again.
+    hold: bool,
+    /// The title call running, if one is; the loop waits for it before it ends.
+    titling: Option<CancellationToken>,
+    named: mpsc::UnboundedSender<Named>,
 }
 
 impl Run<'_> {
@@ -310,6 +356,15 @@ impl Run<'_> {
                 }
                 _ => info!("ignoring an interrupt for a turn that isn't running"),
             },
+            Event::Titled {
+                title,
+                description,
+                hold,
+            } => {
+                info!(hold, "renamed: {title}");
+                self.title = Some((title, description));
+                self.hold = hold;
+            }
             other => warn!(?other, "ignoring an event users don't send"),
         }
     }
@@ -324,6 +379,9 @@ impl Run<'_> {
         };
         info!("input (starts a turn)");
         let id = self.session.publish(&Event::TurnStarted { input }).await;
+        if self.title.is_none() {
+            self.name(&text);
+        }
         self.history
             .push(&id, &Event::UserMessage { text, via: None });
         self.turn = Some(Turn {
@@ -386,6 +444,9 @@ impl Run<'_> {
             Event::Compacted { .. } | Event::CompactionFailed { .. } => {
                 if self.turn.is_some() {
                     self.record(&ev).await;
+                    if let (Event::Compacted { summary, .. }, false) = (&ev, self.hold) {
+                        self.name(summary);
+                    }
                     self.call_model();
                 }
             }
@@ -418,8 +479,67 @@ impl Run<'_> {
             | Event::SessionUpdate { .. }
             | Event::TurnStarted { .. }
             | Event::Steered { .. }
-            | Event::TurnEnded { .. } => {}
+            | Event::TurnEnded { .. }
+            | Event::Titled { .. } => {}
         }
+    }
+
+    /// Name the session after `input` (its first message, or a compaction's summary), in the
+    /// background: the outcome comes to [`Run::named`]. Not while a title call runs already.
+    fn name(&mut self, input: &str) {
+        if self.titling.is_some() {
+            return;
+        }
+        let token = CancellationToken::new();
+        self.titling = Some(token.clone());
+        let req = title::request(&self.agent.cfg, input, self.title.as_ref());
+        let provider = self.agent.provider.clone();
+        let named = self.named.clone();
+        tokio::spawn(async move {
+            let reply = tokio::time::timeout(
+                TITLE_TIMEOUT,
+                stream_reply(&*provider, &req, &token, &|_| {}),
+            )
+            .await;
+            let _ = named.send(match reply {
+                Ok(Ok(Some(c))) => {
+                    let named = title::parse(&c);
+                    if named.is_none() {
+                        warn!("the title call made no title: {}", c.message.text());
+                    }
+                    named
+                }
+                Ok(Ok(None)) => None,
+                Ok(Err(e)) => {
+                    warn!("the title call failed: {e}");
+                    None
+                }
+                Err(_) => {
+                    warn!("the title call timed out");
+                    None
+                }
+            });
+        });
+    }
+
+    /// A title call's outcome: published, unless the owner holds a name of their own now, or
+    /// it's the name the session has.
+    async fn named(&mut self, named: Named) {
+        self.titling = None;
+        let Some(named) = named else { return };
+        if self.hold || self.title.as_ref() == Some(&named) {
+            return;
+        }
+        info!("titled: {}", named.0);
+        let (title, description) = named.clone();
+        self.session
+            .publish(&Event::Titled {
+                title,
+                description,
+                hold: false,
+            })
+            .await;
+        self.title = Some(named);
     }
 
     /// Publish to the session and keep what the model needs.
@@ -778,7 +898,8 @@ fn log_event(ev: &Event) {
         | Event::TurnStarted { .. }
         | Event::Steered { .. }
         | Event::ToolResult { .. }
-        | Event::ModelDelta { .. } => {}
+        | Event::ModelDelta { .. }
+        | Event::Titled { .. } => {}
     }
 }
 
@@ -814,6 +935,8 @@ mod tests {
         system: "sys",
         effort: None,
         context_window: 1_000_000,
+        title_model: "mock-small",
+        title_effort: None,
     };
 
     type Published = Arc<Mutex<Vec<(String, Event)>>>;
@@ -984,7 +1107,8 @@ mod tests {
     fn render(events: &[Event]) -> Vec<String> {
         events
             .iter()
-            .filter(|e| !matches!(e, Event::ModelDelta { .. }))
+            // titles come when their call does: their own tests look for them
+            .filter(|e| !matches!(e, Event::ModelDelta { .. } | Event::Titled { .. }))
             .map(|e| match e {
                 Event::PlayerAttached { epoch } => format!("attached:{epoch}"),
                 Event::PlayerDetached { epoch } => format!("detached:{epoch}"),
@@ -1031,7 +1155,7 @@ mod tests {
                 Event::Compacted { summary, .. } => format!("compacted:{summary}"),
                 Event::CompactionFailed { message } => format!("compaction-failed:{message}"),
                 Event::TurnEnded { reason, .. } => format!("end:{reason:?}"),
-                Event::ModelDelta { .. } => unreachable!("filtered"),
+                Event::ModelDelta { .. } | Event::Titled { .. } => unreachable!("filtered"),
             })
             .collect()
     }
@@ -2027,5 +2151,225 @@ mod tests {
         assert!(!m[0].text().contains("first"));
         assert_eq!(m[1].text(), "r2");
         assert_eq!(m[2].text(), "third");
+    }
+
+    fn titled(title: &str, description: &str, hold: bool) -> Event {
+        Event::Titled {
+            title: title.into(),
+            description: description.into(),
+            hold,
+        }
+    }
+
+    /// The titles the player published, as `(title, description)`.
+    fn titles(h: &Harness) -> Vec<(String, String)> {
+        h.events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Titled {
+                    title,
+                    description,
+                    hold: false,
+                } => Some((title, description)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Until the title calls the session made have their outcome.
+    async fn named(h: &Harness, calls: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while h.provider.titles().len() < calls {
+            assert!(Instant::now() < deadline, "no title call came");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Until `n` turns have ended.
+    async fn turns_ended(h: &Harness, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let ended = || {
+            h.events()
+                .iter()
+                .filter(|e| matches!(e, Event::TurnEnded { .. }))
+                .count()
+        };
+        while ended() < n {
+            assert!(Instant::now() < deadline, "timed out waiting for {n} turns");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_message_names_the_session_once() {
+        let h = harness();
+        h.send("fix the flaky login test please").await;
+        named(&h, 1).await;
+        turns_ended(&h, 1).await;
+        h.send("and the logout one").await;
+        turns_ended(&h, 2).await;
+        assert_eq!(
+            titles(&h),
+            [(
+                "fix the flaky login test please".to_string(),
+                "mock: fix the flaky login test please".to_string()
+            )]
+        );
+        let calls = h.provider.titles();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].model, "mock-small");
+        assert!(calls[0].tools.is_empty());
+        assert_eq!(
+            calls[0].messages[0].text(),
+            "<session>\nfix the flaky login test please\n</session>"
+        );
+        // the turns' calls are theirs alone
+        let (kinds, reqs) = h.finish(2).await;
+        assert_eq!(kinds.len(), 6);
+        assert_eq!(reqs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_named_session_resumed_is_not_named_again() {
+        let mut log = vec![sent("first"), started("first")];
+        log.extend(by_player(vec![
+            logged_reply("r1"),
+            ended(TurnEndReason::Completed),
+            titled("First", "The first.", false),
+        ]));
+        let h = resumed(log);
+        h.send("second").await;
+        let provider = h.provider.clone();
+        h.finish(1).await;
+        assert!(provider.titles().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_session_resumed_is_named_after_its_first_message() {
+        let mut log = vec![sent("first"), started("first")];
+        log.extend(by_player(vec![
+            logged_reply("r1"),
+            ended(TurnEndReason::Completed),
+        ]));
+        log.extend([sent("second"), started("second")]);
+        log.extend(by_player(vec![
+            logged_reply("r2"),
+            ended(TurnEndReason::Completed),
+        ]));
+        let h = resumed(log);
+        named(&h, 1).await;
+        assert_eq!(
+            titles(&h),
+            [("first".to_string(), "mock: first".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_compaction_renames_the_session_from_its_summary() {
+        let h = resumed_with(Vec::new(), SMALL);
+        read_after_a_turn(
+            &h,
+            40_000,
+            vec![
+                Script::text("SUMMARY of the work", Duration::ZERO),
+                Script::text("done", Duration::ZERO),
+            ],
+        )
+        .await;
+        named(&h, 2).await;
+        let calls = h.provider.titles();
+        let retitle = calls[1].messages[0].text();
+        assert!(retitle.starts_with("<current>\nTitle: the first message, which a compaction\n"));
+        assert!(retitle.ends_with("<session>\nSUMMARY of the work\n</session>"));
+        assert_eq!(titles(&h)[1].0, "SUMMARY of the work");
+        h.finish(2).await;
+    }
+
+    #[tokio::test]
+    async fn a_held_name_is_kept_through_compactions_until_released() {
+        let h = resumed_with(Vec::new(), SMALL);
+        h.tx.send(("in-rename".into(), titled("Mine", "As I named it.", true)))
+            .await
+            .unwrap();
+        read_after_a_turn(
+            &h,
+            40_000,
+            vec![
+                Script::text("SUMMARY", Duration::ZERO),
+                Script::text("done", Duration::ZERO),
+            ],
+        )
+        .await;
+        turns_ended(&h, 2).await;
+        assert!(h.provider.titles().is_empty());
+        assert!(titles(&h).is_empty());
+
+        // released, the next compaction names it again, from the name it has
+        h.tx.send(("in-release".into(), titled("Mine", "As I named it.", false)))
+            .await
+            .unwrap();
+        let line = "y".repeat(99);
+        let file = h.workdir.join("big2.txt");
+        std::fs::write(&file, format!("{line}\n").repeat(400)).unwrap();
+        h.provider.reset([
+            tool_script(&[("c2", "Read", json!({ "file_path": file }))]),
+            Script::text("SUMMARY 2", Duration::ZERO),
+            Script::text("done 2", Duration::ZERO),
+        ]);
+        h.send("read the other").await;
+        named(&h, 1).await;
+        assert!(h.provider.titles()[0].messages[0]
+            .text()
+            .starts_with("<current>\nTitle: Mine\nDescription: As I named it.\n"));
+        assert_eq!(titles(&h)[0].0, "SUMMARY 2");
+        h.finish(3).await;
+    }
+
+    #[tokio::test]
+    async fn a_name_held_while_a_title_call_runs_wins() {
+        let h = harness();
+        h.provider.reset_titles([Script::text(
+            r#"{"title": "Theirs", "description": "The model's."}"#,
+            Duration::from_millis(300),
+        )]);
+        h.send("hello").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        h.tx.send(("in-rename".into(), titled("Mine", "As I named it.", true)))
+            .await
+            .unwrap();
+        let published = h.published.clone();
+        // the session ends only once the call has its outcome
+        h.finish(1).await;
+        assert!(!published
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, e)| matches!(e, Event::Titled { hold: false, .. })));
+    }
+
+    #[tokio::test]
+    async fn a_failed_title_call_names_nothing_and_the_next_turn_tries_again() {
+        let h = harness();
+        h.provider.reset_titles([
+            Script::Fail {
+                delay: Duration::ZERO,
+                error: ProviderError::Api {
+                    status: 400,
+                    message: "no".into(),
+                    retryable: false,
+                },
+            },
+            Script::text("Fix the login test", Duration::ZERO),
+        ]);
+        h.send("one").await;
+        named(&h, 1).await;
+        turns_ended(&h, 1).await;
+        h.send("two").await;
+        named(&h, 2).await;
+        assert!(titles(&h).is_empty());
+        let (kinds, _) = h.finish(2).await;
+        assert_eq!(kinds.len(), 6);
+        assert_eq!(kinds[5], "end:Completed");
     }
 }

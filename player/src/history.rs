@@ -133,7 +133,8 @@ impl Entry {
             | Event::ModelDelta { .. }
             | Event::ModelCancelled
             | Event::Error { .. }
-            | Event::CompactionFailed { .. } => None,
+            | Event::CompactionFailed { .. }
+            | Event::Titled { .. } => None,
         }
     }
 
