@@ -27,7 +27,7 @@ use crate::session::chlive::ChliveSession;
 use crate::session::control::Lease;
 use crate::session::Session;
 use crate::tools::Registry;
-use dirigent_protocol::control::{Part, SessionSpec};
+use dirigent_protocol::control::{Part, Provider as ModelProvider, SessionSpec};
 use dirigent_protocol::Event;
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
@@ -102,9 +102,10 @@ struct Cli {
     #[arg(long, env = "DIRIGENT_STATE_DIR")]
     state_dir: Option<PathBuf>,
 
-    /// The model's context window in tokens; the context is compacted at 85% of it.
-    #[arg(long, env = "DIRIGENT_CONTEXT_WINDOW", default_value_t = 200_000)]
-    context_window: u64,
+    /// The model's context window in tokens; the context is compacted at 85% of it. Without
+    /// it, the provider's: Claude's 200k, or the 272k GPT models take in.
+    #[arg(long, env = "DIRIGENT_CONTEXT_WINDOW")]
+    context_window: Option<u64>,
 
     /// Stopped from outside (SIGTERM: its machine is going), how long the turn running may
     /// take to finish before it's cut, in seconds; then the workspace is checkpointed and the
@@ -117,6 +118,14 @@ struct Cli {
 
     #[arg(long, env = "ANTHROPIC_BASE_URL")]
     base_url: Option<String>,
+
+    /// OpenAI's API, which a ChatGPT-plan session's model calls go to (keep the `/v1/`).
+    #[arg(
+        long,
+        env = "OPENAI_BASE_URL",
+        default_value = "https://api.openai.com/v1/"
+    )]
+    openai_base_url: String,
 }
 
 #[tokio::main]
@@ -131,19 +140,6 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli: &'static Cli = Box::leak(Box::new(Cli::parse()));
     let mut signals = stop::signals();
-
-    let provider: Arc<dyn Provider> = if cli.mock {
-        Arc::new(provider::mock::MockProvider::long())
-    } else {
-        let key = cli
-            .api_key
-            .clone()
-            .context("--api-key / ANTHROPIC_API_KEY is required unless --mock")?;
-        Arc::new(provider::genai::GenaiProvider::new(
-            key,
-            cli.base_url.clone(),
-        )?)
-    };
 
     std::fs::create_dir_all(&cli.workdir)
         .with_context(|| format!("--workdir {}", cli.workdir.display()))?;
@@ -208,6 +204,27 @@ async fn main() -> anyhow::Result<()> {
     let spec: &'static SessionSpec = Box::leak(Box::new(lease.spec.clone()));
     let mut session = ChliveSession::new(&id, lease.epoch, &cli.chlive_url, lease.tokens());
     let run = async {
+        // the spec's, which the lease came with
+        let provider: Arc<dyn Provider> = match spec.provider {
+            _ if cli.mock => Arc::new(provider::mock::MockProvider::long()),
+            ModelProvider::Anthropic => {
+                let key = cli.api_key.clone().context(
+                    "--api-key / ANTHROPIC_API_KEY is required for Anthropic's models, unless --mock",
+                )?;
+                Arc::new(provider::genai::GenaiProvider::new(
+                    key,
+                    cli.base_url.clone(),
+                )?)
+            }
+            ModelProvider::Chatgpt => Arc::new(provider::genai::GenaiProvider::chatgpt(
+                lease.plan_tokens(),
+                cli.openai_base_url.clone(),
+            )?),
+        };
+        let context_window = cli.context_window.unwrap_or(match spec.provider {
+            ModelProvider::Anthropic => 200_000,
+            ModelProvider::Chatgpt => 272_000,
+        });
         let log = workspace::open(&mut session, workdir, spec.source.as_ref(), checkpoints).await?;
         let (system, tools): (&'static str, Registry) = match spec.part {
             // after the workspace is made: its AGENTS.md is part of the prompt
@@ -232,7 +249,7 @@ async fn main() -> anyhow::Result<()> {
                 model: &spec.model,
                 system,
                 effort: spec.effort,
-                context_window: cli.context_window,
+                context_window,
             },
             tools: Arc::new(tools),
             workdir,

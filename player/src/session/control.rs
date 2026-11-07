@@ -2,7 +2,8 @@
 //! `protocol/proto`), held for as long as the call is open. A broken call is made again and the
 //! lease resumed; if control says it's gone, the lease is lost and the player must stop. Once the
 //! session is stopped, control tells the player to detach ([`Lease::detach`]). The lease comes
-//! with the player's credentials, which control sends afresh while it's held ([`Lease::tokens`]).
+//! with the player's credentials, which control sends afresh while it's held ([`Lease::tokens`]),
+//! and at once when asked ([`PlanTokens`]: a ChatGPT plan's access token OpenAI refused).
 
 use std::time::Duration;
 
@@ -32,6 +33,8 @@ pub struct Lease {
     /// What the session runs.
     pub spec: SessionSpec,
     tokens: watch::Receiver<pb::Tokens>,
+    /// Asks control for credentials afresh; `true`: the access token was refused.
+    refresh: mpsc::Sender<bool>,
     lost: CancellationToken,
     /// Ends the call; `true`: handing the session over first.
     release: Option<oneshot::Sender<bool>>,
@@ -82,6 +85,7 @@ impl Lease {
         let (release, released) = oneshot::channel();
         let (detach, detached) = watch::channel(None);
         let (tokens_tx, tokens) = watch::channel(tokens);
+        let (refresh, refreshes) = mpsc::channel(4);
         let task = tokio::spawn(keep(
             url.to_string(),
             ask(Some(epoch)),
@@ -90,11 +94,13 @@ impl Lease {
             released,
             detach,
             tokens_tx,
+            refreshes,
         ));
         Ok(Lease {
             epoch,
             spec,
             tokens,
+            refresh,
             lost,
             release: Some(release),
             detach: detached,
@@ -105,6 +111,14 @@ impl Lease {
     /// The player's latest credentials.
     pub fn tokens(&self) -> watch::Receiver<pb::Tokens> {
         self.tokens.clone()
+    }
+
+    /// The ChatGPT plan's access tokens, a ChatGPT-plan session's.
+    pub fn plan_tokens(&self) -> PlanTokens {
+        PlanTokens {
+            tokens: self.tokens.clone(),
+            refresh: self.refresh.clone(),
+        }
     }
 
     /// Whether to stop now, once control says the session is stopped; `None` until then. A
@@ -158,6 +172,51 @@ pub fn owner_token(
     move || {
         let owner = tokens.borrow().owner.clone();
         std::future::ready(owner.ok_or("the lease has no credentials for its owner"))
+    }
+}
+
+/// A ChatGPT plan's access tokens for OpenAI, from the lease's credentials: control renews
+/// them, and sends one afresh when the one it sent last is refused.
+#[derive(Clone)]
+pub struct PlanTokens {
+    tokens: watch::Receiver<pb::Tokens>,
+    refresh: mpsc::Sender<bool>,
+}
+
+/// How long control may take to send an access token in place of one refused.
+const RENEW_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl PlanTokens {
+    #[cfg(test)]
+    pub fn new(tokens: watch::Receiver<pb::Tokens>, refresh: mpsc::Sender<bool>) -> Self {
+        PlanTokens { tokens, refresh }
+    }
+
+    /// The latest, or why there's none (control's word).
+    pub fn current(&self) -> Result<String, String> {
+        let t = self.tokens.borrow();
+        match (&t.openai, &t.openai_unavailable) {
+            (Some(token), _) => Ok(token.clone()),
+            (None, Some(why)) => Err(why.clone()),
+            (None, None) => Err("control sent no access token for the ChatGPT plan".into()),
+        }
+    }
+
+    /// Another than `refused`, once control sends one (or says why it can't).
+    pub async fn renewed(&self, refused: &str) -> Result<String, String> {
+        self.refresh
+            .send(true)
+            .await
+            .map_err(|_| "the lease is gone".to_string())?;
+        let mut tokens = self.tokens.clone();
+        let wait = tokens
+            .wait_for(|t| t.openai.as_deref() != Some(refused) || t.openai_unavailable.is_some());
+        let waited = match tokio::time::timeout(RENEW_TIMEOUT, wait).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(_)) => Err("the lease is gone".to_string()),
+            Err(_) => Err("control sent no new access token for the ChatGPT plan".to_string()),
+        };
+        waited.and_then(|()| self.current())
     }
 }
 
@@ -238,7 +297,8 @@ pub enum Refused {
 
 /// Holds the call open, calling again and resuming (`resume`) when it breaks, until the lease
 /// is released or lost; passes control's word to detach on to `detach`, and its fresh
-/// credentials to `tokens`.
+/// credentials to `tokens`; asks for them afresh when `refreshes` says so.
+#[allow(clippy::too_many_arguments)]
 async fn keep(
     url: String,
     resume: pb::Acquire,
@@ -247,6 +307,7 @@ async fn keep(
     mut released: oneshot::Receiver<bool>,
     detach: watch::Sender<Option<bool>>,
     tokens: watch::Sender<pb::Tokens>,
+    mut refreshes: mpsc::Receiver<bool>,
 ) {
     loop {
         // the call, until it breaks
@@ -262,6 +323,10 @@ async fn keep(
                     drop(tx);
                     while let Ok(Some(_)) = rx.message().await {}
                     return;
+                }
+                Some(rejected) = refreshes.recv() => {
+                    let msg = pb::from_player::Msg::RefreshTokens(pb::RefreshTokens { rejected });
+                    let _ = call.tx.send(pb::FromPlayer { msg: Some(msg) }).await;
                 }
                 msg = call.rx.message() => match msg {
                     Ok(Some(pb::ToPlayer { msg: Some(pb::to_player::Msg::Detach(d)) })) => {

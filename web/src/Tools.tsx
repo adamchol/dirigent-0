@@ -31,7 +31,7 @@ function short(path: string): string {
 }
 
 function Mono({ children }: { children: ReactNode }) {
-  return <code className="rounded bg-muted px-1 py-px font-mono text-[0.85em] text-foreground/80">{children}</code>;
+  return <code className="font-mono text-[12px] text-foreground">{children}</code>;
 }
 
 /** The first line of `s`, cut short. */

@@ -1,12 +1,13 @@
-// The page: the sessions control has (the sidebar), and the one picked (its id in the URL's
-// hash), whose log is read live through chlive. Who looks depends on control's auth: in
-// `declared` (dev), the user chosen in the account menu; in `oidc`, whoever signed in with Google.
+// The page: a top bar with the session picked (its id in the URL's hash) and its controls, the
+// sessions control has (the sidebar), the session picked, whose log is read live through chlive,
+// and a status bar. Who looks depends on control's auth: in `declared`
+// (dev), the user chosen in the account menu; in `oidc`, whoever signed in with Google.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LiveClient, defaultUrl } from "@chlive/client";
 import { LiveClientProvider } from "@chlive/client/react";
 import { AnimatePresence, motion } from "motion/react";
-import { ChevronsUpDownIcon, LogOutIcon, MonitorIcon, MoonIcon, PlusIcon, SunIcon, UserRoundPenIcon, WaypointsIcon } from "lucide-react";
+import { ChevronsUpDownIcon, LinkIcon, LogOutIcon, MenuIcon, MonitorIcon, MoonIcon, PlusIcon, SunIcon, UserRoundPenIcon, WaypointsIcon } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -25,17 +26,19 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group";
-import { SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { Toaster } from "@/components/ui/sonner";
 import { Spinner } from "@/components/ui/spinner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ThemeProvider, useTheme, type Theme } from "@/lib/theme";
+import { cn } from "@/lib/utils";
 import * as api from "./api.ts";
-import type { Who } from "./api.ts";
+import type { SessionInfo, Who } from "./api.ts";
+import { ChatGptDialog, useMe } from "./Link.tsx";
 import { useGoogle } from "./Login.tsx";
-import logo from "./logo.svg";
-import { Session } from "./Session.tsx";
-import { NewSession, SessionsSidebar, useSessions } from "./Sessions.tsx";
+import { Session, Viewers, type LiveStatus } from "./Session.tsx";
+import { NewSession, SessionMenu, SessionsSidebar, useSessions } from "./Sessions.tsx";
+import { tokens } from "./Timeline.tsx";
 
 export function App() {
   return (
@@ -57,7 +60,7 @@ function Root() {
   if (error)
     return (
       <Centered>
-        <Alert variant="destructive" className="max-w-md">
+        <Alert variant="destructive" className="max-w-md border-0 bg-panel">
           <AlertTitle>Control is unreachable</AlertTitle>
           <AlertDescription>{error}</AlertDescription>
         </Alert>
@@ -73,8 +76,9 @@ function Root() {
 }
 
 function Centered({ children }: { children: React.ReactNode }) {
-  return <div className="flex min-h-svh items-center justify-center bg-muted/30 p-6">{children}</div>;
+  return <div className="flex min-h-svh items-center justify-center bg-background p-6">{children}</div>;
 }
+
 
 /** A connection to chlive as `who`, closed when they change (not when their token's renewed:
  * the client asks for the latest one). */
@@ -117,6 +121,15 @@ function remembered(key: string, fallback: string): string {
   }
 }
 
+function remember(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // a private window: not remembered
+  }
+}
+
+
 /** `declared` auth: whoever the account menu says. */
 function Declared() {
   const [user, setUser] = useState(() => remembered("dirigent.user", "user:dev"));
@@ -125,11 +138,7 @@ function Declared() {
     const u = to.trim();
     if (!u) return;
     setUser(u);
-    try {
-      localStorage.setItem("dirigent.user", u);
-    } catch {
-      // a private window: not remembered
-    }
+    remember("dirigent.user", u);
   }
   return <Page who={who} become={become} />;
 }
@@ -141,16 +150,15 @@ function SignedIn(props: { clientId: string }) {
     return (
       <Centered>
         <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4, ease: [0.23, 1, 0.32, 1] }}>
-          <Card className="w-full max-w-sm">
+          <Card className="w-full max-w-sm border-0 bg-panel ring-0">
             <CardHeader className="items-center text-center">
-              <img src={logo} alt="" className="mx-auto mb-2 size-12 rounded-xl" />
-              <CardTitle className="text-xl">Sign in to dirigent</CardTitle>
+              <CardTitle className="text-lg text-strong">Sign in to dirigent</CardTitle>
               <CardDescription>With your Google account, to see your sessions.</CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col items-center gap-4">
               <div ref={google.button} className="min-h-10" />
               {google.error && (
-                <Alert variant="destructive">
+                <Alert variant="destructive" className="border-0 bg-background">
                   <AlertDescription>{google.error}</AlertDescription>
                 </Alert>
               )}
@@ -165,86 +173,172 @@ function SignedIn(props: { clientId: string }) {
 function Page(props: { who: Who; become?: (user: string) => void; signOut?: () => void }) {
   const [selected, select] = useHash();
   const [creating, setCreating] = useState(false);
+  const [browsing, setBrowsing] = useState(false);
+  const [linking, setLinking] = useState(false);
+  const [status, setStatus] = useState<LiveStatus | null>(null);
   const client = useClient(props.who);
   const sessions = useSessions(props.who);
+  // read again once the ChatGPT dialog closes: it may have been linked meanwhile
+  const { me, refresh: refreshMe } = useMe(props.who, 30000);
+  useEffect(() => {
+    if (!linking) refreshMe();
+  }, [linking, refreshMe]);
   const info = sessions.list.find((s) => s.id === selected);
+  // the status bar shows the session open; another one reports its own
+  useEffect(() => setStatus(null), [selected]);
+  const report = useCallback((s: LiveStatus) => setStatus(s), []);
   // the sidebar reads chlive too (when each session was last active)
   if (!client) return null;
 
+  const sidebar = (className?: string) => (
+    <SessionsSidebar
+      sessions={sessions}
+      selected={selected}
+      select={(id) => {
+        select(id);
+        setBrowsing(false);
+      }}
+      who={props.who}
+      create={() => setCreating(true)}
+      account={<Account who={props.who} become={props.become} signOut={props.signOut} link={() => setLinking(true)} />}
+      className={className}
+    />
+  );
+
   return (
     <LiveClientProvider client={client}>
-      <SidebarProvider>
-        <SessionsSidebar
-          sessions={sessions}
-          selected={selected}
-          select={select}
-          who={props.who}
-          create={() => setCreating(true)}
-          account={<Account who={props.who} become={props.become} signOut={props.signOut} />}
-        />
-        <SidebarInset className="min-w-0 overflow-hidden">
-          <AnimatePresence mode="wait" initial={false}>
-            <motion.div
-              key={`${props.who.user}/${selected}`}
-              className="min-w-0"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              transition={{ duration: 0.15 }}
-            >
-              {!selected ? (
-                <Welcome create={() => setCreating(true)} />
-              ) : (
-                <Session
-                  id={selected}
-                  client={client}
-                  who={props.who}
-                  info={info}
-                  listed={sessions.listed}
-                  become={props.become}
-                  changed={sessions.refresh}
-                />
-              )}
-            </motion.div>
-          </AnimatePresence>
-        </SidebarInset>
-        <NewSession
-          open={creating}
-          setOpen={setCreating}
-          who={props.who}
-          made={(id) => {
-            select(id);
-            sessions.refresh();
-          }}
-        />
-      </SidebarProvider>
+      <div className="flex h-svh flex-col bg-background">
+        <header className="flex h-9.5 shrink-0 items-stretch bg-panel">
+          <button
+            type="button"
+            className="flex w-10 items-center justify-center text-muted-foreground hover:text-foreground md:hidden"
+            onClick={() => setBrowsing(true)}
+          >
+            <MenuIcon className="size-4" />
+            <span className="sr-only">Sessions</span>
+          </button>
+          <a href="#" className="hidden w-58 shrink-0 items-center px-3.5 font-medium text-strong md:flex">
+            dirigent
+          </a>
+          <h1 className="flex min-w-0 items-center px-3 text-[13px] font-normal text-strong md:px-4">
+            <span className="truncate">{info ? api.title(info) : selected ? "Session" : ""}</span>
+          </h1>
+          <div className="ml-auto flex shrink-0 items-center gap-1 px-2">
+            {info?.role === "owner" && <Viewers info={info} who={props.who} changed={sessions.refresh} />}
+            {selected && <SessionMenu id={selected} info={info} who={props.who} changed={sessions.refresh} />}
+          </div>
+        </header>
+        <div className="flex min-h-0 flex-1">
+          {sidebar("hidden md:flex")}
+          <main className="min-w-0 flex-1">
+            <AnimatePresence mode="wait" initial={false}>
+              <motion.div
+                key={`${props.who.user}/${selected}`}
+                className="h-full min-w-0"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.12 }}
+              >
+                {!selected ? (
+                  <Welcome create={() => setCreating(true)} />
+                ) : (
+                  <Session
+                    id={selected}
+                    client={client}
+                    who={props.who}
+                    info={info}
+                    listed={sessions.listed}
+                    become={props.become}
+                    report={report}
+                    me={me}
+                    connect={() => setLinking(true)}
+                  />
+                )}
+              </motion.div>
+            </AnimatePresence>
+          </main>
+        </div>
+        <StatusBar info={info} status={selected ? status : null} />
+      </div>
+      <Sheet open={browsing} onOpenChange={setBrowsing}>
+        <SheetContent side="left" className="w-64 gap-0 border-0 p-0" showCloseButton={false}>
+          <SheetTitle className="sr-only">Sessions</SheetTitle>
+          {sidebar("h-full w-full")}
+        </SheetContent>
+      </Sheet>
+      <NewSession
+        open={creating}
+        setOpen={setCreating}
+        who={props.who}
+        me={me}
+        connect={() => setLinking(true)}
+        made={(id) => {
+          select(id);
+          sessions.refresh();
+        }}
+      />
+      <ChatGptDialog who={props.who} declared={!!props.become} open={linking} setOpen={setLinking} />
     </LiveClientProvider>
+  );
+}
+
+/** What's known of the session open: chlive's connection, its player, the turn, the model. */
+function StatusBar({ info, status }: { info?: SessionInfo; status: LiveStatus | null }) {
+  const live = !status
+    ? null
+    : status.log === "live"
+      ? { dot: "bg-success", label: "Live" }
+      : status.log === "error"
+        ? { dot: "bg-destructive", label: status.error ? `Offline: ${status.error}` : "Offline" }
+        : { dot: "bg-primary", label: "Connecting" };
+  const player = info?.player;
+  return (
+    <footer className="flex h-6 shrink-0 items-center gap-4 overflow-hidden bg-panel px-3 text-[11.5px] whitespace-nowrap text-muted-foreground">
+      {live && (
+        <span className="flex items-center gap-1.5">
+          <span aria-hidden="true" className={cn("size-1.5 rounded-full", live.dot)} />
+          {live.label}
+        </span>
+      )}
+      {info &&
+        (player ? (
+          <span>
+            Player {player.subject.replace(/^player:/, "").slice(0, 8)} · epoch {info.epoch}
+            {player.attached ? "" : " · away"}
+          </span>
+        ) : (
+          <span>Idle</span>
+        ))}
+      {status?.running && <span className="text-primary-text">Working</span>}
+      <span className="flex-1" />
+      {info && (
+        <span className="hidden sm:inline">
+          {info.spec.model}
+          {info.spec.effort ? ` · ${info.spec.effort}` : ""}
+        </span>
+      )}
+      {status && status.context > 0 && <span className="hidden sm:inline">{tokens(status.context)} context</span>}
+    </footer>
   );
 }
 
 function Welcome({ create }: { create: () => void }) {
   return (
-    <div className="flex h-svh flex-col">
-      <header className="flex h-14 shrink-0 items-center px-3">
-        <SidebarTrigger />
-      </header>
-      <Empty className="flex-1">
-        <EmptyHeader>
-          <EmptyMedia variant="icon">
-            <WaypointsIcon />
-          </EmptyMedia>
-          <EmptyTitle>Pick a session</EmptyTitle>
-          <EmptyDescription>
-            Or make one: a coder works in a repository, a dirigent directs your coders.
-          </EmptyDescription>
-        </EmptyHeader>
-        <EmptyContent>
-          <Button onClick={create}>
-            <PlusIcon /> New session
-          </Button>
-        </EmptyContent>
-      </Empty>
-    </div>
+    <Empty className="h-full">
+      <EmptyHeader>
+        <EmptyMedia variant="icon" className="bg-panel">
+          <WaypointsIcon />
+        </EmptyMedia>
+        <EmptyTitle className="text-strong">Pick a session</EmptyTitle>
+        <EmptyDescription>Or make one: a coder works in a repository, a dirigent directs your coders.</EmptyDescription>
+      </EmptyHeader>
+      <EmptyContent>
+        <Button size="sm" onClick={create}>
+          <PlusIcon /> New session
+        </Button>
+      </EmptyContent>
+    </Empty>
   );
 }
 
@@ -256,80 +350,76 @@ function initials(user: string): string {
 }
 
 /** Who looks, and the theme; signing out, or (declared auth) looking as someone else. */
-function Account(props: { who: Who; become?: (user: string) => void; signOut?: () => void }) {
+function Account(props: { who: Who; become?: (user: string) => void; signOut?: () => void; link: () => void }) {
   const { theme, setTheme } = useTheme();
   const [draft, setDraft] = useState(props.who.user);
   useEffect(() => setDraft(props.who.user), [props.who.user]);
   return (
-    <SidebarMenu>
-      <SidebarMenuItem>
-        <DropdownMenu>
-          <DropdownMenuTrigger render={<SidebarMenuButton size="lg" />}>
-            <Avatar className="size-8 rounded-lg">
-              <AvatarFallback className="rounded-lg">{initials(props.who.user)}</AvatarFallback>
-            </Avatar>
-            <div className="grid flex-1 text-left text-sm leading-tight">
-              <span className="truncate font-medium">{props.who.user.replace(/^user:/, "")}</span>
-              <span className="truncate text-xs text-muted-foreground">{props.signOut ? "Google" : "declared (dev)"}</span>
-            </div>
-            <ChevronsUpDownIcon className="ml-auto size-4" />
-          </DropdownMenuTrigger>
-          <DropdownMenuContent side="top" align="start" className="w-(--anchor-width) min-w-64">
-            {props.become && (
-              <>
-                <DropdownMenuGroup>
-                  <DropdownMenuLabel>Look as</DropdownMenuLabel>
-                </DropdownMenuGroup>
-                <form
-                  className="px-1.5 pb-1.5"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    props.become!(draft);
-                  }}
-                >
-                  <InputGroup>
-                    <InputGroupAddon>
-                      <UserRoundPenIcon />
-                    </InputGroupAddon>
-                    <InputGroupInput
-                      value={draft}
-                      onChange={(e) => setDraft(e.target.value)}
-                      onKeyDown={(e) => e.stopPropagation()}
-                      spellCheck={false}
-                    />
-                    <InputGroupAddon align="inline-end">
-                      <InputGroupButton type="submit">Go</InputGroupButton>
-                    </InputGroupAddon>
-                  </InputGroup>
-                </form>
-                <DropdownMenuSeparator />
-              </>
-            )}
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={<button type="button" className="flex w-full items-center gap-2 rounded-[5px] p-1.5 text-left hover:bg-accent aria-expanded:bg-accent" />}
+      >
+        <Avatar className="size-6 rounded-[5px]">
+          <AvatarFallback className="rounded-[5px] bg-secondary text-[10px] text-subtle">{initials(props.who.user)}</AvatarFallback>
+        </Avatar>
+        <span className="min-w-0 flex-1 truncate text-xs text-subtle">{props.who.user.replace(/^user:/, "")}</span>
+        <ChevronsUpDownIcon className="size-3.5 text-dim" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent side="top" align="start" className="w-(--anchor-width) min-w-64">
+        {props.become && (
+          <>
             <DropdownMenuGroup>
-              <DropdownMenuLabel>Theme</DropdownMenuLabel>
-              <DropdownMenuRadioGroup value={theme} onValueChange={(v) => setTheme(v as Theme)}>
-                <DropdownMenuRadioItem value="light">
-                  <SunIcon /> Light
-                </DropdownMenuRadioItem>
-                <DropdownMenuRadioItem value="dark">
-                  <MoonIcon /> Dark
-                </DropdownMenuRadioItem>
-                <DropdownMenuRadioItem value="system">
-                  <MonitorIcon /> System
-                </DropdownMenuRadioItem>
-              </DropdownMenuRadioGroup>
+              <DropdownMenuLabel>Look as</DropdownMenuLabel>
             </DropdownMenuGroup>
-            {props.signOut && (
-              <>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={props.signOut}>
-                  <LogOutIcon /> Sign out
-                </DropdownMenuItem>
-              </>
-            )}
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </SidebarMenuItem>
-    </SidebarMenu>
+            <form
+              className="px-1.5 pb-1.5"
+              onSubmit={(e) => {
+                e.preventDefault();
+                props.become!(draft);
+              }}
+            >
+              <InputGroup>
+                <InputGroupAddon>
+                  <UserRoundPenIcon />
+                </InputGroupAddon>
+                <InputGroupInput value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => e.stopPropagation()} spellCheck={false} />
+                <InputGroupAddon align="inline-end">
+                  <InputGroupButton type="submit">Go</InputGroupButton>
+                </InputGroupAddon>
+              </InputGroup>
+            </form>
+            <DropdownMenuSeparator />
+          </>
+        )}
+        <DropdownMenuGroup>
+          <DropdownMenuItem onClick={props.link}>
+            <LinkIcon /> ChatGPT plan
+          </DropdownMenuItem>
+        </DropdownMenuGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuGroup>
+          <DropdownMenuLabel>Theme</DropdownMenuLabel>
+          <DropdownMenuRadioGroup value={theme} onValueChange={(v) => setTheme(v as Theme)}>
+            <DropdownMenuRadioItem value="dark">
+              <MoonIcon /> Dark
+            </DropdownMenuRadioItem>
+            <DropdownMenuRadioItem value="light">
+              <SunIcon /> Light
+            </DropdownMenuRadioItem>
+            <DropdownMenuRadioItem value="system">
+              <MonitorIcon /> System
+            </DropdownMenuRadioItem>
+          </DropdownMenuRadioGroup>
+        </DropdownMenuGroup>
+        {props.signOut && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={props.signOut}>
+              <LogOutIcon /> Sign out
+            </DropdownMenuItem>
+          </>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }

@@ -112,7 +112,7 @@ in
 
   env = {
     RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
-    # the session the dev player runs and `chat` opens, as `user:dev` (chat's default)
+    # the session the dev player runs, `user:dev`'s
     DIRIGENT_SESSION = "d1a1e000-0000-4000-8000-000000000001";
   };
 
@@ -120,7 +120,8 @@ in
 
   processes = stack.processes // {
     # Control's signing key, made once in .dnvr/control-key (kept by `reset-data`): `key.pem`,
-    # and `jwks.json`, its public half, which chlive verifies control's credentials with.
+    # and `jwks.json`, its public half, which chlive verifies control's credentials with; and
+    # `link.key`, which ChatGPT links are encrypted with.
     # Publishes `ready`; then idles.
     keys = {
       command = ''
@@ -158,7 +159,7 @@ in
         # shellcheck disable=SC2086
         exec target/debug/control --listen "127.0.0.1:$port" --grpc-listen "127.0.0.1:$grpc" \
           --postgres "''${PG_URL/:\/\/*@/://dirigent_control@}" \
-          --signing-key .dnvr/control-key/key.pem \
+          --signing-key .dnvr/control-key/key.pem --link-key .dnvr/control-key/link.key \
           --players .dnvr/sessions --player target/debug/player \
           -- ''${DIRIGENT_PLAYER_ARGS---mock}
       '';
@@ -239,13 +240,11 @@ in
   };
 
   scripts = stack.scripts // {
-    chat = {
-      description = "The terminal client on $DIRIGENT_SESSION (or --session <uuid>), as user:dev (or --user <subject>)";
-      runtimeInputs = [ dnvrState ];
+    dirigent = {
+      description = "dirigent's CLI (cli/): dirigent login <url> [--control] [--as <subject>], whoami, link chatgpt, unlink chatgpt, models, logout";
       text = ''
-        ${stackEnv}
         cd "$DNVR_ROOT"
-        exec cargo run -q -p dirigent-chat -- "$@"
+        exec cargo run -q -p dirigent-cli -- "$@"
       '';
     };
     session = {
@@ -375,8 +374,8 @@ in
       text = ''
         ${stackEnv}
         cd "$DNVR_ROOT"
-        # control's tests run it
-        cargo build -q -p dirigent-player
+        # control's tests run them
+        cargo build -q -p dirigent-player -p dirigent-cli
         DIRIGENT_E2E=1 cargo test -p dirigent-control e2e "$@"
         DIRIGENT_E2E=1 exec cargo test -p dirigent-player e2e "$@"
       '';

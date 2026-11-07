@@ -3,6 +3,7 @@ import {
   createHighlighterCore,
   type GrammarState,
   type HighlighterCore,
+  type ThemeRegistration,
 } from "shiki/core"
 import { createJavaScriptRegexEngine } from "shiki/engine/javascript"
 
@@ -40,14 +41,55 @@ const aliases: Record<string, keyof typeof languages> = {
   zsh: "bash",
 }
 
+// dirigent's colours for code: its one accent for keywords, green for literals, violet for types
+// and attributes, the rest in its text greys (index.css)
+function theme(name: string, type: "light" | "dark", c: Record<string, string>): ThemeRegistration {
+  return {
+    name,
+    type,
+    colors: { "editor.foreground": c.text!, "editor.background": "#00000000" },
+    tokenColors: [
+      { settings: { foreground: c.text } },
+      { scope: ["comment", "punctuation.definition.comment"], settings: { foreground: c.comment, fontStyle: "italic" } },
+      { scope: ["keyword", "storage", "keyword.operator.new", "keyword.control"], settings: { foreground: c.keyword } },
+      { scope: ["string", "constant.numeric", "constant.language", "constant.character"], settings: { foreground: c.literal } },
+      { scope: ["entity.name.type", "support.type", "entity.name.class", "meta.attribute", "entity.other.attribute-name", "support.class"], settings: { foreground: c.type } },
+      { scope: ["entity.name.function", "support.function", "meta.function-call"], settings: { foreground: c.function } },
+      { scope: ["punctuation", "keyword.operator", "meta.brace"], settings: { foreground: c.punctuation } },
+      { scope: ["markup.inserted"], settings: { foreground: c.literal } },
+      { scope: ["markup.deleted"], settings: { foreground: c.deleted } },
+    ],
+  }
+}
+
+const themes = [
+  theme("dirigent-dark", "dark", {
+    text: "#c9ccd1",
+    comment: "#6a6f78",
+    keyword: "#e8a33d",
+    literal: "#92d2a9",
+    type: "#c3a3e8",
+    function: "#edeef0",
+    punctuation: "#8b9098",
+    deleted: "#e39a88",
+  }),
+  theme("dirigent-light", "light", {
+    text: "#27272a",
+    comment: "#8b8b95",
+    keyword: "#a6640d",
+    literal: "#1f7a4d",
+    type: "#7c3aed",
+    function: "#18181b",
+    punctuation: "#71717a",
+    deleted: "#b4401e",
+  }),
+]
+
 let highlighter: Promise<HighlighterCore> | undefined
 
 function getHighlighter() {
   highlighter ??= createHighlighterCore({
-    themes: [
-      import("shiki/themes/github-light.mjs"),
-      import("shiki/themes/github-dark.mjs"),
-    ],
+    themes,
     langs: [],
     engine: createJavaScriptRegexEngine({ forgiving: true }),
   })
@@ -91,7 +133,7 @@ export async function loadHighlighter(language: string) {
       const tokenize = (text: string) =>
         shiki.codeToTokens(text, {
           lang,
-          themes: { light: "github-light", dark: "github-dark" },
+          themes: { light: "dirigent-light", dark: "dirigent-dark" },
           defaultColor: false,
           grammarState: state,
         }).tokens

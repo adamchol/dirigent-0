@@ -362,3 +362,19 @@ export interface ActivityRow {
 export function millis(ts: string | Date): number {
   return ts instanceof Date ? ts.getTime() : Date.parse(ts.includes("T") ? ts : `${ts.replace(" ", "T")}Z`);
 }
+
+/** How much of the model's context the session uses: its last call's input (cached or not) and
+ * output, which the next call carries; 0 before it has one. */
+export function contextSize(rows: readonly EventRow[]): number {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i]!;
+    if (row.kind !== "assistant_message") continue;
+    try {
+      const u: Usage = JSON.parse(row.data).usage;
+      return u.input + u.cache_read + u.cache_write + u.output;
+    } catch {
+      return 0;
+    }
+  }
+  return 0;
+}

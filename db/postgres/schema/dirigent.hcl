@@ -139,13 +139,50 @@ function "dirigent.grant_insert_kinds" {
   SQL
 }
 
+# The ChatGPT plan each user linked, which their sessions' model calls may be paid with (Sign in
+# with ChatGPT's plan usage): the grant OpenAI issued, renewed by control alone, since every
+# renewal replaces the refresh token. `account` and `email` are the ChatGPT account's (its ID
+# token's `sub` and `email`), `client_id` the client OpenAI registered for it, `id_token` the
+# last one (a hint when signing in again), `refresh_token` encrypted with control's link key.
+# `broken`: why the grant no longer renews (revoked, expired), until it's linked again.
+table "dirigent.chatgpt_links" {
+  column "subject" { type = text }
+  column "account" {
+    type = text
+    null = false
+  }
+  column "email" {
+    type = text
+    null = false
+  }
+  column "client_id" {
+    type = text
+    null = false
+  }
+  column "id_token" {
+    type = text
+    null = false
+  }
+  column "refresh_token" {
+    type = bytea
+    null = false
+  }
+  column "broken" { type = text }
+  column "updated" {
+    type    = timestamptz
+    null    = false
+    default = sql("now()")
+  }
+  primary_key { columns = [column.subject] }
+}
+
 publication "dirigent_chlive" {
   tables = [table.dirigent.session_access, table.dirigent.insert_kinds]
 }
 
 grant {
   privileges = [SELECT, INSERT, UPDATE, DELETE]
-  on         = [table.dirigent.sessions, table.dirigent.session_access]
+  on         = [table.dirigent.sessions, table.dirigent.session_access, table.dirigent.chatgpt_links]
   to         = [role.dirigent_control]
 }
 

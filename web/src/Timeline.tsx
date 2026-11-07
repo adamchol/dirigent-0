@@ -23,7 +23,7 @@ import {
 
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
-import { Message, MessageContent, MessageFooter, MessageHeader } from "@/components/ui/message";
+import { Message, MessageContent, MessageHeader } from "@/components/ui/message";
 import { MessageScrollerItem } from "@/components/ui/message-scroller";
 import { Spinner } from "@/components/ui/spinner";
 import {
@@ -135,8 +135,8 @@ function Writing({ blocks }: { blocks: readonly Streamed[] }) {
         group[0]!.t === "text" ? (
           <Message key={group[0]!.key}>
             <MessageContent>
-              <Bubble variant="ghost">
-                <BubbleContent>
+              <Bubble variant="ghost" className="w-full">
+                <BubbleContent className="w-full">
                   <Markdown text={group[0]!.text} />
                 </BubbleContent>
               </Bubble>
@@ -184,38 +184,37 @@ function Entry(props: { block: Block; running: boolean; sending: ReadonlySet<str
     case "user": {
       const sending = props.sending.has(b.key);
       return (
-        <Message align="end">
-          <MessageContent>
-            {(b.author !== props.me || b.via) && (
-              <MessageHeader>
-                {b.via ? (
-                  <span>
-                    via dirigent{" "}
-                    <a className="font-mono underline-offset-3 hover:underline" href={`#${b.via}`}>
-                      {b.via.slice(0, 8)}
-                    </a>
-                  </span>
-                ) : (
-                  b.author
-                )}
-              </MessageHeader>
-            )}
-            <Bubble align="end">
-              <BubbleContent className="whitespace-pre-wrap">{b.text}</BubbleContent>
-            </Bubble>
-            <MessageFooter className="gap-1.5 font-normal">
+        <Message>
+          <MessageContent className="gap-1">
+            <MessageHeader className="gap-1 px-0 font-normal text-dim">
+              {b.via ? (
+                <span>
+                  Dirigent{" "}
+                  <a className="font-mono underline-offset-3 hover:underline" href={`#${b.via}`}>
+                    {b.via.slice(0, 8)}
+                  </a>
+                </span>
+              ) : b.author === props.me ? (
+                "You"
+              ) : (
+                b.author.replace(/^user:/, "")
+              )}
+              <span>·</span>
               {sending ? (
-                <>
+                <span className="flex items-center gap-1">
                   <Spinner className="size-3" /> Sending
-                </>
+                </span>
               ) : b.queued ? (
-                <>
+                <span className="flex items-center gap-1">
                   <ClockIcon className="size-3" /> Queued · {time(b.ts)}
-                </>
+                </span>
               ) : (
                 time(b.ts)
               )}
-            </MessageFooter>
+            </MessageHeader>
+            <Bubble variant="muted" className="w-full max-w-full">
+              <BubbleContent className="w-full rounded-md px-3 py-2 whitespace-pre-wrap text-strong">{b.text}</BubbleContent>
+            </Bubble>
           </MessageContent>
         </Message>
       );
@@ -247,8 +246,8 @@ function Entry(props: { block: Block; running: boolean; sending: ReadonlySet<str
       return (
         <Message>
           <MessageContent>
-            <Bubble variant="ghost">
-              <BubbleContent>
+            <Bubble variant="ghost" className="w-full">
+              <BubbleContent className="w-full">
                 <Markdown text={b.text} />
               </BubbleContent>
             </Bubble>
@@ -366,7 +365,7 @@ function Note(props: { kind: string; tone: "dim" | "error"; text: string; detail
   );
 }
 
-function tokens(n: number): string {
+export function tokens(n: number): string {
   return n >= 10_000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
 }
 

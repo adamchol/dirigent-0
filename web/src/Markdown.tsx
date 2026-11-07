@@ -14,7 +14,7 @@ const components: Components = {
     const fence = /language-(\S+)/.exec(className ?? "");
     // fenced (it has a language, or spans lines): a block; else inline
     if (fence || text.includes("\n")) return <Code code={text} language={fence?.[1] ?? "text"} title={fence?.[1]} />;
-    return <code className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[0.85em]">{children}</code>;
+    return <code className="rounded-[3px] bg-secondary px-1.5 py-px font-mono text-[0.88em] text-primary-text">{children}</code>;
   },
   a: ({ children, href }) => (
     <a href={href} target="_blank" rel="noreferrer" className="font-medium underline underline-offset-3 hover:text-foreground/80">
@@ -41,7 +41,7 @@ const components: Components = {
 
 export const Markdown = memo(function Markdown({ text }: { text: string }) {
   return (
-    <div className="flex min-w-0 flex-col gap-3 text-sm">
+    <div className="flex min-w-0 flex-col gap-3 text-[14px] leading-relaxed">
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
         {text}
       </ReactMarkdown>

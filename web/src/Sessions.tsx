@@ -17,7 +17,6 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -41,29 +40,15 @@ import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel, FieldTit
 import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import {
-  Sidebar,
-  SidebarContent,
-  SidebarFooter,
-  SidebarGroup,
-  SidebarGroupAction,
-  SidebarGroupContent,
-  SidebarGroupLabel,
-  SidebarHeader,
-  SidebarMenu,
-  SidebarMenuAction,
-  SidebarMenuButton,
-  SidebarMenuItem,
-  SidebarMenuSkeleton,
-  SidebarRail,
-} from "@/components/ui/sidebar";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { cn } from "@/lib/utils";
 import * as api from "./api.ts";
-import type { Effort, Part, SessionInfo } from "./api.ts";
+import type { Effort, Me, Model, Part, Provider, SessionInfo } from "./api.ts";
+import { linked } from "./Link.tsx";
 import { ACTIVITY_QUERY, millis, type ActivityRow } from "./events.ts";
-import logo from "./logo.svg";
 
 const POLL_MS = 2000;
 
@@ -103,31 +88,18 @@ export function useSessions(who: api.Who): Polled {
   return { list, listed: listed && !failing, refresh };
 }
 
-const STATES = {
-  active: { label: "Active", dot: "bg-emerald-500", ring: "bg-emerald-500/40" },
-  away: { label: "Away", dot: "bg-amber-500", ring: "bg-amber-500/40" },
-  idle: { label: "Idle", dot: "bg-muted-foreground/40", ring: "" },
+const DOTS = {
+  active: "bg-primary shadow-[0_0_0_3px_color-mix(in_oklab,var(--primary)_22%,transparent)]",
+  away: "bg-dim",
+  idle: "bg-transparent ring-1 ring-dim ring-inset",
 } as const;
 
-/** A session's state as a dot: pulsing while a player runs it. */
-export function StateDot({ info, className = "" }: { info: SessionInfo; className?: string }) {
-  const s = STATES[api.state(info)];
-  return (
-    <span className={`relative flex size-2 shrink-0 ${className}`}>
-      {s.ring && <span className={`absolute inline-flex size-full animate-ping rounded-full ${s.ring}`} />}
-      <span className={`relative inline-flex size-2 rounded-full ${s.dot}`} />
-    </span>
-  );
-}
+const STATE_NAMES = { active: "running", away: "its player away", idle: "idle" } as const;
 
-export function StateBadge({ info }: { info: SessionInfo }) {
-  return (
-    <Badge variant="secondary" className="gap-1.5 font-normal">
-      <StateDot info={info} />
-      {STATES[api.state(info)].label}
-      <span className="text-muted-foreground tabular-nums">#{info.epoch}</span>
-    </Badge>
-  );
+/** A session's state as a small dot: the accent, haloed, while a player runs it; grey while its
+ * player's away; a ring while idle. */
+export function StateDot({ info, className = "" }: { info: SessionInfo; className?: string }) {
+  return <span aria-hidden="true" className={cn("inline-block size-1.5 shrink-0 rounded-full", DOTS[api.state(info)], className)} />;
 }
 
 /** Run `f`, then show what it changed; or say why it failed. */
@@ -197,8 +169,18 @@ export function SessionMenu(props: { id: string; info?: SessionInfo; who: api.Wh
   );
 }
 
-const MotionItem = motion.create(SidebarMenuItem);
+/** `list`, the most recently active first: its latest event, or its making (one just made has
+ * none yet). */
+export function useByActivity(list: SessionInfo[]): SessionInfo[] {
+  const activity = useLiveQuery<ActivityRow & Record<string, unknown>>(ACTIVITY_QUERY);
+  return useMemo(() => {
+    const last = new Map(activity.rows.map((r) => [r.session_id, millis(r.last)]));
+    const at = (s: SessionInfo) => Math.max(s.created, last.get(s.id) || 0);
+    return [...list].sort((a, b) => at(b) - at(a));
+  }, [activity.rows, list]);
+}
 
+/** The sessions, by title: a filter, the user's, and those shared with them. */
 export function SessionsSidebar(props: {
   sessions: Polled;
   selected: string;
@@ -206,66 +188,50 @@ export function SessionsSidebar(props: {
   who: api.Who;
   create: () => void;
   account: React.ReactNode;
+  className?: string;
 }) {
-  const { listed } = props.sessions;
-  // the most recently active first: its latest event, or its making (one just made has none yet)
-  const activity = useLiveQuery<ActivityRow & Record<string, unknown>>(ACTIVITY_QUERY);
-  const active = useMemo(() => {
-    const last = new Map(activity.rows.map((r) => [r.session_id, millis(r.last)]));
-    return new Map(props.sessions.list.map((s) => [s.id, Math.max(s.created, last.get(s.id) || 0)]));
-  }, [activity.rows, props.sessions.list]);
-  const list = [...props.sessions.list].sort((a, b) => active.get(b.id)! - active.get(a.id)!);
-  const mine = list.filter((s) => s.role === "owner");
-  const shared = list.filter((s) => s.role !== "owner");
+  const [filter, setFilter] = useState("");
+  const sorted = useByActivity(props.sessions.list);
+  const shown = sorted.filter((s) => api.title(s).toLowerCase().includes(filter.trim().toLowerCase()));
+  const mine = shown.filter((s) => s.role === "owner");
+  const shared = shown.filter((s) => s.role !== "owner");
   return (
-    <Sidebar>
-      <SidebarHeader>
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton size="lg" render={<a href="#" />}>
-              <img src={logo} alt="" className="size-8 rounded-lg ring-1 ring-border" />
-              <div className="grid flex-1 text-left leading-tight">
-                <span className="font-semibold">dirigent</span>
-                <span className="text-xs text-muted-foreground">coding agents, conducted</span>
-              </div>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-        </SidebarMenu>
-        <Button variant="outline" className="justify-start" onClick={props.create}>
-          <PlusIcon /> New session
-        </Button>
-      </SidebarHeader>
-      <SidebarContent>
-        <SidebarGroup>
-          <SidebarGroupLabel>Sessions</SidebarGroupLabel>
-          <SidebarGroupAction title="New session" onClick={props.create}>
-            <PlusIcon />
-            <span className="sr-only">New session</span>
-          </SidebarGroupAction>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {!listed && list.length === 0 && [0, 1, 2].map((i) => <SidebarMenuSkeleton key={i} showIcon />)}
-              {listed && mine.length === 0 && (
-                <p className="px-2 py-1.5 text-xs text-muted-foreground">None yet: make one.</p>
-              )}
-              <SessionItems list={mine} {...props} />
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-        {shared.length > 0 && (
-          <SidebarGroup>
-            <SidebarGroupLabel>Shared with you</SidebarGroupLabel>
-            <SidebarGroupContent>
-              <SidebarMenu>
-                <SessionItems list={shared} {...props} />
-              </SidebarMenu>
-            </SidebarGroupContent>
-          </SidebarGroup>
+    <nav aria-label="Sessions" className={cn("flex w-58 shrink-0 flex-col gap-2 bg-panel p-2", props.className)}>
+      <label htmlFor="filter" className="sr-only">
+        Filter sessions
+      </label>
+      <Input
+        id="filter"
+        value={filter}
+        onChange={(e) => setFilter(e.target.value)}
+        placeholder="Filter sessions"
+        className="h-7 border-0 bg-secondary px-2 text-xs shadow-none md:text-xs dark:bg-secondary"
+      />
+      <div className="-mx-1 flex min-h-0 flex-1 flex-col overflow-y-auto px-1">
+        {!props.sessions.listed && sorted.length === 0 && (
+          <div className="flex flex-col gap-1">
+            {[0, 1, 2].map((i) => (
+              <Skeleton key={i} className="h-6 bg-secondary" />
+            ))}
+          </div>
         )}
-      </SidebarContent>
-      <SidebarFooter>{props.account}</SidebarFooter>
-      <SidebarRail />
-    </Sidebar>
+        <SessionItems list={mine} {...props} />
+        {shared.length > 0 && (
+          <>
+            <span className="mt-3 mb-1 px-2 text-[11px] text-dim">Shared with you</span>
+            <SessionItems list={shared} {...props} />
+          </>
+        )}
+        <button
+          type="button"
+          onClick={props.create}
+          className="mt-1.5 flex h-7 shrink-0 items-center gap-1.5 rounded-[5px] px-2 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+        >
+          <PlusIcon className="size-3.5" /> New session
+        </button>
+      </div>
+      {props.account}
+    </nav>
   );
 }
 
@@ -277,58 +243,80 @@ function SessionItems(props: {
   sessions: Polled;
 }) {
   return (
-    <AnimatePresence initial={false}>
-      {props.list.map((s) => {
-        const owner = s.role === "owner";
-        const st = api.state(s);
-        return (
-          <MotionItem
-            key={s.id}
-            layout="position"
-            initial={{ opacity: 0, x: -8 }}
-            animate={{ opacity: 1, x: 0 }}
-            exit={{ opacity: 0, x: -8 }}
-            transition={{ duration: 0.2 }}
-          >
-            <SidebarMenuButton isActive={s.id === props.selected} onClick={() => props.select(s.id)} title={api.title(s)}>
-              <span className="truncate">{api.title(s)}</span>
-            </SidebarMenuButton>
-            <DropdownMenu>
-              <DropdownMenuTrigger render={<SidebarMenuAction showOnHover />}>
-                <EllipsisIcon />
-                <span className="sr-only">More</span>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent side="right" align="start" className="w-48">
-                <DropdownMenuGroup>
-                  {owner && st === "idle" && (
-                    <DropdownMenuItem onClick={act("Not started", () => api.start(props.who, s.id), props.sessions.refresh)}>
-                      <PlayIcon /> Start
-                    </DropdownMenuItem>
-                  )}
-                  {owner && st !== "idle" && (
-                    <>
-                      <DropdownMenuItem onClick={act("Not stopped", () => api.stop(props.who, s.id, false), props.sessions.refresh)}>
-                        <SquareIcon /> Stop
+    <ul className="flex flex-col gap-px">
+      <AnimatePresence initial={false}>
+        {props.list.map((s) => {
+          const owner = s.role === "owner";
+          const st = api.state(s);
+          const current = s.id === props.selected;
+          return (
+            <motion.li
+              key={s.id}
+              layout="position"
+              initial={{ opacity: 0, x: -6 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -6 }}
+              transition={{ duration: 0.18 }}
+              className="group/item relative"
+            >
+              <button
+                type="button"
+                onClick={() => props.select(s.id)}
+                title={api.title(s)}
+                aria-current={current ? "page" : undefined}
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-[5px] py-1 pr-7 pl-2 text-left transition-colors",
+                  current ? "bg-accent text-strong" : "text-subtle hover:bg-accent/60 hover:text-foreground",
+                )}
+              >
+                <StateDot info={s} />
+                <span className="truncate">{api.title(s)}</span>
+                <span className="sr-only">, {STATE_NAMES[st]}</span>
+              </button>
+              <DropdownMenu>
+                <DropdownMenuTrigger
+                  render={
+                    <button
+                      type="button"
+                      className="absolute top-1/2 right-1 flex size-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground opacity-0 group-hover/item:opacity-100 hover:bg-secondary hover:text-foreground focus-visible:opacity-100 aria-expanded:opacity-100"
+                    />
+                  }
+                >
+                  <EllipsisIcon className="size-3.5" />
+                  <span className="sr-only">More</span>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent side="right" align="start" className="w-48">
+                  <DropdownMenuGroup>
+                    {owner && st === "idle" && (
+                      <DropdownMenuItem onClick={act("Not started", () => api.start(props.who, s.id), props.sessions.refresh)}>
+                        <PlayIcon /> Start
                       </DropdownMenuItem>
-                      <DropdownMenuItem
-                        variant="destructive"
-                        onClick={act("Not stopped", () => api.stop(props.who, s.id, true), props.sessions.refresh)}
-                      >
-                        <OctagonXIcon /> Stop now
-                      </DropdownMenuItem>
-                    </>
-                  )}
-                </DropdownMenuGroup>
-                {owner && <DropdownMenuSeparator />}
-                <DropdownMenuItem onClick={() => navigator.clipboard.writeText(s.id).then(() => toast.success("Session id copied"))}>
-                  <CopyIcon /> Copy id
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </MotionItem>
-        );
-      })}
-    </AnimatePresence>
+                    )}
+                    {owner && st !== "idle" && (
+                      <>
+                        <DropdownMenuItem onClick={act("Not stopped", () => api.stop(props.who, s.id, false), props.sessions.refresh)}>
+                          <SquareIcon /> Stop
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          variant="destructive"
+                          onClick={act("Not stopped", () => api.stop(props.who, s.id, true), props.sessions.refresh)}
+                        >
+                          <OctagonXIcon /> Stop now
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                  </DropdownMenuGroup>
+                  {owner && <DropdownMenuSeparator />}
+                  <DropdownMenuItem onClick={() => navigator.clipboard.writeText(s.id).then(() => toast.success("Session ID copied"))}>
+                    <CopyIcon /> Copy ID
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </motion.li>
+          );
+        })}
+      </AnimatePresence>
+    </ul>
   );
 }
 
@@ -340,15 +328,56 @@ const EFFORTS: { value: Effort | "none"; label: string }[] = [
   { value: "max", label: "Max" },
 ];
 
-/** Making a session, `who`'s: a coder on a repository, or a dirigent. */
-export function NewSession(props: { open: boolean; setOpen: (open: boolean) => void; who: api.Who; made: (id: string) => void }) {
+const PROVIDERS: { value: Provider; label: string }[] = [
+  { value: "anthropic", label: "Anthropic API" },
+  { value: "chatgpt", label: "ChatGPT plan" },
+];
+
+const CLAUDE = "claude-sonnet-5";
+
+/** Making a session, `who`'s: a coder on a repository, or a dirigent; paid to Anthropic, or with
+ * their ChatGPT plan (`connect` links one). */
+export function NewSession(props: {
+  open: boolean;
+  setOpen: (open: boolean) => void;
+  who: api.Who;
+  me: Me | null;
+  connect: () => void;
+  made: (id: string) => void;
+}) {
   const [part, setPart] = useState<Part>("coder");
   const [git, setGit] = useState("");
   const [ref, setRef] = useState("");
-  const [model, setModel] = useState("claude-sonnet-5");
+  const [provider, setProvider] = useState<Provider>("anthropic");
+  const [models, setModels] = useState<Model[] | null>(null);
+  const [model, setModel] = useState(CLAUDE);
   const [effort, setEffort] = useState<Effort | "none">("medium");
   const [start, setStart] = useState(true);
   const [busy, setBusy] = useState(false);
+  const plan = linked(props.me);
+  const { who } = props;
+
+  // the plan's models, once it's chosen: the first, unless one of them is
+  useEffect(() => {
+    if (provider !== "chatgpt" || !props.open) return;
+    let gone = false;
+    api.models(who).then(
+      (list) => {
+        if (gone) return;
+        setModels(list);
+        setModel((m) => (list.some((x) => x.slug === m) ? m : (list[0]?.slug ?? "")));
+      },
+      (err) => !gone && toast.error("The plan's models aren't listed", { description: (err as Error).message }),
+    );
+    return () => {
+      gone = true;
+    };
+  }, [provider, props.open, who]);
+
+  function choose(p: Provider) {
+    setProvider(p);
+    if (p === "anthropic") setModel(CLAUDE);
+  }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -357,7 +386,7 @@ export function NewSession(props: { open: boolean; setOpen: (open: boolean) => v
       part === "coder" && git.trim() ? { git: { url: git.trim(), ...(ref.trim() ? { ref: ref.trim() } : {}) } } : null;
     setBusy(true);
     try {
-      await api.put(props.who, id, { model, effort: effort === "none" ? null : effort, source, part }, start);
+      await api.put(props.who, id, { model, effort: effort === "none" ? null : effort, source, part, provider }, start);
       props.setOpen(false);
       props.made(id);
     } catch (err) {
@@ -425,10 +454,53 @@ export function NewSession(props: { open: boolean; setOpen: (open: boolean) => v
                 </motion.div>
               )}
             </AnimatePresence>
+            <Field>
+              <FieldLabel>Paid with</FieldLabel>
+              <Select items={PROVIDERS} value={provider} onValueChange={(v) => v && choose(v as Provider)}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {PROVIDERS.map((p) => (
+                    <SelectItem key={p.value} value={p.value} disabled={p.value === "chatgpt" && !plan}>
+                      {p.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {!plan && (
+                <FieldDescription>
+                  {props.me?.chatgpt?.broken ? "Your ChatGPT link is broken: " : "No ChatGPT plan is linked: "}
+                  <button type="button" className="text-primary-text hover:underline" onClick={props.connect}>
+                    link it
+                  </button>
+                  .
+                </FieldDescription>
+              )}
+            </Field>
             <div className="grid gap-4 sm:grid-cols-[1fr_10rem]">
               <Field>
                 <FieldLabel htmlFor="model">Model</FieldLabel>
-                <Input id="model" value={model} onChange={(e) => setModel(e.target.value)} required />
+                {provider === "chatgpt" ? (
+                  <Select
+                    items={(models ?? []).map((m) => ({ value: m.slug, label: m.display_name }))}
+                    value={model}
+                    onValueChange={(v) => v && setModel(v as string)}
+                  >
+                    <SelectTrigger className="w-full" id="model" disabled={!models}>
+                      <SelectValue placeholder={models ? "No models" : "Listing…"} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {(models ?? []).map((m) => (
+                        <SelectItem key={m.slug} value={m.slug}>
+                          {m.display_name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <Input id="model" value={model} onChange={(e) => setModel(e.target.value)} required />
+                )}
               </Field>
               <Field>
                 <FieldLabel>Thinking</FieldLabel>
@@ -456,7 +528,7 @@ export function NewSession(props: { open: boolean; setOpen: (open: boolean) => v
           </FieldGroup>
           <DialogFooter>
             <DialogClose render={<Button type="button" variant="outline" />}>Cancel</DialogClose>
-            <Button type="submit" disabled={busy}>
+            <Button type="submit" disabled={busy || !model}>
               {busy ? <Spinner /> : <PlusIcon />} Make it
             </Button>
           </DialogFooter>

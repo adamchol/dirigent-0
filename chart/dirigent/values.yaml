@@ -22,6 +22,11 @@ auth:
     clientIds: []
     # claims a token must have, e.g. {hd: example.com}; email_verified is always required
     requiredClaims: {}
+    # the CLI's OAuth client (`dirigent login`): a "Desktop app" one, whose secret isn't one
+    # (control hands it to the CLI); none, the CLI can't sign in
+    cli:
+      clientId: ""
+      clientSecret: ""
 
 # The chart's Postgres: a CloudNativePG Cluster, with control's and chlive's roles.
 postgres:

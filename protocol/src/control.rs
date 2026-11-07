@@ -29,6 +29,25 @@ pub struct SessionSpec {
     /// What the session's player plays.
     #[serde(default, skip_serializing_if = "Part::is_coder")]
     pub part: Part,
+    /// Who its model calls are paid to.
+    #[serde(default, skip_serializing_if = "Provider::is_anthropic")]
+    pub provider: Provider,
+}
+
+/// Who a session's model calls are paid to: Anthropic, with the player's API key; or OpenAI,
+/// with its owner's ChatGPT plan (linked through `dirigent link chatgpt`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+    #[default]
+    Anthropic,
+    Chatgpt,
+}
+
+impl Provider {
+    fn is_anthropic(&self) -> bool {
+        *self == Provider::Anthropic
+    }
 }
 
 /// What a session's player plays: a coder, in its workspace; or the dirigent, directing other
@@ -62,6 +81,7 @@ impl Default for SessionSpec {
             effort: default_effort(),
             source: None,
             part: Part::Coder,
+            provider: Provider::Anthropic,
         }
     }
 }
@@ -111,6 +131,10 @@ impl From<SessionSpec> for pb::SessionSpec {
                 Part::Coder => pb::Part::Coder,
                 Part::Dirigent => pb::Part::Dirigent,
             } as i32,
+            provider: match spec.provider {
+                Provider::Anthropic => pb::Provider::Anthropic,
+                Provider::Chatgpt => pb::Provider::Chatgpt,
+            } as i32,
         }
     }
 }
@@ -147,6 +171,16 @@ impl TryFrom<pb::SessionSpec> for SessionSpec {
                 Ok(pb::Part::Coder | pb::Part::Unspecified) => Part::Coder,
                 Ok(pb::Part::Dirigent) => Part::Dirigent,
                 Err(_) => return Err(format!("a spec with part {}, not one there is", spec.part)),
+            },
+            provider: match pb::Provider::try_from(spec.provider) {
+                Ok(pb::Provider::Anthropic | pb::Provider::Unspecified) => Provider::Anthropic,
+                Ok(pb::Provider::Chatgpt) => Provider::Chatgpt,
+                Err(_) => {
+                    return Err(format!(
+                        "a spec with provider {}, not one there is",
+                        spec.provider
+                    ))
+                }
             },
         })
     }
@@ -250,6 +284,11 @@ mod tests {
             serde_json::to_string(&git).unwrap(),
             r#"{"git":{"url":"u"}}"#
         );
+        // Anthropic's goes unsaid, as specs made before there was a choice say it
+        let chatgpt: SessionSpec = serde_json::from_str(r#"{"provider":"chatgpt"}"#).unwrap();
+        assert_eq!(chatgpt.provider, Provider::Chatgpt);
+        let default = serde_json::to_value(SessionSpec::default()).unwrap();
+        assert!(default.get("provider").is_none());
     }
 
     #[test]
@@ -265,6 +304,7 @@ mod tests {
                     reference: Some("main".into()),
                 }),
                 part: Part::Coder,
+                provider: Provider::Anthropic,
             },
             SessionSpec {
                 model: "m".into(),
@@ -274,12 +314,14 @@ mod tests {
                     reference: None,
                 }),
                 part: Part::Coder,
+                provider: Provider::Chatgpt,
             },
             SessionSpec {
                 model: "m".into(),
                 effort: None,
                 source: None,
                 part: Part::Dirigent,
+                provider: Provider::Anthropic,
             },
         ];
         for spec in specs {
@@ -292,6 +334,7 @@ mod tests {
             effort: Some(pb::Effort::Unspecified as i32),
             source: None,
             part: 0,
+            provider: 0,
         };
         assert!(SessionSpec::try_from(unspecified).is_err());
         assert!(SessionSpec::try_from(pb::SessionSpec::default()).is_err());

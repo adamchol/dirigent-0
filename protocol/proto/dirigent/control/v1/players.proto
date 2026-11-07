@@ -24,7 +24,15 @@ message FromPlayer {
   oneof msg {
     Acquire acquire = 1;
     Handoff handoff = 2;
+    RefreshTokens refresh_tokens = 3;
   }
+}
+
+// Any time after `Acquired`: credentials afresh now, answered with `Tokens`. `rejected`: the
+// model provider refused its access token (`Tokens.openai`), which control renews rather than
+// sending again.
+message RefreshTokens {
+  bool rejected = 1;
 }
 
 // Sent last, before ending the stream: the player is stopped from outside (its machine is
@@ -66,6 +74,10 @@ message Tokens {
   // A dirigent's: for chlive and control's API, as the session's owner, whom it acts for (the
   // player in its `act` claim).
   optional string owner = 2;
+  // A ChatGPT-plan session's: an access token of its owner's plan for OpenAI's Responses API,
+  // renewed by control (with a quarter of an hour left at least); or, none, why there's none.
+  optional string openai = 3;
+  optional string openai_unavailable = 4;
 }
 
 // Any time after `Acquired`: the session was stopped. The player finishes the turn running
@@ -85,6 +97,16 @@ message SessionSpec {
   }
   // What its player plays (unspecified: a coder).
   Part part = 4;
+  // Who its model calls are paid to (unspecified: Anthropic).
+  Provider provider = 5;
+}
+
+enum Provider {
+  PROVIDER_UNSPECIFIED = 0;
+  // Anthropic's API, with the player's API key.
+  PROVIDER_ANTHROPIC = 1;
+  // OpenAI's Responses API, paid with the session owner's ChatGPT plan.
+  PROVIDER_CHATGPT = 2;
 }
 
 enum Part {

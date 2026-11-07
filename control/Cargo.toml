@@ -29,7 +29,10 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.9"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
+# ChatGPT links (src/chatgpt.rs): their refresh tokens, encrypted in Postgres
+chacha20poly1305 = "0.10"
+thiserror = "2"
 async-trait = "0.1"
 # the KubeVirt runner (src/runner.rs): players in VirtualMachineInstances, as dynamic objects
 # (no generated CRD types), on aws-lc-rs as reqwest is (two rustls providers and neither is picked);

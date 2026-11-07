@@ -8,7 +8,7 @@
       // the theme (lib/theme.tsx) before the page renders
       try {
         const t = localStorage.getItem("dirigent.theme");
-        if (t === "dark" || (t !== "light" && matchMedia("(prefers-color-scheme: dark)").matches))
+        if (t !== "light" && (t !== "system" || matchMedia("(prefers-color-scheme: dark)").matches))
           document.documentElement.classList.add("dark");
       } catch {}
     </script>

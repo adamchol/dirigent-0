@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { callStart, streamed, timeline, type EventRow } from "./events.ts";
+import { callStart, contextSize, streamed, timeline, type EventRow } from "./events.ts";
 
 let offset = 0;
 function row(id: string, kind: string, data?: unknown, author = "player:p"): EventRow {
@@ -131,4 +131,16 @@ test("deltas make the reply being written; its call starts after the last bounda
     row("u", "user_message", { text: "and" }, "user:dev"),
   ];
   expect(callStart(rows)).toBe(1);
+});
+
+test("the context is the last model call's input and output", () => {
+  offset = 0;
+  const call = (id: string, input: number, cached: number, output: number) =>
+    row(id, "assistant_message", {
+      content: [{ type: "text", text: "ok" }],
+      stop_reason: { reason: "end_turn" },
+      usage: { input, output, cache_read: cached, cache_write: 0 },
+    });
+  expect(contextSize([])).toBe(0);
+  expect(contextSize([call("a", 100, 0, 10), call("b", 20, 110, 5), row("e", "turn_ended", { reason: "completed" })])).toBe(135);
 });

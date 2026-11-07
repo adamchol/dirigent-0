@@ -422,6 +422,109 @@ impl Store {
             .await?;
         Ok(n == 1)
     }
+
+    /// `subject`'s ChatGPT link, if they linked one.
+    pub async fn link(&self, subject: &str) -> anyhow::Result<Option<Link>> {
+        let row = self
+            .db
+            .lock()
+            .await
+            .query_opt(
+                "SELECT account, email, client_id, id_token, refresh_token, broken \
+                 FROM dirigent.chatgpt_links WHERE subject = $1",
+                &[&subject],
+            )
+            .await?;
+        Ok(row.map(|r| Link {
+            account: r.get(0),
+            email: r.get(1),
+            client_id: r.get(2),
+            id_token: r.get(3),
+            refresh_token: r.get(4),
+            broken: r.get(5),
+        }))
+    }
+
+    /// `subject`'s link is this one now, whatever it was.
+    pub async fn put_link(&self, subject: &str, link: &Link) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO dirigent.chatgpt_links \
+                 (subject, account, email, client_id, id_token, refresh_token, broken) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 ON CONFLICT (subject) DO UPDATE SET account = $2, email = $3, client_id = $4, \
+                 id_token = $5, refresh_token = $6, broken = $7, updated = now()",
+                &[
+                    &subject,
+                    &link.account,
+                    &link.email,
+                    &link.client_id,
+                    &link.id_token,
+                    &link.refresh_token,
+                    &link.broken,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The link's refresh token was replaced (`old` by `new`), or it's `broken`: unless it was
+    /// linked anew meanwhile (its refresh token isn't `old`); whether it was.
+    pub async fn renewed_link(
+        &self,
+        subject: &str,
+        old: &[u8],
+        new: Result<&[u8], &str>,
+    ) -> anyhow::Result<bool> {
+        let db = self.db.lock().await;
+        let n = match new {
+            Ok(new) => {
+                db.execute(
+                    "UPDATE dirigent.chatgpt_links SET refresh_token = $3, updated = now() \
+                     WHERE subject = $1 AND refresh_token = $2",
+                    &[&subject, &old, &new],
+                )
+                .await?
+            }
+            Err(broken) => {
+                db.execute(
+                    "UPDATE dirigent.chatgpt_links SET broken = $3, updated = now() \
+                     WHERE subject = $1 AND refresh_token = $2",
+                    &[&subject, &old, &broken],
+                )
+                .await?
+            }
+        };
+        Ok(n == 1)
+    }
+
+    /// Whether there was a link.
+    pub async fn delete_link(&self, subject: &str) -> anyhow::Result<bool> {
+        let n = self
+            .db
+            .lock()
+            .await
+            .execute(
+                "DELETE FROM dirigent.chatgpt_links WHERE subject = $1",
+                &[&subject],
+            )
+            .await?;
+        Ok(n == 1)
+    }
+}
+
+/// A user's ChatGPT link (`dirigent.chatgpt_links`), its refresh token as it's stored:
+/// encrypted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub account: String,
+    pub email: String,
+    pub client_id: String,
+    pub id_token: String,
+    pub refresh_token: Vec<u8>,
+    pub broken: Option<String>,
 }
 
 /// The sessions the caller (`$1`) owns or views, with their lease holders, owners and viewers,

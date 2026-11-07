@@ -26,7 +26,7 @@ pub const CALLER: &str = "dirigent-user";
 /// have, at most how often.
 const JWKS_REFRESH: Duration = Duration::from_secs(300);
 const JWKS_COOLDOWN: Duration = Duration::from_secs(30);
-const LEEWAY: u64 = 5;
+pub const LEEWAY: u64 = 5;
 
 pub struct Auth {
     pub signer: Signer,
@@ -108,6 +108,17 @@ pub struct OidcArgs {
         value_parser = required_claim
     )]
     pub required_claims: Vec<(String, Value)>,
+    /// The CLI's OAuth client, an installed app's (Google's "Desktop app"): its ID tokens are
+    /// taken too, and control hands it to the CLI to sign in with.
+    #[arg(long = "oidc-cli-client-id", env = "DIRIGENT_OIDC_CLI_CLIENT_ID")]
+    pub cli_client_id: Option<String>,
+    /// Its secret, which an installed app's isn't: it's handed out with the id.
+    #[arg(
+        long = "oidc-cli-client-secret",
+        env = "DIRIGENT_OIDC_CLI_CLIENT_SECRET",
+        hide_env_values = true
+    )]
+    pub cli_client_secret: Option<String>,
 }
 
 fn required_claim(s: &str) -> Result<(String, Value), String> {
@@ -126,13 +137,9 @@ enum Source {
     File(PathBuf),
 }
 
-/// Verifies an OpenID provider's ID tokens.
-pub struct Oidc {
-    issuers: Vec<String>,
-    audiences: Vec<String>,
-    subject_claim: String,
-    subject_prefix: String,
-    required_claims: BTreeMap<String, Value>,
+/// An OpenID provider's public keys (a JWKS: a URL, or a file), read again every
+/// [`JWKS_REFRESH`], and for a key id they don't have at once, at most every [`JWKS_COOLDOWN`].
+pub struct Keys {
     source: Source,
     keys: RwLock<JwkSet>,
     /// When the keys were last read; held while they're read again.
@@ -140,93 +147,48 @@ pub struct Oidc {
     http: reqwest::Client,
 }
 
-impl Oidc {
-    /// Its keys read (failing without them), then read again every [`JWKS_REFRESH`].
-    pub async fn start(args: &OidcArgs) -> anyhow::Result<Arc<Oidc>> {
-        anyhow::ensure!(!args.issuers.is_empty(), "--auth oidc needs --oidc-issuer");
-        anyhow::ensure!(
-            !args.audiences.is_empty(),
-            "--auth oidc needs --oidc-audience (the apps' client ids)"
-        );
-        let source = if args.jwks.starts_with("https://") || args.jwks.starts_with("http://") {
-            Source::Url(args.jwks.clone())
+impl Keys {
+    /// Read (failing without them), then read again while they're used.
+    pub async fn start(http: reqwest::Client, jwks: &str) -> anyhow::Result<Arc<Keys>> {
+        let source = if jwks.starts_with("https://") || jwks.starts_with("http://") {
+            Source::Url(jwks.into())
         } else {
-            Source::File(args.jwks.clone().into())
+            Source::File(jwks.into())
         };
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()?;
         let keys = load(&http, &source).await?;
-        let oidc = Arc::new(Oidc {
-            issuers: args.issuers.clone(),
-            audiences: args.audiences.clone(),
-            subject_claim: args.subject_claim.clone(),
-            subject_prefix: args.subject_prefix.clone(),
-            required_claims: args.required_claims.iter().cloned().collect(),
+        let keys = Arc::new(Keys {
             source,
             keys: RwLock::new(keys),
             loaded_at: tokio::sync::Mutex::new(Instant::now()),
             http,
         });
-        let weak = Arc::downgrade(&oidc);
+        let weak = Arc::downgrade(&keys);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(JWKS_REFRESH).await;
-                let Some(oidc) = weak.upgrade() else { return };
-                let mut loaded_at = oidc.loaded_at.lock().await;
-                oidc.reload().await;
+                let Some(keys) = weak.upgrade() else { return };
+                let mut loaded_at = keys.loaded_at.lock().await;
+                keys.reload().await;
                 *loaded_at = Instant::now();
             }
         });
-        Ok(oidc)
+        Ok(keys)
     }
 
-    /// The web's client id.
-    pub fn client_id(&self) -> &str {
-        &self.audiences[0]
-    }
-
-    /// The token's subject, or why it isn't taken.
-    pub async fn verify(&self, token: &str) -> Result<String, String> {
-        let header = jsonwebtoken::decode_header(token).map_err(|_| "a malformed token")?;
-        if matches!(
-            header.alg,
-            Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512
-        ) {
-            return Err("a token signed with a shared secret".into());
+    /// The key a token's header names.
+    pub async fn decoding(&self, kid: Option<&str>) -> Result<DecodingKey, String> {
+        if let Some(key) = self.key(kid) {
+            return Ok(key);
         }
-        let key = match self.key(header.kid.as_deref()) {
-            Some(key) => key,
-            None => {
-                // a key it doesn't have: read them again, unless that was just done
-                let mut loaded_at = self.loaded_at.lock().await;
-                if loaded_at.elapsed() >= JWKS_COOLDOWN {
-                    self.reload().await;
-                    *loaded_at = Instant::now();
-                }
-                drop(loaded_at);
-                self.key(header.kid.as_deref())
-                    .ok_or("signed with a key the provider doesn't have")?
-            }
-        };
-        let mut validation = Validation::new(header.alg);
-        validation.set_issuer(&self.issuers);
-        validation.set_audience(&self.audiences);
-        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
-        validation.validate_nbf = true;
-        validation.leeway = LEEWAY;
-        let claims = jsonwebtoken::decode::<Map<String, Value>>(token, &key, &validation)
-            .map_err(|e| format!("the token isn't taken: {e}"))?
-            .claims;
-        for (claim, want) in &self.required_claims {
-            if claims.get(claim) != Some(want) {
-                return Err(format!("the token's {claim} isn't {want}"));
-            }
+        // a key it doesn't have: read them again, unless that was just done
+        let mut loaded_at = self.loaded_at.lock().await;
+        if loaded_at.elapsed() >= JWKS_COOLDOWN {
+            self.reload().await;
+            *loaded_at = Instant::now();
         }
-        match claims.get(&self.subject_claim).and_then(Value::as_str) {
-            Some(s) if !s.is_empty() => Ok(format!("{}{s}", self.subject_prefix)),
-            _ => Err(format!("the token has no {}", self.subject_claim)),
-        }
+        drop(loaded_at);
+        self.key(kid)
+            .ok_or_else(|| "signed with a key the provider doesn't have".into())
     }
 
     /// The key named `kid` (or, with none named, the only one).
@@ -245,6 +207,97 @@ impl Oidc {
         match load(&self.http, &self.source).await {
             Ok(keys) => *self.keys.write().unwrap() = keys,
             Err(e) => warn!("reading the OpenID provider's keys again: {e:#}"),
+        }
+    }
+}
+
+/// A JWT's header, unless it's signed with a shared secret: a provider's keys are public.
+pub fn asymmetric_header(token: &str) -> Result<jsonwebtoken::Header, String> {
+    let header = jsonwebtoken::decode_header(token).map_err(|_| "a malformed token")?;
+    if matches!(
+        header.alg,
+        Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512
+    ) {
+        return Err("a token signed with a shared secret".into());
+    }
+    Ok(header)
+}
+
+/// Verifies an OpenID provider's ID tokens.
+pub struct Oidc {
+    issuers: Vec<String>,
+    audiences: Vec<String>,
+    subject_claim: String,
+    subject_prefix: String,
+    required_claims: BTreeMap<String, Value>,
+    keys: Arc<Keys>,
+    /// The CLI's OAuth client (an installed app's), when it signs in.
+    cli: Option<(String, String)>,
+}
+
+impl Oidc {
+    pub async fn start(args: &OidcArgs) -> anyhow::Result<Arc<Oidc>> {
+        anyhow::ensure!(!args.issuers.is_empty(), "--auth oidc needs --oidc-issuer");
+        anyhow::ensure!(
+            !args.audiences.is_empty(),
+            "--auth oidc needs --oidc-audience (the apps' client ids)"
+        );
+        let cli = match (&args.cli_client_id, &args.cli_client_secret) {
+            (Some(id), Some(secret)) => Some((id.clone(), secret.clone())),
+            (None, None) => None,
+            _ => anyhow::bail!("--oidc-cli-client-id and --oidc-cli-client-secret go together"),
+        };
+        let mut audiences = args.audiences.clone();
+        if let Some((id, _)) = &cli {
+            if !audiences.contains(id) {
+                audiences.push(id.clone());
+            }
+        }
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        Ok(Arc::new(Oidc {
+            issuers: args.issuers.clone(),
+            audiences,
+            subject_claim: args.subject_claim.clone(),
+            subject_prefix: args.subject_prefix.clone(),
+            required_claims: args.required_claims.iter().cloned().collect(),
+            keys: Keys::start(http, &args.jwks).await?,
+            cli,
+        }))
+    }
+
+    /// The web's client id.
+    pub fn client_id(&self) -> &str {
+        &self.audiences[0]
+    }
+
+    /// The CLI's client id and (an installed app's, not secret) secret.
+    pub fn cli(&self) -> Option<(&str, &str)> {
+        self.cli.as_ref().map(|(id, s)| (id.as_str(), s.as_str()))
+    }
+
+    /// The token's subject, or why it isn't taken.
+    pub async fn verify(&self, token: &str) -> Result<String, String> {
+        let header = asymmetric_header(token)?;
+        let key = self.keys.decoding(header.kid.as_deref()).await?;
+        let mut validation = Validation::new(header.alg);
+        validation.set_issuer(&self.issuers);
+        validation.set_audience(&self.audiences);
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.validate_nbf = true;
+        validation.leeway = LEEWAY;
+        let claims = jsonwebtoken::decode::<Map<String, Value>>(token, &key, &validation)
+            .map_err(|e| format!("the token isn't taken: {e}"))?
+            .claims;
+        for (claim, want) in &self.required_claims {
+            if claims.get(claim) != Some(want) {
+                return Err(format!("the token's {claim} isn't {want}"));
+            }
+        }
+        match claims.get(&self.subject_claim).and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => Ok(format!("{}{s}", self.subject_prefix)),
+            _ => Err(format!("the token has no {}", self.subject_claim)),
         }
     }
 }
@@ -314,6 +367,8 @@ pub mod test_provider {
                 subject_claim: "email".into(),
                 subject_prefix: "user:".into(),
                 required_claims: vec![("email_verified".into(), Value::Bool(true))],
+                cli_client_id: None,
+                cli_client_secret: None,
             }
         }
 
@@ -400,12 +455,32 @@ mod tests {
         let rotated = test_signer(ISSUER, Duration::from_secs(600));
         p.publish(&[&p.signer, &rotated]);
         // read just now: not again within the cooldown
-        *o.loaded_at.lock().await = Instant::now() - JWKS_COOLDOWN;
+        *o.keys.loaded_at.lock().await = Instant::now() - JWKS_COOLDOWN;
         let t = Provider::token_by(
             &rotated,
             serde_json::json!({ "aud": CLIENT, "email": "me@x.com", "email_verified": true }),
         );
         assert_eq!(o.verify(&t).await.unwrap(), "user:me@x.com");
+    }
+
+    #[tokio::test]
+    async fn the_clis_client_is_an_audience_too_and_is_handed_out() {
+        let p = Provider::new();
+        let mut args = p.args();
+        args.cli_client_id = Some("cli-client".into());
+        args.cli_client_secret = Some("not-secret".into());
+        let o = Oidc::start(&args).await.unwrap();
+        assert_eq!(o.client_id(), CLIENT);
+        assert_eq!(o.cli(), Some(("cli-client", "not-secret")));
+        let t = Provider::token_by(
+            &p.signer,
+            serde_json::json!({ "aud": "cli-client", "email": "me@x.com", "email_verified": true }),
+        );
+        assert_eq!(o.verify(&t).await.unwrap(), "user:me@x.com");
+        // its id without its secret, or the other way round, isn't a client
+        args.cli_client_secret = None;
+        assert!(Oidc::start(&args).await.is_err());
+        assert_eq!(oidc(&p).await.cli(), None);
     }
 
     #[test]

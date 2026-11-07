@@ -6,6 +6,7 @@
 //! that's lost without giving the lease back is started again once the lease expires.
 
 mod auth;
+mod chatgpt;
 mod leases;
 mod runner;
 mod token;
@@ -24,7 +25,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use dirigent_protocol::control::pb::players_server::{Players, PlayersServer};
-use dirigent_protocol::control::{pb, player_subject, Part, Role, SessionInfo, SessionSpec};
+use dirigent_protocol::control::{
+    pb, player_subject, Part, Provider, Role, SessionInfo, SessionSpec,
+};
 use serde::Deserialize;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
@@ -32,6 +35,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::chatgpt::{ChatGpt, ChatGptArgs, LinkInfo, Model, Started as LinkStarted};
 use crate::leases::{Acquire, Put, Reserve, Store};
 use crate::runner::{Kube, Local, Runner};
 use crate::token::{Signer, CHLIVE, CONTROL};
@@ -118,6 +122,9 @@ struct Cli {
     #[command(flatten)]
     oidc: OidcArgs,
 
+    #[command(flatten)]
+    chatgpt: ChatGptArgs,
+
     /// The key control signs credentials with: Ed25519, PKCS#8 PEM (`control keygen`).
     #[arg(long, env = "DIRIGENT_SIGNING_KEY", required = true)]
     signing_key: Option<PathBuf>,
@@ -152,6 +159,8 @@ enum AuthMode {
 struct Control {
     store: Store,
     auth: Auth,
+    /// The ChatGPT plans linked, which sessions may run on; none without a link key.
+    chatgpt: Option<ChatGpt>,
     runner: Option<&'static dyn Runner>,
     startup: Duration,
     /// Whether only the players it started get leases (`--reserved-only`).
@@ -186,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
     let postgres = cli.postgres.as_deref().expect("required");
     let signing_key = cli.signing_key.as_deref().expect("required");
     let signer = Signer::load(signing_key, &cli.issuer, Duration::from_secs(cli.token_ttl))?;
+    let chatgpt = ChatGpt::new(&cli.chatgpt, signer.kid())?;
     let oidc = match cli.auth {
         AuthMode::Declared => None,
         AuthMode::Oidc => Some(auth::Oidc::start(&cli.oidc).await?),
@@ -217,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
     let control = control(
         store,
         Auth { signer, oidc },
+        chatgpt,
         runner,
         Duration::from_secs(cli.startup),
         cli.reserved_only,
@@ -247,6 +258,7 @@ async fn main() -> anyhow::Result<()> {
 fn control(
     store: Store,
     auth: Auth,
+    chatgpt: Option<ChatGpt>,
     runner: Option<&'static dyn Runner>,
     startup: Duration,
     reserved_only: bool,
@@ -254,6 +266,7 @@ fn control(
     Box::leak(Box::new(Control {
         store,
         auth,
+        chatgpt,
         runner,
         startup,
         reserved_only,
@@ -273,18 +286,124 @@ fn router(control: &'static Control) -> Router {
             axum::routing::put(add_viewer).delete(remove_viewer),
         )
         .route("/auth", get(auth_mode))
+        .route("/me", get(me))
+        .route("/links/chatgpt", axum::routing::delete(unlink_chatgpt))
+        .route("/links/chatgpt/start", post(start_link))
+        .route("/links/chatgpt/finish", post(finish_link))
+        .route("/links/chatgpt/models", get(chatgpt_models))
         .route("/token", post(chlive_token))
         .route("/.well-known/jwks.json", get(jwks))
         .with_state(control)
 }
 
 /// How the API's callers are known, for clients to sign in by: `{"mode": "declared"}`, or
-/// `{"mode": "oidc", "google_client_id": <the web's client id>}`.
+/// `{"mode": "oidc", "google_client_id": <the web's client id>, "cli": {"client_id",
+/// "client_secret"}}`, the CLI's (an installed app's, whose secret isn't one), when it has one.
 async fn auth_mode(State(control): State<&'static Control>) -> Json<serde_json::Value> {
     Json(match &control.auth.oidc {
         None => serde_json::json!({ "mode": "declared" }),
-        Some(oidc) => serde_json::json!({ "mode": "oidc", "google_client_id": oidc.client_id() }),
+        Some(oidc) => serde_json::json!({
+            "mode": "oidc",
+            "google_client_id": oidc.client_id(),
+            "cli": oidc.cli().map(|(id, secret)| {
+                serde_json::json!({ "client_id": id, "client_secret": secret })
+            }),
+        }),
     })
+}
+
+/// The caller, and the ChatGPT plan they linked: `{"subject", "chatgpt": {"email", "broken"}}`.
+async fn me(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+) -> Result<Json<serde_json::Value>, Failed> {
+    let chatgpt = match &control.chatgpt {
+        Some(c) => c
+            .info(&control.store, &caller)
+            .await
+            .map_err(|e| failed("reading the ChatGPT link", e))?,
+        None => None,
+    };
+    Ok(Json(
+        serde_json::json!({ "subject": caller, "chatgpt": chatgpt }),
+    ))
+}
+
+fn linking(control: &Control) -> Result<&ChatGpt, Failed> {
+    control.chatgpt.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "this control links no ChatGPT plans (no --link-key)".into(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct StartLink {
+    /// The loopback port the CLI waits on for the sign-in to come back.
+    port: u16,
+}
+
+/// A ChatGPT sign-in for the caller to make in their browser.
+async fn start_link(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Json(body): Json<StartLink>,
+) -> Result<Json<LinkStarted>, Failed> {
+    let chatgpt = linking(control)?;
+    match chatgpt.start(&control.store, &caller, body.port).await {
+        Ok(started) => Ok(Json(started)),
+        Err(e) => Err(failed("starting a ChatGPT sign-in", e)),
+    }
+}
+
+/// What the sign-in came back to the loopback with (its query: more is ignored).
+#[derive(Deserialize)]
+struct FinishLink {
+    code: String,
+    state: String,
+    client_id: Option<String>,
+}
+
+async fn finish_link(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Json(body): Json<FinishLink>,
+) -> Result<Json<LinkInfo>, Failed> {
+    let chatgpt = linking(control)?;
+    let done = chatgpt
+        .finish(
+            &control.store,
+            &caller,
+            &body.code,
+            &body.state,
+            body.client_id.as_deref(),
+        )
+        .await;
+    done.map(Json).map_err(|why| (StatusCode::BAD_REQUEST, why))
+}
+
+async fn unlink_chatgpt(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+) -> Result<StatusCode, Failed> {
+    let chatgpt = linking(control)?;
+    match chatgpt.unlink(&control.store, &caller).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(not_found()),
+        Err(e) => Err(failed("unlinking ChatGPT", e)),
+    }
+}
+
+/// The models the caller's plan has.
+async fn chatgpt_models(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+) -> Result<Json<Vec<Model>>, Failed> {
+    let chatgpt = linking(control)?;
+    chatgpt
+        .models(&control.store, &caller)
+        .await
+        .map(Json)
+        .map_err(|why| (StatusCode::BAD_GATEWAY, why))
 }
 
 /// In `declared` auth (dev), a chlive credential for the caller, standing in for the OpenID
@@ -434,6 +553,24 @@ async fn put_session(
     body.spec
         .check()
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    if body.spec.provider == Provider::Chatgpt {
+        let link = linking(control)?
+            .info(&control.store, &caller)
+            .await
+            .map_err(|e| failed("reading the ChatGPT link", e))?;
+        let why = match link {
+            None => Some("link a ChatGPT plan first (dirigent link chatgpt)".to_string()),
+            Some(LinkInfo {
+                broken: Some(why), ..
+            }) => Some(format!(
+                "the ChatGPT link is broken: {why} (link it again: dirigent link chatgpt)"
+            )),
+            Some(_) => None,
+        };
+        if let Some(why) = why {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, why));
+        }
+    }
     let put = control
         .store
         .put_session(id, &body.spec, &caller, &body.viewers)
@@ -640,33 +777,53 @@ impl Players for Lessor {
         attached.insert(session, Attached { conn, detach });
         drop(attached);
         let (tx, rx) = mpsc::channel(4);
-        // a dirigent acts as its owner
-        let delegate = (spec.part == Part::Dirigent).then_some(owner);
+        let held = Held {
+            session,
+            subject,
+            // a dirigent acts as its owner
+            delegate: (spec.part == Part::Dirigent).then(|| owner.clone()),
+            plan: (spec.provider == Provider::Chatgpt).then_some(owner),
+            conn,
+        };
         let acquired = pb::ToPlayer {
             msg: Some(pb::to_player::Msg::Acquired(pb::Acquired {
                 epoch,
                 spec: Some(spec.into()),
-                tokens: Some(tokens(control, &subject, delegate.as_deref())),
+                tokens: Some(tokens(control, &held, false).await),
             })),
         };
         tx.send(Ok(acquired)).await.expect("the receiver is here");
-        let held = Held {
-            session,
-            subject,
-            delegate,
-            conn,
-        };
         tokio::spawn(hold(control, held, inbound, tx, detached));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
-/// The player's credentials: as `subject`, and, `delegate`, as that owner too.
-fn tokens(control: &Control, subject: &str, delegate: Option<&str>) -> pb::Tokens {
+/// The player's credentials: as its subject, and, a dirigent's, as its owner too; and, a
+/// ChatGPT-plan session's, an access token of its owner's plan (`rejected`: not the one handed
+/// out last, which OpenAI refused).
+async fn tokens(control: &Control, held: &Held, rejected: bool) -> pb::Tokens {
     let signer = &control.auth.signer;
+    let subject = held.subject.as_str();
+    let (openai, openai_unavailable) = match (&held.plan, &control.chatgpt) {
+        (None, _) => (None, None),
+        (Some(_), None) => (None, Some("this control links no ChatGPT plans".into())),
+        (Some(owner), Some(chatgpt)) => match chatgpt.access(&control.store, owner, rejected).await
+        {
+            Ok(token) => (Some(token), None),
+            Err(why) => {
+                warn!(session = %held.session, owner, "no ChatGPT access token: {why}");
+                (None, Some(why.to_string()))
+            }
+        },
+    };
     pb::Tokens {
         player: signer.sign(subject, &[CHLIVE], None),
-        owner: delegate.map(|owner| signer.sign(owner, &[CHLIVE, CONTROL], Some(subject))),
+        owner: held
+            .delegate
+            .as_deref()
+            .map(|owner| signer.sign(owner, &[CHLIVE, CONTROL], Some(subject))),
+        openai,
+        openai_unavailable,
     }
 }
 
@@ -677,6 +834,8 @@ struct Held {
     subject: String,
     /// Who it acts as, a dirigent's: its owner.
     delegate: Option<String>,
+    /// Whose ChatGPT plan pays for its model calls: its owner's, a ChatGPT-plan session's.
+    plan: Option<String>,
     /// Which connection.
     conn: u64,
 }
@@ -692,12 +851,8 @@ async fn hold(
     tx: mpsc::Sender<Result<pb::ToPlayer, Status>>,
     mut detached: watch::Receiver<Option<bool>>,
 ) {
-    let Held {
-        session,
-        subject,
-        delegate,
-        conn,
-    } = held;
+    let (session, conn) = (held.session, held.conn);
+    let subject = held.subject.as_str();
     let half = control.auth.signer.ttl / 2;
     let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
     let mut handoff = false;
@@ -705,7 +860,7 @@ async fn hold(
         tokio::select! {
             _ = renew.tick() => {
                 let tokens = pb::ToPlayer {
-                    msg: Some(pb::to_player::Msg::Tokens(tokens(control, &subject, delegate.as_deref()))),
+                    msg: Some(pb::to_player::Msg::Tokens(tokens(control, &held, false).await)),
                 };
                 if tx.send(Ok(tokens)).await.is_err() {
                     break false;
@@ -714,6 +869,14 @@ async fn hold(
             msg = inbound.message() => match msg {
                 Ok(Some(pb::FromPlayer { msg: Some(pb::from_player::Msg::Handoff(_)) })) => {
                     handoff = true;
+                }
+                Ok(Some(pb::FromPlayer { msg: Some(pb::from_player::Msg::RefreshTokens(r)) })) => {
+                    let tokens = pb::ToPlayer {
+                        msg: Some(pb::to_player::Msg::Tokens(tokens(control, &held, r.rejected).await)),
+                    };
+                    if tx.send(Ok(tokens)).await.is_err() {
+                        break false;
+                    }
                 }
                 Ok(Some(_)) => continue, // nothing more to ask once held
                 Ok(None) => break true,
@@ -739,8 +902,8 @@ async fn hold(
         attached.remove(&session);
     }
     let r = match closed {
-        true => control.store.release(session, &subject).await,
-        false => control.store.detach(session, &subject).await,
+        true => control.store.release(session, subject).await,
+        false => control.store.detach(session, subject).await,
     };
     match r {
         Ok(()) if closed => info!(session = %session, subject, handoff, "lease given back"),
@@ -994,7 +1157,7 @@ mod e2e {
 
     /// A control on ports of its own, with `runner` (given the gRPC address players use).
     async fn start_with(runner: impl FnOnce(&Ctl) -> &'static dyn Runner) -> Option<Ctl> {
-        start_full(None, Duration::from_secs(600), false, runner).await
+        start_full(None, Duration::from_secs(600), false, None, runner).await
     }
 
     /// The same, in `oidc` auth with `oidc`, its credentials good for `ttl`. It signs with the
@@ -1003,12 +1166,14 @@ mod e2e {
         oidc: Option<Arc<auth::Oidc>>,
         ttl: Duration,
         reserved_only: bool,
+        chatgpt: Option<ChatGptArgs>,
         runner: impl FnOnce(&Ctl) -> &'static dyn Runner,
     ) -> Option<Ctl> {
         std::env::var_os("DIRIGENT_E2E")?;
         let key = std::env::var("DIRIGENT_SIGNING_KEY")
             .expect("DIRIGENT_SIGNING_KEY (the `e2e` script sets it)");
         let signer = Signer::load(key.as_ref(), "dirigent-control", ttl).unwrap();
+        let chatgpt = chatgpt.map(|args| ChatGpt::new(&args, signer.kid()).unwrap().unwrap());
         let url = std::env::var("DIRIGENT_CONTROL_POSTGRES")
             .expect("DIRIGENT_CONTROL_POSTGRES (the `e2e` script sets it)");
         let store = Store::connect(&url, Duration::from_secs(1)).await.unwrap();
@@ -1023,6 +1188,7 @@ mod e2e {
         let control = control(
             store,
             Auth { signer, oidc },
+            chatgpt,
             Some(runner(&ctl)),
             Duration::from_secs(1),
             reserved_only,
@@ -1410,7 +1576,8 @@ mod e2e {
     #[tokio::test]
     async fn e2e_reserved_only_control_leases_only_the_players_it_started() {
         let runner = recorder(false);
-        let Some(base) = start_full(None, Duration::from_secs(600), true, |_| runner).await else {
+        let Some(base) = start_full(None, Duration::from_secs(600), true, None, |_| runner).await
+        else {
             return;
         };
         let s = Uuid::new_v4();
@@ -1543,7 +1710,8 @@ mod e2e {
     #[tokio::test]
     async fn e2e_a_lease_comes_with_credentials_sent_afresh_while_its_held() {
         let runner = recorder(false);
-        let Some(base) = start_full(None, Duration::from_secs(2), false, |_| runner).await else {
+        let Some(base) = start_full(None, Duration::from_secs(2), false, None, |_| runner).await
+        else {
             return;
         };
         let coder = Uuid::new_v4();
@@ -1614,7 +1782,10 @@ mod e2e {
         let provider = Provider::new();
         let oidc = auth::Oidc::start(&provider.args()).await.unwrap();
         let runner = recorder(false);
-        let Some(base) = start_full(Some(oidc), Duration::from_secs(600), false, |_| runner).await
+        let Some(base) = start_full(Some(oidc), Duration::from_secs(600), false, None, |_| {
+            runner
+        })
+        .await
         else {
             return;
         };
@@ -1674,7 +1845,7 @@ mod e2e {
             .unwrap();
         assert_eq!(
             mode,
-            serde_json::json!({ "mode": "oidc", "google_client_id": CLIENT })
+            serde_json::json!({ "mode": "oidc", "google_client_id": CLIENT, "cli": null })
         );
 
         // the dirigent's player: as its owner, with the token for that; not with its own
@@ -1873,5 +2044,377 @@ mod e2e {
             let ours = args.contains(&needle.as_bytes());
             (is_player && ours).then_some(pid)
         })
+    }
+
+    /// A fake OpenAI, and a control linking ChatGPT plans with it (a link key of its own).
+    async fn start_linking(
+        runner: &'static Recorder,
+    ) -> Option<(Ctl, chatgpt::fake::OpenAi, tempfile::TempDir)> {
+        std::env::var_os("DIRIGENT_E2E")?;
+        let openai = chatgpt::fake::OpenAi::start().await;
+        let keys = tempfile::tempdir().unwrap();
+        chatgpt::keygen(&keys.path().join("link.key")).unwrap();
+        let args = openai.args(&keys.path().join("link.key"));
+        let ctl = start_full(None, Duration::from_secs(600), false, Some(args), |_| {
+            runner
+        })
+        .await?;
+        Some((ctl, openai, keys))
+    }
+
+    /// A user of their own: links are kept by user, across the tests' runs.
+    fn new_user() -> String {
+        format!("user:plan-{}", Uuid::new_v4())
+    }
+
+    async fn get_json(
+        base: &Ctl,
+        user: &str,
+        path: &str,
+    ) -> (reqwest::StatusCode, serde_json::Value) {
+        let res = call(user, reqwest::Method::GET, base, path)
+            .send()
+            .await
+            .unwrap();
+        let status = res.status();
+        (status, res.json().await.unwrap_or_default())
+    }
+
+    /// `user` links the fake's plan, as the CLI does, its browser signing in at once.
+    async fn link(base: &Ctl, user: &str) -> serde_json::Value {
+        let res = call(user, reqwest::Method::POST, base, "/links/chatgpt/start")
+            .json(&serde_json::json!({ "port": 1455 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+        let started: chatgpt::Started = res.json().await.unwrap();
+        let browser = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let back = browser.get(&started.url).send().await.unwrap();
+        let location = back.headers()["location"].to_str().unwrap();
+        let back = reqwest::Url::parse(location).unwrap();
+        assert_eq!(
+            back.as_str().split('?').next(),
+            Some("http://127.0.0.1:1455/auth/callback")
+        );
+        let query: HashMap<String, String> = back.query_pairs().into_owned().collect();
+        assert_eq!(query["state"], started.state);
+        let res = call(user, reqwest::Method::POST, base, "/links/chatgpt/finish")
+            .json(&query)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            reqwest::StatusCode::OK,
+            "{:?}",
+            res.text().await
+        );
+        res.json().await.unwrap()
+    }
+
+    /// The next credentials on the held lease's call, within 10 s.
+    async fn next_tokens(conn: &mut Conn) -> pb::Tokens {
+        let call = conn.call.as_mut().expect("a lease");
+        match tokio::time::timeout(Duration::from_secs(10), call.rx.message()).await {
+            Ok(Ok(Some(pb::ToPlayer {
+                msg: Some(pb::to_player::Msg::Tokens(t)),
+            }))) => t,
+            other => panic!("no credentials: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_a_chatgpt_plan_is_linked_and_pays_for_its_owners_sessions() {
+        let runner = recorder(false);
+        let Some((base, openai, _keys)) = start_linking(runner).await else {
+            return;
+        };
+        let user = new_user();
+        let (_, me) = get_json(&base, &user, "/me").await;
+        assert_eq!(me, serde_json::json!({ "subject": user, "chatgpt": null }));
+        let plan = serde_json::json!({ "provider": "chatgpt", "model": "gpt-test" });
+        let s = Uuid::new_v4();
+        assert_eq!(
+            put_json(&base, s, &user, plan.clone()).await,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        let linked = link(&base, &user).await;
+        assert_eq!(linked["email"], chatgpt::fake::EMAIL);
+        let (_, me) = get_json(&base, &user, "/me").await;
+        assert_eq!(
+            me["chatgpt"],
+            serde_json::json!({ "email": chatgpt::fake::EMAIL, "broken": null })
+        );
+        let (status, models) = get_json(&base, &user, "/links/chatgpt/models").await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(
+            models,
+            serde_json::json!([{ "slug": "gpt-test", "display_name": "GPT Test" }])
+        );
+
+        // a session on the plan: its player gets the plan's access token, and another once
+        // OpenAI refuses that one
+        assert_eq!(
+            put_json(&base, s, &user, plan).await,
+            reqwest::StatusCode::CREATED
+        );
+        let mut ws = connect(&base).await;
+        let player = Uuid::new_v4().to_string();
+        assert!(matches!(
+            acquire(&mut ws, s, &player, None).await,
+            Reply::Acquired { .. }
+        ));
+        let tokens = ws.tokens.clone().unwrap();
+        let first = tokens.openai.clone().expect("an access token");
+        assert_eq!(Some(&first), openai.state.access.lock().unwrap().as_ref());
+        assert_eq!(tokens.openai_unavailable, None);
+        let refresh = pb::FromPlayer {
+            msg: Some(pb::from_player::Msg::RefreshTokens(pb::RefreshTokens {
+                rejected: true,
+            })),
+        };
+        ws.call.as_ref().unwrap().tx.send(refresh).await.unwrap();
+        let renewed = next_tokens(&mut ws).await.openai.expect("an access token");
+        assert_ne!(renewed, first);
+        assert_eq!(Some(&renewed), openai.state.access.lock().unwrap().as_ref());
+        // asked again without its being refused: the same one
+        let again = pb::FromPlayer {
+            msg: Some(pb::from_player::Msg::RefreshTokens(pb::RefreshTokens {
+                rejected: false,
+            })),
+        };
+        ws.call.as_ref().unwrap().tx.send(again).await.unwrap();
+        assert_eq!(next_tokens(&mut ws).await.openai, Some(renewed));
+        ws.close().await;
+
+        // an Anthropic session's player gets none
+        let other = Uuid::new_v4();
+        assert_eq!(
+            put_json(&base, other, &user, serde_json::json!({})).await,
+            reqwest::StatusCode::CREATED
+        );
+        let mut ws = connect(&base).await;
+        acquire(&mut ws, other, &Uuid::new_v4().to_string(), None).await;
+        assert_eq!(ws.tokens.clone().unwrap().openai, None);
+        ws.close().await;
+
+        assert_eq!(
+            call(&user, reqwest::Method::DELETE, &base, "/links/chatgpt")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NO_CONTENT
+        );
+        assert_eq!(openai.state.revoked.load(Ordering::SeqCst), 1);
+        let (_, me) = get_json(&base, &user, "/me").await;
+        assert_eq!(me["chatgpt"], serde_json::Value::Null);
+        assert_eq!(
+            call(&user, reqwest::Method::DELETE, &base, "/links/chatgpt")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
+    }
+
+    /// A ChatGpt of its own on the stack's Postgres, as a control just started would be: its
+    /// access tokens not in memory yet. (Its store is never dropped: the test process would
+    /// exit with its connection.)
+    async fn restarted(
+        openai: &chatgpt::fake::OpenAi,
+        keys: &std::path::Path,
+    ) -> (&'static ChatGpt, &'static Store) {
+        let url = std::env::var("DIRIGENT_CONTROL_POSTGRES").unwrap();
+        let store = Store::connect(&url, Duration::from_secs(1)).await.unwrap();
+        let key = std::env::var("DIRIGENT_SIGNING_KEY").unwrap();
+        let signer =
+            Signer::load(key.as_ref(), "dirigent-control", Duration::from_secs(60)).unwrap();
+        let chatgpt = ChatGpt::new(&openai.args(&keys.join("link.key")), signer.kid())
+            .unwrap()
+            .unwrap();
+        (Box::leak(Box::new(chatgpt)), Box::leak(Box::new(store)))
+    }
+
+    #[tokio::test]
+    async fn e2e_a_chatgpt_link_is_renewed_once_for_all_who_ask_and_breaks_when_refused() {
+        let runner = recorder(false);
+        let Some((base, openai, keys)) = start_linking(runner).await else {
+            return;
+        };
+        let user = new_user();
+        link(&base, &user).await;
+        let (chatgpt, store) = restarted(&openai, keys.path()).await;
+        let before = openai.state.refreshes.load(Ordering::SeqCst);
+        let asks: Vec<_> = (0..10)
+            .map(|_| {
+                let user = user.clone();
+                tokio::spawn(async move { chatgpt.access(store, &user, false).await })
+            })
+            .collect();
+        let mut got = Vec::new();
+        for ask in asks {
+            got.push(ask.await.unwrap().expect("an access token"));
+        }
+        assert_eq!(openai.state.refreshes.load(Ordering::SeqCst), before + 1);
+        assert!(got
+            .iter()
+            .all(|t| Some(t) == openai.state.access.lock().unwrap().as_ref()));
+
+        // the refresh token it holds was used by someone else meanwhile: refused as reused, the
+        // link is broken, and the plan pays for no new session until it's linked again
+        *openai.state.refresh.lock().unwrap() = Some("rt-elsewhere".into());
+        let (fresh, _) = restarted(&openai, keys.path()).await;
+        let refused = fresh.access(store, &user, false).await;
+        assert!(
+            matches!(&refused, Err(chatgpt::Unavailable::Broken(why)) if why.contains("refresh_token_reused")),
+            "{refused:?}"
+        );
+        let (_, me) = get_json(&base, &user, "/me").await;
+        assert!(me["chatgpt"]["broken"]
+            .as_str()
+            .unwrap()
+            .contains("refresh_token_reused"));
+        let plan = serde_json::json!({ "provider": "chatgpt", "model": "gpt-test" });
+        assert_eq!(
+            put_json(&base, Uuid::new_v4(), &user, plan.clone()).await,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        link(&base, &user).await;
+        let (_, me) = get_json(&base, &user, "/me").await;
+        assert_eq!(me["chatgpt"]["broken"], serde_json::Value::Null);
+        assert_eq!(
+            put_json(&base, Uuid::new_v4(), &user, plan).await,
+            reqwest::StatusCode::CREATED
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_a_chatgpt_sign_in_is_finished_only_by_who_started_it_and_once() {
+        let runner = recorder(false);
+        let Some((base, _openai, _keys)) = start_linking(runner).await else {
+            return;
+        };
+        let user = new_user();
+        let res = call(&user, reqwest::Method::POST, &base, "/links/chatgpt/start")
+            .json(&serde_json::json!({ "port": 1455 }))
+            .send()
+            .await
+            .unwrap();
+        let started: chatgpt::Started = res.json().await.unwrap();
+        let browser = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let back = browser.get(&started.url).send().await.unwrap();
+        let back = reqwest::Url::parse(back.headers()["location"].to_str().unwrap()).unwrap();
+        let query: HashMap<String, String> = back.query_pairs().into_owned().collect();
+        let finish = |who: &str| {
+            call(who, reqwest::Method::POST, &base, "/links/chatgpt/finish").json(&query)
+        };
+        assert_eq!(
+            finish(&new_user()).send().await.unwrap().status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        // taken by the attempt: not even its starter finishes it now
+        assert_eq!(
+            finish(&user).send().await.unwrap().status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let (_, me) = get_json(&base, &user, "/me").await;
+        assert_eq!(me["chatgpt"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn e2e_the_cli_links_a_chatgpt_plan_through_its_loopback() {
+        let runner = recorder(false);
+        let Some((base, openai, _keys)) = start_linking(runner).await else {
+            return;
+        };
+        let user = new_user();
+        let home = tempfile::tempdir().unwrap();
+        let creds = home.path().join("credentials.json");
+        let cli = || {
+            let mut c = tokio::process::Command::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../target/debug/dirigent"
+            ));
+            c.env("DIRIGENT_CREDENTIALS", &creds).kill_on_drop(true);
+            c
+        };
+        let login = cli()
+            .args([
+                "login",
+                "--control",
+                &format!("http://{base}"),
+                "--as",
+                &user,
+            ])
+            .output()
+            .await
+            .expect("the CLI (`e2e` builds it)");
+        assert!(login.status.success(), "{login:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&login.stdout).trim(),
+            format!("Signed in as {user}")
+        );
+
+        let mut linking = cli()
+            .args(["link", "chatgpt", "--no-browser"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // the browser: the address it prints, followed to its loopback
+        let mut stderr = tokio::io::BufReader::new(linking.stderr.take().unwrap());
+        let url = tokio::time::timeout(Duration::from_secs(10), async {
+            use tokio::io::AsyncBufReadExt;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert!(stderr.read_line(&mut line).await.unwrap() > 0, "no address");
+                if let Some(url) = line.trim().strip_prefix(&openai.url) {
+                    return format!("{}{url}", openai.url);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
+        assert!(page.contains("ChatGPT is linked"), "{page}");
+        let out = tokio::time::timeout(Duration::from_secs(10), linking.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("Linked ChatGPT: {}", chatgpt::fake::EMAIL)
+        );
+        let whoami = cli().arg("whoami").output().await.unwrap();
+        let whoami = String::from_utf8_lossy(&whoami.stdout);
+        assert!(
+            whoami.contains(&format!("ChatGPT: {}", chatgpt::fake::EMAIL)),
+            "{whoami}"
+        );
+        let models = cli().arg("models").output().await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&models.stdout),
+            "gpt-test\tGPT Test\n"
+        );
+        assert!(cli()
+            .args(["unlink", "chatgpt"])
+            .status()
+            .await
+            .unwrap()
+            .success());
+        assert!(cli().arg("logout").status().await.unwrap().success());
+        assert!(!creds.exists());
     }
 }

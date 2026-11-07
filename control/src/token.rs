@@ -70,6 +70,11 @@ impl Signer {
         })
     }
 
+    /// The key's id: its RFC 7638 thumbprint.
+    pub fn kid(&self) -> &str {
+        &self.kid
+    }
+
     /// A token saying it's `sub`, for `aud`; `act`, with it acting for `sub`.
     pub fn sign(&self, sub: &str, aud: &[&str], act: Option<&str>) -> String {
         let iat = now();
@@ -131,8 +136,10 @@ fn now() -> u64 {
 }
 
 /// A new key, unless `dir` has one: `key.pem` (private) and `jwks.json` (its public half, for
-/// chlive's `jwks_file`).
+/// chlive's `jwks_file`); and `link.key`, which ChatGPT links are encrypted with.
 pub fn keygen(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    crate::chatgpt::keygen(&dir.join("link.key"))?;
     let pem = dir.join("key.pem");
     if !pem.exists() {
         std::fs::create_dir_all(dir)?;
@@ -148,7 +155,8 @@ pub fn keygen(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+/// A new file only its owner may read.
+pub fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()

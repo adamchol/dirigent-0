@@ -96,12 +96,23 @@ spec:
             {{- end }}
             {{- end }}
           env:
+            {{- with .Values.auth.google.cli }}
+            {{- if and (eq $.Values.auth.mode "oidc") .clientId }}
+            - name: DIRIGENT_OIDC_CLI_CLIENT_ID
+              value: {{ .clientId | quote }}
+            - name: DIRIGENT_OIDC_CLI_CLIENT_SECRET
+              value: {{ .clientSecret | quote }}
+            {{- end }}
+            {{- end }}
             - name: PG_PASSWORD
               valueFrom: { secretKeyRef: { name: dirigent-control-postgres, key: password } }
             - name: DIRIGENT_CONTROL_POSTGRES
               value: "postgres://dirigent_control:$(PG_PASSWORD)@dirigent-postgres-rw:5432/dirigent"
             - name: DIRIGENT_SIGNING_KEY
               value: /etc/dirigent/key/key.pem
+            # what users' ChatGPT links are encrypted with
+            - name: DIRIGENT_LINK_KEY
+              value: /etc/dirigent/link/link.key
             - name: DIRIGENT_KUBE_TEMPLATE
               value: /etc/dirigent/player/vm.json
             - name: DIRIGENT_KUBE_NAME
@@ -115,9 +126,12 @@ spec:
             {{- toYaml .Values.control.resources | nindent 12 }}
           volumeMounts:
             - { name: key, mountPath: /etc/dirigent/key, readOnly: true }
+            - { name: link, mountPath: /etc/dirigent/link, readOnly: true }
             - { name: player, mountPath: /etc/dirigent/player, readOnly: true }
       volumes:
         - name: key
           secret: { secretName: dirigent-signing-key }
+        - name: link
+          secret: { secretName: dirigent-link-key }
         - name: player
           configMap: { name: dirigent-player }

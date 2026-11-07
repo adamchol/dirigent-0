@@ -1,5 +1,5 @@
-# dirigent's Rust binaries: `control`, `player` and `chat`. The tests need the running stack
-# (`dnvr up`, then `e2e`), so none run here.
+# dirigent's Rust binaries: `control`, `player` and the CLI, `dirigent`. The tests need the
+# running stack (`dnvr up`, then `e2e`), so none run here.
 {
   lib,
   rustPlatform,
@@ -14,7 +14,7 @@ rustPlatform.buildRustPackage {
       ../../Cargo.lock
       ../../protocol
       ../../player
-      ../../chat
+      ../../cli
       ../../control
     ];
   };

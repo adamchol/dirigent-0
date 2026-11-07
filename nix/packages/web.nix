@@ -35,7 +35,7 @@ let
     installPhase = "cp -r node_modules $out";
     outputHashMode = "recursive";
     outputHashAlgo = "sha256";
-    outputHash = "sha256-s7Lozn5DBVbdbyZtvV1fj+ouVrwdshH6PEJ1fbrs5K4=";
+    outputHash = "sha256-AcPSQvyF4DkFsHE0vNk+MiBHSsa10DiI7NaKl8r4qUY=";
   };
 in
 stdenvNoCC.mkDerivation {

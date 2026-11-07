@@ -16,9 +16,13 @@ use super::{
     ContentBlock, Delta, DeltaStream, Effort, Message, Provider, ProviderError, Request, Role,
     StopReason, Usage,
 };
+use crate::session::control::PlanTokens;
 
 pub struct GenaiProvider {
     client: Client,
+    /// OpenAI's Responses API on a ChatGPT plan, with the lease's access tokens; none,
+    /// Anthropic's.
+    plan: Option<PlanTokens>,
 }
 
 impl GenaiProvider {
@@ -35,21 +39,38 @@ impl GenaiProvider {
         }
         Ok(GenaiProvider {
             client: builder.build()?,
+            plan: None,
         })
     }
-}
 
-#[async_trait]
-impl Provider for GenaiProvider {
-    fn name(&self) -> &'static str {
-        "genai"
+    /// OpenAI's Responses API at `base_url` (`https://api.openai.com/v1/`; keep the `/v1/`), paid
+    /// with the ChatGPT plan whose access tokens `plan` has: each call takes the latest.
+    pub fn chatgpt(plan: PlanTokens, base_url: String) -> anyhow::Result<Self> {
+        let tokens = plan.clone();
+        let client = Client::builder()
+            .with_auth_resolver_fn(move |_| Ok(tokens.current().ok().map(AuthData::from_single)))
+            .with_service_target_resolver_fn(move |mut t: ServiceTarget| {
+                t.endpoint = Endpoint::from_owned(base_url.clone());
+                Ok(t)
+            })
+            .build()?;
+        Ok(GenaiProvider {
+            client,
+            plan: Some(plan),
+        })
     }
 
-    async fn stream(&self, req: &Request) -> Result<DeltaStream, ProviderError> {
-        let (chat_req, opts) = to_chat_request(req);
+    async fn open(&self, req: &Request) -> Result<DeltaStream, ProviderError> {
+        let openai = self.plan.is_some();
+        let (chat_req, opts) = to_chat_request(req, openai);
+        // the Responses adapter, whatever the model's name
+        let model = match openai {
+            true => format!("openai_resp::{}", req.model),
+            false => req.model.clone(),
+        };
         let res = self
             .client
-            .exec_chat_stream(req.model.as_str(), chat_req, Some(&opts))
+            .exec_chat_stream(model.as_str(), chat_req, Some(&opts))
             .await
             .map_err(classify_error)?;
         let mut st = MapState::default();
@@ -64,14 +85,71 @@ impl Provider for GenaiProvider {
     }
 }
 
+/// Why a ChatGPT plan's call can't be made, as the turn fails with it.
+fn unavailable(why: String) -> ProviderError {
+    ProviderError::Api {
+        status: 401,
+        message: format!("the ChatGPT plan: {why}"),
+        retryable: false,
+    }
+}
+
+fn refused(e: &ProviderError) -> bool {
+    matches!(e, ProviderError::Api { status: 401, .. })
+}
+
+#[async_trait]
+impl Provider for GenaiProvider {
+    fn name(&self) -> &'static str {
+        "genai"
+    }
+
+    /// On a ChatGPT plan, an access token OpenAI refuses (expired early, revoked) is renewed by
+    /// control, and the call made once more with the new one.
+    async fn stream(&self, req: &Request) -> Result<DeltaStream, ProviderError> {
+        let Some(plan) = &self.plan else {
+            return self.open(req).await;
+        };
+        let token = plan.current().map_err(unavailable)?;
+        match self.open(req).await {
+            Err(e) if refused(&e) => {}
+            Err(e) => return Err(e),
+            // a refusal comes as the stream's first item
+            Ok(mut stream) => match stream.next().await {
+                Some(Err(e)) if refused(&e) => {}
+                first => return Ok(futures::stream::iter(first).chain(stream).boxed()),
+            },
+        }
+        plan.renewed(&token).await.map_err(unavailable)?;
+        self.open(req).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Request mapping
 // ---------------------------------------------------------------------------
 
 /// Prompt cache breakpoints: the end of the static prefix (the tools, then the system prompt), the
 /// last message, and the message the previous call ended on (the one before the last reply), so
-/// the prefix that call cached is read back however many blocks were added since.
-pub fn to_chat_request(req: &Request) -> (ChatRequest, ChatOptions) {
+/// the prefix that call cached is read back however many blocks were added since. For `openai`'s
+/// Responses API, none (it caches prefixes itself), and the system prompt is its `instructions`
+/// (a ChatGPT plan's calls may have no system message).
+pub fn to_chat_request(req: &Request, openai: bool) -> (ChatRequest, ChatOptions) {
+    if openai {
+        let messages = req.messages.iter().flat_map(to_chat_messages).collect();
+        let mut chat = ChatRequest::new(messages);
+        if let Some(system) = &req.system {
+            chat = chat.with_system(system.clone());
+        }
+        if !req.tools.is_empty() {
+            chat = chat.with_tools(req.tools.iter().map(|t| {
+                Tool::new(t.name.clone())
+                    .with_description(t.description.clone())
+                    .with_schema(t.input_schema.clone())
+            }));
+        }
+        return (chat, chat_options(req));
+    }
     let last = req.messages.len().checked_sub(1);
     let previous = req
         .messages
@@ -105,7 +183,11 @@ pub fn to_chat_request(req: &Request) -> (ChatRequest, ChatOptions) {
             }
         }));
     }
-    let opts = ChatOptions::default()
+    (chat, chat_options(req))
+}
+
+fn chat_options(req: &Request) -> ChatOptions {
+    ChatOptions::default()
         .with_capture_usage(true)
         .with_capture_content(true)
         .with_capture_tool_calls(true)
@@ -116,8 +198,7 @@ pub fn to_chat_request(req: &Request) -> (ChatRequest, ChatOptions) {
             Some(Effort::Medium) => ReasoningEffort::Medium,
             Some(Effort::High) => ReasoningEffort::High,
             Some(Effort::Max) => ReasoningEffort::Max,
-        });
-    (chat, opts)
+        })
 }
 
 /// One neutral message becomes one genai message, except that tool results
@@ -209,6 +290,10 @@ pub struct MapState {
     next_index: usize,
     open: Option<Open>,
     tool_index: HashMap<String, usize>,
+    /// The thinking blocks without a signature yet, in order.
+    unsigned: Vec<usize>,
+    /// Whether signatures came streamed (Anthropic's), not only at the end (OpenAI's).
+    streamed_signatures: bool,
 }
 
 impl MapState {
@@ -235,14 +320,18 @@ impl MapState {
             ChatStreamEvent::ReasoningChunk(c) => {
                 let index = match self.open {
                     Some(Open::Thinking(i)) => i,
-                    _ => self.open_block(
-                        &mut out,
-                        ContentBlock::Thinking {
-                            text: String::new(),
-                            provider_data: Value::Null,
-                        },
-                        Open::Thinking,
-                    ),
+                    _ => {
+                        let i = self.open_block(
+                            &mut out,
+                            ContentBlock::Thinking {
+                                text: String::new(),
+                                provider_data: Value::Null,
+                            },
+                            Open::Thinking,
+                        );
+                        self.unsigned.push(i);
+                        i
+                    }
                 };
                 out.push(Delta::Thinking {
                     index,
@@ -265,6 +354,8 @@ impl MapState {
                     index,
                     provider_data: json!({ "signature": c.content }),
                 });
+                self.unsigned.retain(|&i| i != index);
+                self.streamed_signatures = true;
                 // The signature is the last thing in a thinking block.
                 self.close(&mut out);
             }
@@ -323,6 +414,34 @@ impl MapState {
     }
 
     fn finish(&mut self, out: &mut Vec<Delta>, end: StreamEnd) {
+        // OpenAI's reasoning comes encrypted at the end only (its items' `encrypted_content`):
+        // the signatures of the thinking blocks summarizing it, in order, or of blocks of their
+        // own, so the reasoning goes back with the next call (`store: false` keeps none)
+        if !self.streamed_signatures {
+            let signatures = end.captured_thought_signatures().unwrap_or_default();
+            let mut unsigned = std::mem::take(&mut self.unsigned).into_iter();
+            for signature in signatures {
+                let index = match unsigned.next() {
+                    Some(i) => i,
+                    None => {
+                        let i = self.open_block(
+                            out,
+                            ContentBlock::Thinking {
+                                text: String::new(),
+                                provider_data: Value::Null,
+                            },
+                            Open::Thinking,
+                        );
+                        self.close(out);
+                        i
+                    }
+                };
+                out.push(Delta::BlockData {
+                    index,
+                    provider_data: json!({ "signature": signature }),
+                });
+            }
+        }
         // Final, parsed tool arguments win over the streamed buffer.
         if let Some(content) = &end.captured_content {
             for tc in content.tool_calls() {
@@ -410,6 +529,16 @@ pub fn classify_error(e: ::genai::Error) -> ProviderError {
     let status = e.status().map(|s| s.as_u16());
     let text = e.to_string();
     let lower = text.to_ascii_lowercase();
+    // a ChatGPT plan's limit (or its app's) is reached: not a rate limit that passes in a while
+    if lower.contains("subscription_sharing_usage_limit_exceeded") {
+        return ProviderError::Api {
+            status: status.unwrap_or(429),
+            message:
+                "the ChatGPT plan's usage limit is reached (see https://chatgpt.com/settings/usage)"
+                    .into(),
+            retryable: false,
+        };
+    }
     match status {
         Some(429) => ProviderError::RateLimited {
             retry_after: retry_after(&e),
@@ -455,11 +584,12 @@ fn retry_after(e: &::genai::Error) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{Accumulator, ToolSpec};
+    use crate::provider::{Accumulator, Completion, ToolSpec};
     use ::genai::chat::{ChatRole, PromptTokensDetails, StreamChunk, ToolChunk};
     use ::genai::webc;
     use http::header::{HeaderMap, HeaderValue};
     use http::StatusCode;
+    use std::sync::Arc;
 
     fn end(stop: Option<GStop>, usage: Option<GUsage>) -> ChatStreamEvent {
         ChatStreamEvent::End(StreamEnd {
@@ -490,7 +620,7 @@ mod tests {
             }],
             effort: Some(Effort::High),
         };
-        let (chat, opts) = to_chat_request(&req);
+        let (chat, opts) = to_chat_request(&req, false);
         assert_eq!(
             chat.messages[0].content.joined_texts().as_deref(),
             Some("be terse")
@@ -508,10 +638,13 @@ mod tests {
             [ChatRole::System, ChatRole::User]
         ));
 
-        let (_, opts) = to_chat_request(&Request {
-            effort: None,
-            ..req
-        });
+        let (_, opts) = to_chat_request(
+            &Request {
+                effort: None,
+                ..req
+            },
+            false,
+        );
         assert!(matches!(opts.reasoning_effort, Some(ReasoningEffort::Zero)));
     }
 
@@ -548,7 +681,7 @@ mod tests {
             tools: vec![],
             effort: None,
         };
-        assert_eq!(cached(&to_chat_request(&req).0), [true, true]);
+        assert_eq!(cached(&to_chat_request(&req, false).0), [true, true]);
 
         req.messages.extend([
             Message::assistant(vec![call("c1")]),
@@ -558,7 +691,7 @@ mod tests {
         ]);
         // system, go, c1 call, c1 result (the previous call's end), c2 call, c2 result
         assert_eq!(
-            cached(&to_chat_request(&req).0),
+            cached(&to_chat_request(&req, false).0),
             [true, false, false, true, false, true]
         );
     }
@@ -577,7 +710,7 @@ mod tests {
             tools: vec![spec("Read"), spec("Bash")],
             effort: None,
         };
-        let (chat, _) = to_chat_request(&req);
+        let (chat, _) = to_chat_request(&req, false);
         let marked: Vec<_> = chat
             .tools
             .unwrap()
@@ -626,7 +759,7 @@ mod tests {
             tools: vec![],
             effort: None,
         };
-        let (chat, _) = to_chat_request(&req);
+        let (chat, _) = to_chat_request(&req, false);
         let roles: Vec<_> = chat.messages.iter().map(|m| m.role.clone()).collect();
         assert!(matches!(
             roles.as_slice(),
@@ -889,5 +1022,237 @@ mod tests {
             error: "connection reset".into(),
         };
         assert!(matches!(classify_error(cut), ProviderError::Stream(_)));
+    }
+
+    /// The calls made: their bearer tokens and bodies.
+    type Sent = Arc<std::sync::Mutex<Vec<(Option<String>, Value)>>>;
+
+    /// OpenAI's Responses API on a ChatGPT plan, for the tests: it takes the access token
+    /// `accepts` only, and answers with `REPLY` streamed, or fails as `fail` says. What it's sent
+    /// is kept.
+    struct Fake {
+        url: String,
+        requests: Sent,
+    }
+
+    const REPLY: &str = "Hello from the plan.";
+
+    async fn fake(accepts: &'static str, fail: Option<(u16, &'static str)>) -> Fake {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        let requests: Sent = Default::default();
+        let kept = requests.clone();
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |headers: HeaderMap, body: axum::Json<Value>| {
+                let kept = kept.clone();
+                async move {
+                    let bearer = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .map(String::from);
+                    kept.lock().unwrap().push((bearer.clone(), body.0.clone()));
+                    if bearer.as_deref() != Some(accepts) {
+                        return (StatusCode::UNAUTHORIZED, r#"{"detail":"no"}"#).into_response();
+                    }
+                    if let Some((status, code)) = fail {
+                        let body = json!({ "error": { "code": code, "message": code, "type": "x" } });
+                        return (StatusCode::from_u16(status).unwrap(), body.to_string())
+                            .into_response();
+                    }
+                    let item = json!({
+                        "id": "msg_1", "type": "message", "role": "assistant", "status": "completed",
+                        "content": [{ "type": "output_text", "text": REPLY, "annotations": [] }],
+                    });
+                    // its reasoning, summarized, and encrypted (the summary's signature)
+                    let reasoning = json!({
+                        "id": "rs_1", "type": "reasoning", "encrypted_content": "ENC1",
+                        "summary": [{ "type": "summary_text", "text": "thinking it over" }],
+                    });
+                    let events = [
+                        json!({ "type": "response.created",
+                            "response": { "id": "r", "model": "gpt-test", "status": "in_progress", "output": [] } }),
+                        json!({ "type": "response.output_item.added", "output_index": 0,
+                            "item": { "id": "rs_1", "type": "reasoning", "summary": [] } }),
+                        json!({ "type": "response.reasoning_summary_text.delta", "item_id": "rs_1",
+                            "output_index": 0, "summary_index": 0, "delta": "thinking it over" }),
+                        json!({ "type": "response.output_item.done", "output_index": 0,
+                            "item": reasoning }),
+                        json!({ "type": "response.output_item.added", "output_index": 1,
+                            "item": { "id": "msg_1", "type": "message", "role": "assistant",
+                                "status": "in_progress", "content": [] } }),
+                        json!({ "type": "response.output_text.delta", "item_id": "msg_1",
+                            "output_index": 1, "content_index": 0, "delta": REPLY }),
+                        json!({ "type": "response.output_item.done", "output_index": 1, "item": item }),
+                        json!({ "type": "response.completed", "response": {
+                            "id": "r", "model": "gpt-test", "status": "completed", "output": [reasoning, item],
+                            "usage": { "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+                                "input_tokens_details": { "cached_tokens": 0 },
+                                "output_tokens_details": { "reasoning_tokens": 0 } } } }),
+                    ];
+                    let sse: String = events
+                        .iter()
+                        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+                        .collect();
+                    ([("content-type", "text/event-stream")], sse).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        Fake { url, requests }
+    }
+
+    /// A lease's plan tokens, `token` to begin with: asked afresh, `renewed` (control's part),
+    /// or why there's none.
+    fn plan(
+        token: Option<&str>,
+        renewed: Result<&'static str, &'static str>,
+    ) -> (PlanTokens, Arc<std::sync::atomic::AtomicUsize>) {
+        let tokens =
+            |openai: Option<&str>, why: Option<&str>| dirigent_protocol::control::pb::Tokens {
+                player: "p".into(),
+                owner: None,
+                openai: openai.map(String::from),
+                openai_unavailable: why.map(String::from),
+            };
+        let (tx, rx) =
+            tokio::sync::watch::channel(tokens(token, token.is_none().then_some("not linked")));
+        let (refresh, mut refreshes) = tokio::sync::mpsc::channel::<bool>(4);
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = asked.clone();
+        tokio::spawn(async move {
+            while let Some(rejected) = refreshes.recv().await {
+                assert!(rejected);
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tx.send_replace(match renewed {
+                    Ok(t) => tokens(Some(t), None),
+                    Err(why) => tokens(None, Some(why)),
+                });
+            }
+        });
+        (PlanTokens::new(rx, refresh), asked)
+    }
+
+    fn plan_request() -> Request {
+        Request {
+            model: "gpt-test".into(),
+            system: Some("be brief".into()),
+            messages: vec![Message::user("hi")],
+            tools: vec![ToolSpec {
+                name: "read".into(),
+                description: "reads".into(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            }],
+            effort: Some(Effort::Medium),
+        }
+    }
+
+    async fn complete(p: &GenaiProvider, req: &Request) -> Result<Completion, ProviderError> {
+        let mut stream = p.stream(req).await?;
+        let mut acc = Accumulator::default();
+        while let Some(delta) = stream.next().await {
+            acc.push(delta?);
+        }
+        Ok(acc.finish())
+    }
+
+    #[tokio::test]
+    async fn a_chatgpt_plans_call_is_renewed_once_refused_and_says_its_prompt_as_instructions() {
+        let api = fake("at-2", None).await;
+        let (tokens, asked) = plan(Some("at-1"), Ok("at-2"));
+        let p = GenaiProvider::chatgpt(tokens, format!("{}/v1/", api.url)).unwrap();
+        let done = complete(&p, &plan_request()).await.unwrap();
+        assert_eq!(done.message.text(), REPLY);
+        assert_eq!(done.stop_reason, StopReason::EndTurn);
+        assert_eq!((done.usage.input, done.usage.output), (10, 5));
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let requests = api.requests.lock().unwrap().clone();
+        let bearers: Vec<_> = requests.iter().map(|(b, _)| b.as_deref()).collect();
+        assert_eq!(bearers, [Some("at-1"), Some("at-2")]);
+        let (_, body) = &requests[1];
+        assert_eq!(body["model"], "gpt-test");
+        assert_eq!(body["instructions"], "be brief");
+        assert_eq!(
+            (&body["store"], &body["stream"]),
+            (&json!(false), &json!(true))
+        );
+        let input = body["input"].as_array().unwrap();
+        assert!(
+            input
+                .iter()
+                .all(|i| i["role"] != "system" && i["role"] != "developer"),
+            "{input:?}"
+        );
+        // what a plan's calls may not have
+        for key in [
+            "temperature",
+            "max_output_tokens",
+            "prompt_cache_retention",
+            "previous_response_id",
+        ] {
+            assert!(body.get(key).is_none(), "{key} in {body}");
+        }
+        assert_eq!(body["tools"][0]["name"], "read");
+        // the reasoning, its summary signed with what OpenAI encrypted, goes back with the next
+        // call (which takes the renewed token at once)
+        assert_eq!(
+            done.message.content[0],
+            ContentBlock::Thinking {
+                text: "thinking it over".into(),
+                provider_data: json!({ "signature": "ENC1" }),
+            }
+        );
+        let mut next = plan_request();
+        next.messages
+            .extend([done.message.clone(), Message::user("and then?")]);
+        complete(&p, &next).await.unwrap();
+        let (_, body) = api.requests.lock().unwrap().last().unwrap().clone();
+        let reasoning: Vec<_> = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["type"] == "reasoning")
+            .map(|i| i["encrypted_content"].clone())
+            .collect();
+        assert_eq!(reasoning, [json!("ENC1")]);
+        assert_eq!(
+            api.requests.lock().unwrap().last().unwrap().0.as_deref(),
+            Some("at-2")
+        );
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_chatgpt_plan_out_of_usage_or_unlinked_fails_the_call_for_good() {
+        let api = fake(
+            "at-1",
+            Some((429, "subscription_sharing_usage_limit_exceeded")),
+        )
+        .await;
+        let (tokens, _) = plan(Some("at-1"), Ok("at-1"));
+        let p = GenaiProvider::chatgpt(tokens, format!("{}/v1/", api.url)).unwrap();
+        let e = complete(&p, &plan_request()).await.unwrap_err();
+        assert!(!e.retryable(), "{e:?}");
+        assert!(e.to_string().contains("usage limit"), "{e}");
+
+        let api = fake("at-1", None).await;
+        let (tokens, _) = plan(None, Ok("at-1"));
+        let p = GenaiProvider::chatgpt(tokens, format!("{}/v1/", api.url)).unwrap();
+        let e = complete(&p, &plan_request()).await.unwrap_err();
+        assert!(
+            !e.retryable() && e.to_string().contains("not linked"),
+            "{e}"
+        );
+        assert!(api.requests.lock().unwrap().is_empty());
+
+        // refused, and control can't renew it: why, without calling again
+        let (tokens, _) = plan(Some("at-0"), Err("the ChatGPT link is broken: revoked"));
+        let p = GenaiProvider::chatgpt(tokens, format!("{}/v1/", api.url)).unwrap();
+        let e = complete(&p, &plan_request()).await.unwrap_err();
+        assert!(!e.retryable() && e.to_string().contains("revoked"), "{e}");
+        assert_eq!(api.requests.lock().unwrap().len(), 1);
     }
 }

@@ -12,10 +12,9 @@ const codeBlockVariants = cva(
   {
     variants: {
       variant: {
-        default:
-          "border border-input text-foreground has-[>[data-slot=code-block-content]:focus-visible]:border-ring dark:bg-input/30",
-        destructive:
-          "border border-destructive/30 text-destructive dark:border-destructive/40",
+        // dirigent: on a panel, no outline
+        default: "bg-panel text-foreground",
+        destructive: "bg-destructive/8 text-destructive",
       },
     },
     defaultVariants: {
@@ -60,7 +59,7 @@ function CodeBlockTitle({ className, ...props }: React.ComponentProps<"div">) {
     <div
       data-slot="code-block-title"
       className={cn(
-        "min-w-0 truncate font-sans text-sm font-medium text-foreground group-data-[size=sm]/code-block:text-xs group-data-[variant=destructive]/code-block:text-destructive [&_svg]:pointer-events-none [&_svg]:inline-block [&_svg]:align-middle [&_svg:not([class*='size-'])]:size-3.5 *:[svg]:me-1.5",
+        "min-w-0 truncate font-mono text-[11px] text-muted-foreground group-data-[variant=destructive]/code-block:text-destructive [&_svg]:pointer-events-none [&_svg]:inline-block [&_svg]:align-middle [&_svg:not([class*='size-'])]:size-3.5 *:[svg]:me-1.5",
         className
       )}
       {...props}
@@ -186,8 +185,8 @@ const codeBlockLineVariants = cva(
     variants: {
       variant: {
         default: "",
-        added: "bg-muted after:content-['+']",
-        removed: "bg-destructive/10 after:text-destructive after:content-['−']",
+        added: "bg-success/9 text-success after:text-success after:content-['+']",
+        removed: "bg-destructive/9 text-destructive after:text-destructive after:content-['−']",
         highlighted: "bg-muted",
       },
     },

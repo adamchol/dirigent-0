@@ -6,6 +6,8 @@ import type { Source } from "./events.ts";
 
 export type Effort = "low" | "medium" | "high" | "max";
 export type Part = "coder" | "dirigent";
+/** Who a session's model calls are paid to: Anthropic, or its owner's ChatGPT plan. */
+export type Provider = "anthropic" | "chatgpt";
 
 export interface SessionSpec {
   model: string;
@@ -13,6 +15,8 @@ export interface SessionSpec {
   source?: Source | null;
   /** Absent: a coder. */
   part?: Part;
+  /** Absent: Anthropic. */
+  provider?: Provider;
 }
 
 /** `SessionInfo` (protocol/src/control.rs): a session as its caller sees it. */
@@ -34,6 +38,24 @@ export interface SessionInfo {
 
 /** How control knows its callers (`GET /auth`). */
 export type Auth = { mode: "declared" } | { mode: "oidc"; google_client_id: string };
+
+/** The ChatGPT plan a user linked (through the CLI), and why it's broken, if it is. */
+export interface Link {
+  email: string;
+  broken: string | null;
+}
+
+/** Who the caller is to control, and their link (`GET /me`). */
+export interface Me {
+  subject: string;
+  chatgpt: Link | null;
+}
+
+/** A model a ChatGPT plan has. */
+export interface Model {
+  slug: string;
+  display_name: string;
+}
 
 /** Who calls: a subject; signed in, with the ID token that says so. */
 export interface Who {
@@ -63,6 +85,10 @@ export function part(s: SessionInfo): Part {
   return s.spec.part ?? "coder";
 }
 
+export function provider(s: SessionInfo): Provider {
+  return s.spec.provider ?? "anthropic";
+}
+
 async function call(who: Who, method: string, path: string, body?: unknown): Promise<Response> {
   const headers: Record<string, string> = who.idToken
     ? { authorization: `Bearer ${who.idToken}` }
@@ -75,6 +101,15 @@ async function call(who: Who, method: string, path: string, body?: unknown): Pro
   });
   if (!res.ok) throw new Error(`${res.status}: ${(await res.text()) || res.statusText}`);
   return res;
+}
+
+export async function me(who: Who): Promise<Me> {
+  return (await call(who, "GET", "/me")).json();
+}
+
+/** The models `who`'s ChatGPT plan has. */
+export async function models(who: Who): Promise<Model[]> {
+  return (await call(who, "GET", "/links/chatgpt/models")).json();
 }
 
 /** The sessions `who` owns or views. */

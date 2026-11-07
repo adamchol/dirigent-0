@@ -10,6 +10,9 @@
 {{- if and (eq .Values.auth.mode "oidc") (empty .Values.auth.google.clientIds) }}
 {{- fail "auth.google.clientIds is required in oidc auth" }}
 {{- end }}
+{{- if and .Values.auth.google.cli.clientId (not .Values.auth.google.cli.clientSecret) }}
+{{- fail "auth.google.cli.clientSecret is required with its clientId" }}
+{{- end }}
 {{- $_ := required "clickhouse.adminSecret" .Values.clickhouse.adminSecret }}
 {{- $_ := required "kafka.bootstrapServers" .Values.kafka.bootstrapServers }}
 {{- if le (int .Values.player.stopGrace) (int .Values.player.checkpointMargin) }}
