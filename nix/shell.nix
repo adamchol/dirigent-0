@@ -349,24 +349,12 @@ in
       text = ''exec bash ${./kube-test/kube-test.sh} "$@"'';
     };
     push-images = {
-      description = "Push the chart's images and the chart to a registry (ghcr.io/adamchol): push-images [registry], logged in with `skopeo login` and `helm registry login`";
+      description = "Push the chart's images and the chart to a registry (ghcr.io/adamchol): push-images [--registry R] TAG [TAG…], logged in with `skopeo login` and `helm registry login`; see nix/push-images.sh";
       runtimeInputs = [
         pkgs.skopeo
         pkgs.kubernetes-helm
       ];
-      text = ''
-        registry=''${1:-ghcr.io/adamchol}
-        cd "$DNVR_ROOT"
-        chart=$(nix build .#chart --no-link --print-out-paths)
-        version=$(sed -n 's/^appVersion: //p' "$chart/Chart.yaml")
-        for image in control chlive web migrations kube-tools rustfs ingest player-vm; do
-          archive=$(nix build ".#$image-image" --no-link --print-out-paths)
-          skopeo copy "docker-archive:$archive" "docker://$registry/dirigent-$image:$version"
-        done
-        out=$(mktemp -d)
-        helm package "$chart" -d "$out"
-        exec helm push "$out"/dirigent-*.tgz "oci://$registry/charts"
-      '';
+      text = ''exec bash ${./push-images.sh} "$@"'';
     };
     e2e = {
       description = "Run the control plane's and the player's tests against the running stack (mock provider)";

@@ -99,6 +99,15 @@
           packages = {
             inherit dirigent web chart;
             default = dirigent;
+            # the dev shell's `push-images`, without the shell (CI's)
+            push-images = pkgs.writeShellApplication {
+              name = "push-images";
+              runtimeInputs = [
+                pkgs.skopeo
+                pkgs.kubernetes-helm
+              ];
+              text = ''exec bash ${./nix/push-images.sh} "$@"'';
+            };
           }
           // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
             lib.mapAttrs' (name: lib.nameValuePair "${name}-image") images

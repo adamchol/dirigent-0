@@ -1,0 +1,51 @@
+# The chart's images and the chart, built on nixbuild.net (the runner only evaluates the flake)
+# and pushed to GHCR by nix/push-images.sh: master as sha-<commit> and master, a v1.2.3 tag as
+# 1.2.3. Pull requests only build.
+name: images
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - uses: nixbuild/nix-quick-install-action@v35
+        with:
+          nix_conf: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ github.token }}
+      - uses: nixbuild/nixbuild-action@v27
+        with:
+          nixbuild_token: ${{ secrets.NIXBUILD_TOKEN }}
+      - name: Build
+        if: github.event_name == 'pull_request'
+        run: |
+          nix build --no-link --print-build-logs .#chart \
+            .#{control,chlive,web,migrations,kube-tools,rustfs,ingest,player-vm}-image
+      - name: Push
+        if: github.event_name != 'pull_request'
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tags=("${GITHUB_REF_NAME#v}")
+          else
+            tags=("sha-${GITHUB_SHA::7}" "${GITHUB_REF_NAME//\//-}")
+          fi
+          nix run .#push-images -- "${tags[@]}"
