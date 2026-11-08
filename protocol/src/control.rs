@@ -216,6 +216,10 @@ pub struct SessionInfo {
     /// When it was made, in milliseconds since the Unix epoch.
     #[serde(default)]
     pub created: i64,
+    /// The names of the secrets its tools get (its own, and its owner's for all their
+    /// sessions); never their values.
+    #[serde(default)]
+    pub secrets: Vec<String>,
 }
 
 /// A user's part in a session.
@@ -251,6 +255,7 @@ mod tests {
             viewers: vec!["user:v".into()],
             role: Role::Viewer,
             created: 0,
+            secrets: vec!["GITHUB_TOKEN".into()],
         };
         let wire = serde_json::to_value(&info).unwrap();
         assert_eq!(

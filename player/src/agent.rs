@@ -19,6 +19,7 @@ use crate::provider::{
     Accumulator, Completion, ContentBlock, Delta, Effort, Provider, ProviderError, Request,
     StopReason,
 };
+use crate::secrets::Secrets;
 use crate::session::Session;
 use crate::title;
 use crate::tools::{Registry, ToolCtx, ToolOutput};
@@ -59,6 +60,8 @@ pub struct Agent {
     pub checkpoints: Option<&'static Checkpoints>,
     /// Where the workspace is mirrored after every tool call that may change it; none, it isn't.
     pub mirror: Option<&'static Mutex<Mirror>>,
+    /// The session's secrets: in its tools' environment, kept out of what's published.
+    pub secrets: Secrets,
 }
 
 pub const ABORTED_TOOL_RESULT: &str = "Tool call aborted by user interrupt";
@@ -150,7 +153,7 @@ impl Agent {
             session,
             history: History::from_events(&handled),
             fixed: (self.cfg.system.len() + tools) as u64 / CHARS_PER_TOKEN,
-            ctx: Arc::new(ToolCtx::new(self.workdir)),
+            ctx: Arc::new(ToolCtx::new(self.workdir, self.secrets.clone())),
             turn: None,
             queue: fold.queued().iter().cloned().collect(),
             tx,
@@ -176,6 +179,8 @@ impl Agent {
             "session started"
         );
         let mut client = true;
+        let mut secrets = self.secrets.clone();
+        let mut seen = secrets.current();
         // `Some(now)` once told to detach (maybe before it started: no turn is begun then)
         let mut detaching: Option<bool> = *detach.when.borrow_and_update();
         if let Some(now) = detaching {
@@ -193,6 +198,12 @@ impl Agent {
                 biased;
                 Some(ev) = outcomes.recv() => run.handle(ev).await,
                 Some(named) = names.recv() => run.named(named).await,
+                Some(now) = secrets.changed(&seen) => {
+                    let names: Vec<String> = now.keys().cloned().collect();
+                    info!(?names, "the session's secrets changed");
+                    seen = now;
+                    run.session.publish(&Event::SecretsChanged { names }).await;
+                }
                 now = told_to_detach(&mut detach.when, detaching), if detaching != Some(true) => {
                     info!(now, "detaching");
                     detaching = Some(now);
@@ -289,7 +300,9 @@ fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -> Ve
             | Event::Compacted { .. }
             | Event::CompactionFailed { .. }
             | Event::Titled { .. }
-            | Event::FilesChanged { .. } => {}
+            | Event::FilesChanged { .. }
+            | Event::SecretAnswered { .. }
+            | Event::SecretsChanged { .. } => {}
         }
     }
     if !open {
@@ -337,7 +350,9 @@ impl Run<'_> {
     /// An event a user appended, with its id.
     async fn input(&mut self, id: String, ev: Event) {
         match ev {
-            Event::UserMessage { .. } | Event::SessionUpdate { .. } => {
+            Event::UserMessage { .. }
+            | Event::SessionUpdate { .. }
+            | Event::SecretAnswered { .. } => {
                 let text = ev.input().expect("an input");
                 if self.turn.is_none() {
                     self.queue.push_back((id, text));
@@ -484,7 +499,9 @@ impl Run<'_> {
             | Event::TurnStarted { .. }
             | Event::Steered { .. }
             | Event::TurnEnded { .. }
-            | Event::Titled { .. } => {}
+            | Event::Titled { .. }
+            | Event::SecretAnswered { .. }
+            | Event::SecretsChanged { .. } => {}
             // the workspace, as a tool left it: in the log, never the history
             Event::FilesChanged { .. } => {
                 self.session.publish(&ev).await;
@@ -700,7 +717,8 @@ impl Run<'_> {
                 let _ = tx.send(Event::ToolResult {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
-                    content: out.content,
+                    // a secret it printed stays out of the history and the log
+                    content: ctx.secrets.redact(&out.content),
                     is_error: out.is_error,
                     meta: out.meta,
                 });
@@ -916,7 +934,9 @@ fn log_event(ev: &Event) {
         | Event::ToolResult { .. }
         | Event::ModelDelta { .. }
         | Event::Titled { .. }
-        | Event::FilesChanged { .. } => {}
+        | Event::FilesChanged { .. }
+        | Event::SecretAnswered { .. }
+        | Event::SecretsChanged { .. } => {}
     }
 }
 
@@ -1013,13 +1033,19 @@ mod tests {
         cfg: AgentConfig,
         checkpoints: Option<&'static Checkpoints>,
     ) -> Harness {
-        start(log, cfg, checkpoints, None)
+        start(log, cfg, checkpoints, None, Secrets::none())
     }
 
     /// A harness whose workspace is mirrored, its repository in `state`.
     fn mirrored(state: &Path) -> Harness {
         let state: &'static Path = Box::leak(state.to_path_buf().into_boxed_path());
-        start(Vec::new(), CFG, None, Some(state))
+        start(Vec::new(), CFG, None, Some(state), Secrets::none())
+    }
+
+    /// A harness whose session has `secrets`, its workspace mirrored in `state`.
+    fn with_secrets(state: &Path, secrets: Secrets) -> Harness {
+        let state: &'static Path = Box::leak(state.to_path_buf().into_boxed_path());
+        start(Vec::new(), CFG, None, Some(state), secrets)
     }
 
     fn start(
@@ -1027,6 +1053,7 @@ mod tests {
         cfg: AgentConfig,
         checkpoints: Option<&'static Checkpoints>,
         mirror: Option<&'static Path>,
+        secrets: Secrets,
     ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let workdir: &'static Path =
@@ -1040,6 +1067,7 @@ mod tests {
             workdir,
             checkpoints,
             mirror: None,
+            secrets: secrets.clone(),
         };
         let (tx, inbox) = mpsc::channel(8);
         let (detach, when) = watch::channel(None);
@@ -1050,7 +1078,7 @@ mod tests {
         };
         let task = tokio::spawn(async move {
             if let Some(dir) = mirror {
-                let m = Mirror::open(dir, workdir, &[]).await?;
+                let m = Mirror::open(dir, workdir, &[], secrets).await?;
                 agent.mirror = Some(Box::leak(Box::new(tokio::sync::Mutex::new(m))));
             }
             let log = session.load().await?;
@@ -1196,6 +1224,8 @@ mod tests {
                 Event::CompactionFailed { message } => format!("compaction-failed:{message}"),
                 Event::TurnEnded { reason, .. } => format!("end:{reason:?}"),
                 Event::FilesChanged { .. } => "files".into(),
+                Event::SecretAnswered { name, provided, .. } => format!("answer:{name}:{provided}"),
+                Event::SecretsChanged { names } => format!("secrets:{}", names.join(",")),
                 Event::ModelDelta { .. } | Event::Titled { .. } => unreachable!("filtered"),
             })
             .collect()
@@ -1545,6 +1575,100 @@ mod tests {
                 ContentBlock::Text { text: "a".into() },
                 ContentBlock::Text { text: "b".into() }
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_secret_reaches_the_tools_and_stays_out_of_the_history_the_log_and_the_files() {
+        let state = tempfile::tempdir().unwrap();
+        let (tx, secrets) = Secrets::channel(&[("GITHUB_TOKEN", "ghp_first_value")]);
+        let h = with_secrets(state.path(), secrets);
+        h.provider.reset([
+            tool_script(&[(
+                "c1",
+                "Bash",
+                json!({ "command": "printf %s \"$GITHUB_TOKEN\" | tee token.txt" }),
+            )]),
+            Script::text("done", Duration::ZERO),
+        ]);
+        h.send("use it").await;
+        turns_ended(&h, 1).await;
+        let file = std::fs::read_to_string(h.workdir.join("token.txt")).unwrap();
+        assert_eq!(file, "ghp_first_value", "the tool had the value");
+
+        // another meanwhile: recorded by name
+        tx.send_replace(crate::secrets::tokens(&[
+            ("GITHUB_TOKEN", "ghp_first_value"),
+            ("NPM_TOKEN", "npm_value_1"),
+        ]));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !h
+            .events()
+            .iter()
+            .any(|e| matches!(e, Event::SecretsChanged { .. }))
+        {
+            assert!(Instant::now() < deadline, "no secrets_changed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let published = h.published.clone();
+        let (kinds, reqs) = h.finish(1).await;
+        assert!(
+            kinds.contains(&"tool:Bash:ok:[secret:GITHUB_TOKEN]".to_string()),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"secrets:GITHUB_TOKEN,NPM_TOKEN".to_string()),
+            "{kinds:?}"
+        );
+        let wire = serde_json::to_string(&*published.lock().unwrap()).unwrap();
+        assert!(!wire.contains("ghp_first_value"), "a value in the log");
+        let model = serde_json::to_string(&reqs[1].messages).unwrap();
+        assert!(!model.contains("ghp_first_value"), "a value in the history");
+        assert!(model.contains("[secret:GITHUB_TOKEN]"));
+
+        // the mirrored file has it redacted
+        let files: Vec<Event> = published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::FilesChanged { .. }))
+            .map(|(_, e)| e.clone())
+            .collect();
+        let mut bundles = dirigent_sync::Bundles::default();
+        let whole: Vec<_> = files.iter().filter_map(|e| bundles.push(e)).collect();
+        let reader = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let repo = dirigent_sync::Repo::open(reader.path()).await.unwrap();
+        let (last, _) = repo.replay(whole).await;
+        repo.checkout(out.path(), &last.unwrap(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.path().join("token.txt")).unwrap(),
+            "[secret:GITHUB_TOKEN]"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_to_a_request_for_a_secret_starts_a_turn() {
+        let h = harness();
+        h.provider.reset([Script::text("on it", Duration::ZERO)]);
+        let answer = Event::SecretAnswered {
+            session: "s1".into(),
+            name: "GITHUB_TOKEN".into(),
+            provided: true,
+            call: "c9".into(),
+        };
+        h.tx.send(("in-answer".into(), answer)).await.unwrap();
+        let (kinds, reqs) = h.finish(1).await;
+        assert_eq!(
+            kinds,
+            vec!["user:answer", "assistant:on it", "end:Completed",]
+        );
+        let said = serde_json::to_string(&reqs[0].messages).unwrap();
+        assert!(
+            said.contains("<secret_answer session=\\\"s1\\\" name=\\\"GITHUB_TOKEN\\\">provided</secret_answer>"),
+            "{said}"
         );
     }
 

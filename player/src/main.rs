@@ -6,6 +6,7 @@ mod history;
 mod mirror;
 mod process;
 mod provider;
+mod secrets;
 mod session;
 mod stop;
 mod title;
@@ -28,6 +29,7 @@ use crate::checkpoints::Checkpoints;
 use crate::dirigent::Director;
 use crate::mirror::Mirror;
 use crate::provider::{Effort, Provider};
+use crate::secrets::Secrets;
 use crate::session::chlive::ChliveSession;
 use crate::session::control::Lease;
 use crate::session::Session;
@@ -125,9 +127,7 @@ struct Cli {
     #[arg(long, env = "DIRIGENT_STOP_GRACE", default_value_t = 300)]
     stop_grace: u64,
 
-    #[arg(long, env = "ANTHROPIC_API_KEY", hide_env_values = true)]
-    api_key: Option<String>,
-
+    /// Anthropic's API (its key comes on the lease: the owner's, or the install's).
     #[arg(long, env = "ANTHROPIC_BASE_URL")]
     base_url: Option<String>,
 
@@ -219,15 +219,10 @@ async fn main() -> anyhow::Result<()> {
         // the spec's, which the lease came with
         let provider: Arc<dyn Provider> = match spec.provider {
             _ if cli.mock => Arc::new(provider::mock::MockProvider::long()),
-            ModelProvider::Anthropic => {
-                let key = cli.api_key.clone().context(
-                    "--api-key / ANTHROPIC_API_KEY is required for Anthropic's models, unless --mock",
-                )?;
-                Arc::new(provider::genai::GenaiProvider::new(
-                    key,
-                    cli.base_url.clone(),
-                )?)
-            }
+            ModelProvider::Anthropic => Arc::new(provider::genai::GenaiProvider::anthropic(
+                lease.anthropic_key(),
+                cli.base_url.clone(),
+            )?),
             ModelProvider::Chatgpt => Arc::new(provider::genai::GenaiProvider::chatgpt(
                 lease.plan_tokens(),
                 cli.openai_base_url.clone(),
@@ -251,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
             spec.source.as_ref(),
             checkpoints,
             &state.join("sync"),
+            Secrets::new(lease.tokens()),
         )
         .await?;
         let mirror: Option<&'static Mutex<Mirror>> =
@@ -286,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
             workdir,
             checkpoints,
             mirror,
+            secrets: Secrets::new(lease.tokens()),
         };
         info!(
             session = id,

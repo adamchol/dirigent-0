@@ -1,7 +1,7 @@
 //! dirigent's command line. It signs you in to a dirigent (with Google, as the web does),
 //! links the accounts your sessions' model calls are paid with (a ChatGPT plan, whose sign-in
-//! comes back to a listener only a process on your machine can have), and mirrors a session's
-//! workspace into a folder here.
+//! comes back to a listener only a process on your machine can have; an Anthropic API key),
+//! keeps the secrets their tools get, and mirrors a session's workspace into a folder here.
 
 mod api;
 mod credentials;
@@ -59,14 +59,21 @@ enum Command {
     Logout,
     /// Who you are to the dirigent, and the accounts you've linked.
     Whoami,
-    /// Link an account your sessions run on: signed in in your browser, held by dirigent.
+    /// Link an account your sessions run on, held by dirigent: a ChatGPT plan, signed in in your
+    /// browser; an Anthropic API key, typed (hidden) or on stdin.
     Link {
         account: Account,
         #[arg(long)]
         no_browser: bool,
     },
-    /// Unlink an account: dirigent revokes its grant and forgets it.
+    /// Unlink an account: dirigent revokes its grant (or forgets the key).
     Unlink { account: Account },
+    /// The secrets your sessions' tools get, by name: for all your sessions, or one's
+    /// (`--session`), which wins. Values are never shown again.
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
     /// The models your ChatGPT plan has.
     Models,
     /// Mirror a session's workspace into a folder here, kept as the session changes it (to
@@ -90,6 +97,31 @@ enum Command {
 enum Account {
     /// A ChatGPT plan (Plus or Pro).
     Chatgpt,
+    /// An Anthropic API key, which your Anthropic sessions run on rather than the install's.
+    Anthropic,
+}
+
+#[derive(Subcommand)]
+enum SecretCommand {
+    /// Set a secret: its value typed (hidden) or on stdin.
+    Set {
+        /// Its name, the variable the tools get (e.g. GITHUB_TOKEN).
+        name: String,
+        /// Only this session's (its id); without, all your sessions'.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// The names of the secrets.
+    List {
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Remove a secret.
+    Rm {
+        name: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -109,6 +141,14 @@ struct CliClient {
 struct Me {
     subject: String,
     chatgpt: Option<Link>,
+    anthropic: Option<Hint>,
+    #[serde(default)]
+    anthropic_default: bool,
+}
+
+#[derive(Deserialize)]
+struct Hint {
+    hint: String,
 }
 
 #[derive(Deserialize)]
@@ -228,6 +268,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     broken: Some(why),
                 }) => println!("ChatGPT: {email}, broken: {why} (dirigent link chatgpt)"),
             }
+            match (me.anthropic, me.anthropic_default) {
+                (Some(Hint { hint }), _) => println!("Anthropic: your key …{hint}"),
+                (None, true) => println!("Anthropic: the install's key (dirigent link anthropic)"),
+                (None, false) => println!("Anthropic: no key (dirigent link anthropic)"),
+            }
         }
         Command::Link {
             account: Account::Chatgpt,
@@ -259,6 +304,50 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             api.delete("/links/chatgpt").await?;
             println!("Unlinked ChatGPT");
         }
+        Command::Link {
+            account: Account::Anthropic,
+            ..
+        } => {
+            let mut api = Api::signed_in(http)?;
+            let key = hidden("Anthropic API key: ")?;
+            let saved: Hint = api.put("/links/anthropic", &json!({ "key": key })).await?;
+            println!(
+                "Anthropic: your key …{} (your sessions run on it)",
+                saved.hint
+            );
+        }
+        Command::Unlink {
+            account: Account::Anthropic,
+        } => {
+            let mut api = Api::signed_in(http)?;
+            api.delete("/links/anthropic").await?;
+            println!("Removed your Anthropic key");
+        }
+        Command::Secret { command } => {
+            let mut api = Api::signed_in(http)?;
+            let base = |session: &Option<String>| match session {
+                Some(s) => format!("/sessions/{s}/secrets"),
+                None => "/secrets".into(),
+            };
+            match command {
+                SecretCommand::Set { name, session } => {
+                    let value = hidden(&format!("{name}: "))?;
+                    let path = format!("{}/{name}", base(&session));
+                    api.put_empty(&path, &json!({ "value": value })).await?;
+                    println!("Set {name}");
+                }
+                SecretCommand::List { session } => {
+                    let names: Vec<String> = api.get(&base(&session)).await?;
+                    for name in names {
+                        println!("{name}");
+                    }
+                }
+                SecretCommand::Rm { name, session } => {
+                    api.delete(&format!("{}/{name}", base(&session))).await?;
+                    println!("Removed {name}");
+                }
+            }
+        }
         Command::Models => {
             let mut api = Api::signed_in(http)?;
             let models: Vec<Model> = api.get("/links/chatgpt/models").await?;
@@ -274,4 +363,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         } => sync::sync(Api::signed_in(http)?, &session, dir, chlive, once).await?,
     }
     Ok(())
+}
+
+/// A secret: typed without echo on a terminal, else stdin's (without its last line ending).
+fn hidden(prompt: &str) -> anyhow::Result<String> {
+    use std::io::{IsTerminal, Read};
+    let value = if std::io::stdin().is_terminal() {
+        rpassword::prompt_password(prompt)?
+    } else {
+        let mut value = String::new();
+        std::io::stdin().read_to_string(&mut value)?;
+        value.trim_end_matches(['\n', '\r']).to_string()
+    };
+    anyhow::ensure!(!value.is_empty(), "nothing was given");
+    Ok(value)
 }

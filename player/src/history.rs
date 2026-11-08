@@ -135,7 +135,9 @@ impl Entry {
             | Event::Error { .. }
             | Event::CompactionFailed { .. }
             | Event::Titled { .. }
-            | Event::FilesChanged { .. } => None,
+            | Event::FilesChanged { .. }
+            | Event::SecretAnswered { .. }
+            | Event::SecretsChanged { .. } => None,
         }
     }
 

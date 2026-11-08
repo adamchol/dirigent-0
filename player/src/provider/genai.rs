@@ -16,21 +16,24 @@ use super::{
     ContentBlock, Delta, DeltaStream, Effort, Message, Provider, ProviderError, Request, Role,
     StopReason, Usage,
 };
-use crate::session::control::PlanTokens;
+use crate::session::control::{AnthropicKey, PlanTokens};
 
 pub struct GenaiProvider {
     client: Client,
     /// OpenAI's Responses API on a ChatGPT plan, with the lease's access tokens; none,
     /// Anthropic's.
     plan: Option<PlanTokens>,
+    /// Anthropic's API key, the lease's; none, a ChatGPT plan's.
+    key: Option<AnthropicKey>,
 }
 
 impl GenaiProvider {
-    /// `base_url`, when set, replaces the provider's endpoint for every call
-    /// (Anthropic default: `https://api.anthropic.com/v1/`; keep the `/v1/`).
-    pub fn new(api_key: String, base_url: Option<String>) -> anyhow::Result<Self> {
+    /// Anthropic's API with `key`, each call taking the latest. `base_url`, when set, replaces
+    /// its endpoint for every call (by default `https://api.anthropic.com/v1/`; keep the `/v1/`).
+    pub fn anthropic(key: AnthropicKey, base_url: Option<String>) -> anyhow::Result<Self> {
+        let current = key.clone();
         let mut builder = Client::builder()
-            .with_auth_resolver_fn(move |_| Ok(Some(AuthData::from_single(api_key.clone()))));
+            .with_auth_resolver_fn(move |_| Ok(current.current().ok().map(AuthData::from_single)));
         if let Some(url) = base_url {
             builder = builder.with_service_target_resolver_fn(move |mut t: ServiceTarget| {
                 t.endpoint = Endpoint::from_owned(url.clone());
@@ -40,6 +43,7 @@ impl GenaiProvider {
         Ok(GenaiProvider {
             client: builder.build()?,
             plan: None,
+            key: Some(key),
         })
     }
 
@@ -57,6 +61,7 @@ impl GenaiProvider {
         Ok(GenaiProvider {
             client,
             plan: Some(plan),
+            key: None,
         })
     }
 
@@ -94,6 +99,15 @@ fn unavailable(why: String) -> ProviderError {
     }
 }
 
+/// Why an Anthropic session's call can't be made: it has no key.
+fn no_key(why: String) -> ProviderError {
+    ProviderError::Api {
+        status: 401,
+        message: why,
+        retryable: false,
+    }
+}
+
 fn refused(e: &ProviderError) -> bool {
     matches!(e, ProviderError::Api { status: 401, .. })
 }
@@ -107,6 +121,9 @@ impl Provider for GenaiProvider {
     /// On a ChatGPT plan, an access token OpenAI refuses (expired early, revoked) is renewed by
     /// control, and the call made once more with the new one.
     async fn stream(&self, req: &Request) -> Result<DeltaStream, ProviderError> {
+        if let Some(key) = &self.key {
+            key.current().map_err(no_key)?;
+        }
         let Some(plan) = &self.plan else {
             return self.open(req).await;
         };
@@ -1117,6 +1134,7 @@ mod tests {
                 owner: None,
                 openai: openai.map(String::from),
                 openai_unavailable: why.map(String::from),
+                ..Default::default()
             };
         let (tx, rx) =
             tokio::sync::watch::channel(tokens(token, token.is_none().then_some("not linked")));
@@ -1157,6 +1175,25 @@ mod tests {
             acc.push(delta?);
         }
         Ok(acc.finish())
+    }
+
+    #[tokio::test]
+    async fn an_anthropic_call_without_a_key_fails_with_controls_word() {
+        let why = "no Anthropic API key: add yours in the web's account menu";
+        let key = AnthropicKey::of(dirigent_protocol::control::pb::Tokens {
+            anthropic_unavailable: Some(why.into()),
+            ..Default::default()
+        });
+        let p = GenaiProvider::anthropic(key, Some("http://127.0.0.1:1/v1/".into())).unwrap();
+        match p.stream(&plan_request()).await {
+            Err(ProviderError::Api {
+                status: 401,
+                message,
+                retryable: false,
+            }) => assert_eq!(message, why),
+            Err(other) => panic!("{other:?}"),
+            Ok(_) => panic!("a call without a key"),
+        }
     }
 
     #[tokio::test]

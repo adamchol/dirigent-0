@@ -78,6 +78,12 @@ message Tokens {
   // renewed by control (with a quarter of an hour left at least); or, none, why there's none.
   optional string openai = 3;
   optional string openai_unavailable = 4;
+  // An Anthropic session's: its owner's API key, or the install's; or, none, why there's none.
+  optional string anthropic = 5;
+  optional string anthropic_unavailable = 6;
+  // The session's secrets, by name: its own, and its owner's for all their sessions (the
+  // session's winning), for its tools' environment. Sent again at once when they change.
+  map<string, string> secrets = 7;
 }
 
 // Any time after `Acquired`: the session was stopped. The player finishes the turn running
@@ -103,7 +109,7 @@ message SessionSpec {
 
 enum Provider {
   PROVIDER_UNSPECIFIED = 0;
-  // Anthropic's API, with the player's API key.
+  // Anthropic's API, with the owner's API key, or the install's.
   PROVIDER_ANTHROPIC = 1;
   // OpenAI's Responses API, paid with the session owner's ChatGPT plan.
   PROVIDER_CHATGPT = 2;

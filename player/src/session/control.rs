@@ -121,6 +121,13 @@ impl Lease {
         }
     }
 
+    /// The Anthropic API key, an Anthropic session's: its owner's or the install's.
+    pub fn anthropic_key(&self) -> AnthropicKey {
+        AnthropicKey {
+            tokens: self.tokens.clone(),
+        }
+    }
+
     /// Whether to stop now, once control says the session is stopped; `None` until then. A
     /// graceful stop may turn into one that's now.
     pub fn detach(&self) -> watch::Receiver<Option<bool>> {
@@ -217,6 +224,33 @@ impl PlanTokens {
             Err(_) => Err("control sent no new access token for the ChatGPT plan".to_string()),
         };
         waited.and_then(|()| self.current())
+    }
+}
+
+/// The Anthropic API key in the lease's credentials, as control sent it last (again at once when
+/// the owner gives or removes theirs).
+#[derive(Clone)]
+pub struct AnthropicKey {
+    tokens: watch::Receiver<pb::Tokens>,
+}
+
+impl AnthropicKey {
+    /// As `tokens` have it, always.
+    #[cfg(test)]
+    pub fn of(tokens: pb::Tokens) -> Self {
+        AnthropicKey {
+            tokens: watch::channel(tokens).1,
+        }
+    }
+
+    /// The key, or why there's none (control's word).
+    pub fn current(&self) -> Result<String, String> {
+        let t = self.tokens.borrow();
+        match (&t.anthropic, &t.anthropic_unavailable) {
+            (Some(key), _) => Ok(key.clone()),
+            (None, Some(why)) => Err(why.clone()),
+            (None, None) => Err("control sent no Anthropic API key".into()),
+        }
     }
 }
 

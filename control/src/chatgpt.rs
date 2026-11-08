@@ -10,15 +10,12 @@
 //! named by its signing key's thumbprint (RFC 9278), as OpenAI recommends.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use jsonwebtoken::Validation;
 use rand::RngCore;
 use reqwest::Url;
@@ -29,6 +26,7 @@ use tracing::{info, warn};
 
 use crate::auth::{asymmetric_header, Keys, LEEWAY};
 use crate::leases::{Link, Store};
+use crate::seal::Seal;
 
 /// The scope that lets a grant's access tokens be paid with the plan.
 const PLAN_SCOPE: &str = "chatgpt.tokens.use.direct";
@@ -95,7 +93,7 @@ pub struct ChatGpt {
     auth: String,
     api: String,
     host_id: String,
-    cipher: XChaCha20Poly1305,
+    seal: Seal,
     provider: tokio::sync::OnceCell<Provider>,
     /// The sign-ins under way, by their `state`.
     pending: Mutex<HashMap<String, Pending>>,
@@ -186,7 +184,7 @@ impl ChatGpt {
             auth: args.openai_auth.trim_end_matches('/').into(),
             api: args.openai_api.trim_end_matches('/').into(),
             host_id: format!("urn:ietf:params:oauth:jwk-thumbprint:sha-256:{host_key_id}"),
-            cipher: XChaCha20Poly1305::new(&load_key(path)?.into()),
+            seal: Seal::load(path)?,
             provider: Default::default(),
             pending: Default::default(),
             access: Default::default(),
@@ -586,24 +584,11 @@ impl ChatGpt {
     }
 
     fn seal(&self, plain: &[u8]) -> Vec<u8> {
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let mut sealed = nonce.to_vec();
-        sealed.extend(
-            self.cipher
-                .encrypt(&nonce, plain)
-                .expect("encrypting in memory"),
-        );
-        sealed
+        self.seal.seal(plain)
     }
 
     fn open(&self, sealed: &[u8]) -> anyhow::Result<String> {
-        anyhow::ensure!(sealed.len() > 24, "a sealed refresh token too short");
-        let (nonce, text) = sealed.split_at(24);
-        let plain = self
-            .cipher
-            .decrypt(XNonce::from_slice(nonce), text)
-            .map_err(|_| anyhow::anyhow!("the refresh token isn't the link key's"))?;
-        Ok(String::from_utf8(plain)?)
+        self.seal.open(sealed)
     }
 }
 
@@ -679,34 +664,13 @@ fn random() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn load_key(path: &Path) -> anyhow::Result<[u8; 32]> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading the link key {}", path.display()))?;
-    let bytes = STANDARD
-        .decode(text.trim())
-        .with_context(|| format!("{}: not base64", path.display()))?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("{}: not 32 bytes", path.display()))
-}
-
-/// A new link key in `path` (32 random bytes, base64), unless there's one.
-pub fn keygen(path: &Path) -> anyhow::Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-    let mut key = [0u8; 32];
-    rand::rng().fill_bytes(&mut key);
-    crate::token::write_private(path, STANDARD.encode(key).as_bytes())
-        .with_context(|| format!("writing {}", path.display()))
-}
-
 /// OpenAI's side of Sign in with ChatGPT, for the tests: discovery, authorize (which redirects
 /// at once, as a user who's signed in and consents), the token endpoint (codes, and refresh
 /// tokens that rotate, an old one refused as reused), revocation, its keys, the plan's models,
 /// and the Responses API, streaming a reply as the access token's (or failing, as told).
 #[cfg(test)]
 pub mod fake {
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::extract::{Form, Query, State};
@@ -977,10 +941,11 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn chatgpt(dir: &Path) -> ChatGpt {
         let key = dir.join("link.key");
-        keygen(&key).unwrap();
+        crate::seal::keygen(&key).unwrap();
         let args = ChatGptArgs {
             link_key: Some(key),
             openai_auth: "http://127.0.0.1:1".into(),
@@ -990,31 +955,13 @@ mod tests {
     }
 
     #[test]
-    fn a_sealed_refresh_token_opens_only_with_its_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let c = chatgpt(dir.path());
-        let sealed = c.seal(b"rt-secret");
-        assert!(!sealed.windows(9).any(|w| w == b"rt-secret"));
-        assert_ne!(sealed, c.seal(b"rt-secret"), "a nonce of its own each time");
-        assert_eq!(c.open(&sealed).unwrap(), "rt-secret");
-        let other = tempfile::tempdir().unwrap();
-        assert!(chatgpt(other.path()).open(&sealed).is_err());
-        assert!(c.open(&sealed[..10]).is_err());
-    }
-
-    #[test]
-    fn the_host_is_named_by_controls_key_and_keygen_keeps_a_key() {
+    fn the_host_is_named_by_controls_key() {
         let dir = tempfile::tempdir().unwrap();
         let c = chatgpt(dir.path());
         assert_eq!(
             c.host_id,
             "urn:ietf:params:oauth:jwk-thumbprint:sha-256:kid"
         );
-        let key = dir.path().join("link.key");
-        let before = std::fs::read(&key).unwrap();
-        keygen(&key).unwrap();
-        assert_eq!(std::fs::read(&key).unwrap(), before);
-        assert_eq!(load_key(&key).unwrap().len(), 32);
     }
 
     #[test]

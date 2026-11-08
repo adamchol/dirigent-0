@@ -14,6 +14,7 @@ use tracing::{info, warn};
 use crate::checkpoints::Checkpoints;
 use crate::mirror::Mirror;
 use crate::process::{command, run};
+use crate::secrets::Secrets;
 use crate::session::Session;
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -29,6 +30,7 @@ pub async fn open(
     source: Option<&Source>,
     checkpoints: Option<&Checkpoints>,
     mirror: &Path,
+    secrets: Secrets,
 ) -> anyhow::Result<(Vec<(String, Event)>, Option<Mirror>)> {
     let mut log = session.load().await?;
     let mut restored = false;
@@ -43,7 +45,7 @@ pub async fn open(
         Err(error) => anyhow::bail!("the workspace couldn't be made: {error}"),
     }
     let files = session.files().await?;
-    let mut mirror = match Mirror::open(mirror, workdir, &files).await {
+    let mut mirror = match Mirror::open(mirror, workdir, &files, secrets).await {
         Ok(m) => m,
         Err(e) => {
             warn!("the workspace isn't mirrored: {e:#}");
@@ -396,12 +398,14 @@ pub(crate) mod tests {
             files: Vec::new(),
             published: Vec::new(),
         };
+        let secrets = || Secrets::channel(&[("GITHUB_TOKEN", "ghp_secret123")]).1;
         let (_, mirror) = open(
             &mut first,
             leak(&old),
             None,
             Some(&cp),
             &tmp.path().join("s1"),
+            secrets(),
         )
         .await
         .unwrap();
@@ -409,6 +413,7 @@ pub(crate) mod tests {
         let snapshot = cp.snapshot(&old, "t").await.unwrap();
         std::fs::write(old.join("keep"), "2").unwrap();
         std::fs::remove_file(old.join("gone")).unwrap();
+        std::fs::write(old.join(".env"), "TOKEN=ghp_secret123\n").unwrap();
         let mut files = first.published.clone();
         files.extend(mirror.snapshot("Bash c1").await);
         assert_eq!(files.len(), 2, "{files:?}");
@@ -427,6 +432,7 @@ pub(crate) mod tests {
             None,
             Some(&cp),
             &tmp.path().join("s2"),
+            secrets(),
         )
         .await
         .unwrap();
@@ -437,6 +443,24 @@ pub(crate) mod tests {
         );
         assert_eq!(std::fs::read_to_string(work.join("keep")).unwrap(), "2");
         assert!(!work.join("gone").exists());
+        // a secret it wrote: redacted in the log, put back in the workspace
+        assert_eq!(
+            std::fs::read_to_string(work.join(".env")).unwrap(),
+            "TOKEN=ghp_secret123\n"
+        );
+        let reader = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let repo = dirigent_sync::Repo::open(reader.path()).await.unwrap();
+        let mut bundles = dirigent_sync::Bundles::default();
+        let whole: Vec<_> = files.iter().filter_map(|e| bundles.push(e)).collect();
+        let (last, _) = repo.replay(whole).await;
+        repo.checkout(out.path(), &last.unwrap(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.path().join(".env")).unwrap(),
+            "TOKEN=[secret:GITHUB_TOKEN]\n"
+        );
 
         // and its next commit builds on the log's last
         std::fs::write(work.join("new"), "n").unwrap();

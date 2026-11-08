@@ -16,6 +16,16 @@ pub const MAX_TIMEOUT_MS: u64 = 600_000;
 pub const MAX_OUTPUT_CHARS: usize = 30_000;
 pub const HEAD_CHARS: usize = 20_000;
 
+/// The player's variables a command gets: what a shell and the usual tools need, never its
+/// own (its credentials, the stack's addresses).
+const PASSED_ON: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR", "TZ",
+];
+
+fn passed_on(key: &str) -> bool {
+    PASSED_ON.contains(&key) || key.starts_with("LC_")
+}
+
 pub struct Bash;
 
 #[async_trait]
@@ -53,6 +63,14 @@ impl Tool for Bash {
         );
 
         let mut cmd = Command::new("bash");
+        // the player's environment only as far as a shell needs it, and the session's secrets
+        cmd.env_clear();
+        for (key, value) in std::env::vars_os() {
+            if passed_on(&key.to_string_lossy()) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.envs(ctx.secrets.current());
         cmd.arg("-c")
             .arg(&command)
             .current_dir(ctx.workdir)
@@ -175,6 +193,7 @@ fn kill_group(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::Secrets;
     use crate::tools::testing::*;
 
     async fn bash(ctx: &ToolCtx, input: Value) -> ToolOutput {
@@ -196,6 +215,45 @@ mod tests {
         assert!(out.is_error);
         assert_eq!(out.content, "boom\nExit code: 3");
         assert_eq!(out.meta["exit_code"], 3);
+    }
+
+    #[tokio::test]
+    async fn a_command_gets_the_secrets_and_none_of_the_players_own_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let root: &'static std::path::Path =
+            Box::leak(dir.path().canonicalize().unwrap().into_boxed_path());
+        let (tx, secrets) = Secrets::channel(&[("GITHUB_TOKEN", "ghp_first")]);
+        let ctx = ToolCtx::new(root, secrets);
+        // the player's own, which no command should see
+        assert!(!passed_on("DIRIGENT_KOPIA_TOKEN") && !passed_on("ANTHROPIC_API_KEY"));
+        assert!(passed_on("PATH") && passed_on("LC_ALL"));
+        let env = |out: ToolOutput| -> Vec<String> {
+            let mut names: Vec<String> = out
+                .content
+                .lines()
+                .filter_map(|l| l.split_once('=').map(|(k, _)| k.to_string()))
+                .collect();
+            names.sort();
+            names
+        };
+        let out = bash(&ctx, json!({ "command": "env -0 | tr '\\0' '\\n'" })).await;
+        let names = env(out);
+        assert!(
+            names.iter().all(|n| passed_on(n)
+                || n == "GITHUB_TOKEN"
+                || n == "PWD"
+                || n == "SHLVL"
+                || n == "_"
+                || n == "OLDPWD"),
+            "{names:?}"
+        );
+        assert!(names.contains(&"GITHUB_TOKEN".to_string()));
+        let out = bash(&ctx, json!({ "command": "printf %s \"$GITHUB_TOKEN\"" })).await;
+        assert_eq!(out.content, "ghp_first");
+        // one given meanwhile reaches the next command
+        tx.send_replace(crate::secrets::tokens(&[("GITHUB_TOKEN", "ghp_second")]));
+        let out = bash(&ctx, json!({ "command": "printf %s \"$GITHUB_TOKEN\"" })).await;
+        assert_eq!(out.content, "ghp_second");
     }
 
     #[tokio::test]

@@ -139,7 +139,7 @@ fn now() -> u64 {
 /// chlive's `jwks_file`); and `link.key`, which ChatGPT links are encrypted with.
 pub fn keygen(dir: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
-    crate::chatgpt::keygen(&dir.join("link.key"))?;
+    crate::seal::keygen(&dir.join("link.key"))?;
     let pem = dir.join("key.pem");
     if !pem.exists() {
         std::fs::create_dir_all(dir)?;

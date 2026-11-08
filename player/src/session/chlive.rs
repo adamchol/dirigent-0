@@ -228,6 +228,7 @@ mod e2e {
     use crate::checkpoints::Checkpoints;
     use crate::provider::mock::{MockProvider, Script};
     use crate::provider::Message;
+    use crate::secrets::Secrets;
     use crate::session::control::{Lease, Refused};
     use crate::tools::Registry;
     use crate::workspace;
@@ -352,8 +353,10 @@ mod e2e {
             workdir,
             checkpoints: Some(checkpoints),
             mirror: None,
+            secrets: Secrets::new(lease.tokens()),
         };
         let mirror = state.path().join("sync");
+        let secrets = Secrets::new(lease.tokens());
         let mut s = ChliveSession::new(session, lease.epoch, &stack.chlive, lease.tokens());
         let source = lease.spec.source.clone();
         let detach = Detach {
@@ -361,9 +364,15 @@ mod e2e {
             when: lease.detach(),
         };
         let task = tokio::spawn(async move {
-            let (log, m) =
-                workspace::open(&mut s, workdir, source.as_ref(), Some(checkpoints), &mirror)
-                    .await?;
+            let (log, m) = workspace::open(
+                &mut s,
+                workdir,
+                source.as_ref(),
+                Some(checkpoints),
+                &mirror,
+                secrets,
+            )
+            .await?;
             agent.mirror = m.map(|m| &*Box::leak(Box::new(tokio::sync::Mutex::new(m))));
             agent.run(&mut s, log, detach).await
         });
@@ -952,6 +961,137 @@ mod e2e {
             &format!("/sessions/{child}/stop"),
         );
         assert!(stop.send().await.unwrap().status().is_success());
+    }
+
+    #[tokio::test]
+    async fn e2e_a_secret_given_mid_session_reaches_its_tools_and_stays_out_of_the_log() {
+        let Some(stack) = stack() else { return };
+        let session = new_session(&stack).await;
+        let user = User::new(&stack, &session);
+        let player = start(&stack, &session).await;
+        user.say("!true").await;
+        log_until(&stack, &session, |r| turns_ended(r) == 1).await;
+
+        let value = format!("e2e-secret-{}", new_id());
+        let put = api(
+            &stack,
+            reqwest::Method::PUT,
+            &format!("/sessions/{session}/secrets/E2E_TOKEN"),
+        )
+        .json(&serde_json::json!({ "value": value }));
+        assert_eq!(
+            put.send().await.unwrap().status(),
+            reqwest::StatusCode::NO_CONTENT
+        );
+        let log = log_until(&stack, &session, |r| {
+            r.iter().any(|r| r.kind == "secrets_changed")
+        })
+        .await;
+        let changed = log.iter().find(|r| r.kind == "secrets_changed").unwrap();
+        assert_eq!(
+            changed.event().unwrap(),
+            Event::SecretsChanged {
+                names: vec!["E2E_TOKEN".into()]
+            }
+        );
+
+        user.say(r#"!printf %s "$E2E_TOKEN" > f.txt && cat f.txt"#)
+            .await;
+        let log = log_until(&stack, &session, |r| turns_ended(r) == 2).await;
+        let said = log
+            .iter()
+            .rev()
+            .find_map(|r| match r.event().unwrap() {
+                Event::ToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(said, "[secret:E2E_TOKEN]");
+        assert!(
+            log.iter().all(|r| !r.data.contains(&value)),
+            "a value in the log"
+        );
+        let on_disk = std::fs::read_to_string(player.dir.path().join("f.txt")).unwrap();
+        assert_eq!(on_disk, value);
+        // and in the workspace's mirror, redacted
+        let files = files(&stack, &session).await;
+        assert!(files
+            .iter()
+            .all(|e| !serde_json::to_string(e).unwrap().contains(&value)));
+        let mut bundles = dirigent_sync::Bundles::default();
+        let whole: Vec<_> = files.iter().filter_map(|e| bundles.push(e)).collect();
+        let reader = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let repo = dirigent_sync::Repo::open(reader.path()).await.unwrap();
+        let (last, _) = repo.replay(whole).await;
+        repo.checkout(out.path(), &last.unwrap(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.path().join("f.txt")).unwrap(),
+            "[secret:E2E_TOKEN]"
+        );
+        player.stop().await;
+    }
+
+    #[tokio::test]
+    async fn e2e_a_dirigent_asks_for_secrets_only_for_its_owners_sessions_and_hears_the_answer() {
+        let Some(stack) = stack() else { return };
+        let dirigent = put_session(&stack, serde_json::json!({ "part": "dirigent" })).await;
+        let mine = new_session(&stack).await;
+        // another's, which the user only views
+        let theirs = new_id();
+        let status = reqwest::Client::new()
+            .put(format!("{}/sessions/{theirs}", stack.control))
+            .header("dirigent-user", "user:e2e-someone-else")
+            .json(&serde_json::json!({ "viewers": [USER] }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::CREATED);
+        let user = User::new(&stack, &dirigent);
+        let player = start(&stack, &dirigent).await;
+        let ask = |session: &str| {
+            format!(
+                r#"!!request_secret {{"session": "{session}", "name": "GITHUB_TOKEN", "why": "to push"}}"#
+            )
+        };
+        user.say(&ask(&mine)).await;
+        log_until(&stack, &dirigent, |r| turns_ended(r) == 1).await;
+        user.say(&ask(&theirs)).await;
+        let log = log_until(&stack, &dirigent, |r| turns_ended(r) == 2).await;
+        let results: Vec<(bool, String)> = log
+            .iter()
+            .filter_map(|r| match r.event().unwrap() {
+                Event::ToolResult {
+                    is_error, content, ..
+                } => Some((is_error, content)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert!(
+            !results[0].0 && results[0].1.contains("Asked the user"),
+            "{results:?}"
+        );
+        assert!(
+            results[1].0 && results[1].1.contains("only view"),
+            "{results:?}"
+        );
+
+        // the owner's answer, written by them, starts the dirigent's next turn
+        user.send(Event::SecretAnswered {
+            session: mine.clone(),
+            name: "GITHUB_TOKEN".into(),
+            provided: true,
+            call: "c1".into(),
+        })
+        .await;
+        let log = log_until(&stack, &dirigent, |r| turns_ended(r) == 3).await;
+        let answer = log.iter().find(|r| r.kind == "secret_answered").unwrap();
+        assert_eq!(answer.author, USER);
+        player.stop().await;
     }
 
     #[tokio::test]

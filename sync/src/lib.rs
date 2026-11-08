@@ -27,7 +27,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 pub use bundles::{events, Bundle, Bundles, PART};
-pub use workspace::{Workspace, MAX_FILE_SIZE};
+pub use workspace::{replace, Workspace, MAX_FILE_SIZE};
 
 /// How long one git command may take.
 const TIMEOUT: Duration = Duration::from_secs(300);

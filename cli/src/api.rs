@@ -88,6 +88,21 @@ impl Api {
         json(req).await
     }
 
+    pub async fn put<T: DeserializeOwned>(
+        &mut self,
+        path: &str,
+        body: &impl Serialize,
+    ) -> anyhow::Result<T> {
+        let req = self.request(Method::PUT, path).await?.json(body);
+        json(req).await
+    }
+
+    /// A PUT answered with nothing.
+    pub async fn put_empty(&mut self, path: &str, body: &impl Serialize) -> anyhow::Result<()> {
+        let req = self.request(Method::PUT, path).await?.json(body);
+        checked(req).await.map(|_| ())
+    }
+
     pub async fn delete(&mut self, path: &str) -> anyhow::Result<()> {
         let req = self.request(Method::DELETE, path).await?;
         checked(req).await.map(|_| ())

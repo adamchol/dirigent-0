@@ -9,6 +9,8 @@ mod auth;
 mod chatgpt;
 mod leases;
 mod runner;
+mod seal;
+mod secrets;
 mod token;
 
 use std::collections::HashMap;
@@ -29,15 +31,17 @@ use dirigent_protocol::control::{
     pb, player_subject, Part, Provider, Role, SessionInfo, SessionSpec,
 };
 use serde::Deserialize;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::chatgpt::{ChatGpt, ChatGptArgs, LinkInfo, Model, Started as LinkStarted};
-use crate::leases::{Acquire, Put, Reserve, Store};
+use crate::leases::{Acquire, Put, Reserve, Scope, Store};
 use crate::runner::{Kube, Local, Runner};
+use crate::seal::Seal;
+use crate::secrets::{KeyArgs, Keys};
 use crate::token::{Signer, CHLIVE, CONTROL};
 
 /// How often a player's connection is pinged, and how long it may go unanswered before the
@@ -125,6 +129,9 @@ struct Cli {
     #[command(flatten)]
     chatgpt: ChatGptArgs,
 
+    #[command(flatten)]
+    keys: KeyArgs,
+
     /// The key control signs credentials with: Ed25519, PKCS#8 PEM (`control keygen`).
     #[arg(long, env = "DIRIGENT_SIGNING_KEY", required = true)]
     signing_key: Option<PathBuf>,
@@ -161,6 +168,10 @@ struct Control {
     auth: Auth,
     /// The ChatGPT plans linked, which sessions may run on; none without a link key.
     chatgpt: Option<ChatGpt>,
+    /// Users' API keys and secrets, and the install's key.
+    keys: Keys,
+    /// What changed of leases' credentials, which their holders send again at once.
+    changed: broadcast::Sender<Changed>,
     runner: Option<&'static dyn Runner>,
     startup: Duration,
     /// Whether only the players it started get leases (`--reserved-only`).
@@ -196,6 +207,13 @@ async fn main() -> anyhow::Result<()> {
     let signing_key = cli.signing_key.as_deref().expect("required");
     let signer = Signer::load(signing_key, &cli.issuer, Duration::from_secs(cli.token_ttl))?;
     let chatgpt = ChatGpt::new(&cli.chatgpt, signer.kid())?;
+    let seal = cli
+        .chatgpt
+        .link_key
+        .as_deref()
+        .map(Seal::load)
+        .transpose()?;
+    let keys = Keys::new(&cli.keys, seal)?;
     let oidc = match cli.auth {
         AuthMode::Declared => None,
         AuthMode::Oidc => Some(auth::Oidc::start(&cli.oidc).await?),
@@ -228,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
         store,
         Auth { signer, oidc },
         chatgpt,
+        keys,
         runner,
         Duration::from_secs(cli.startup),
         cli.reserved_only,
@@ -259,6 +278,7 @@ fn control(
     store: Store,
     auth: Auth,
     chatgpt: Option<ChatGpt>,
+    keys: Keys,
     runner: Option<&'static dyn Runner>,
     startup: Duration,
     reserved_only: bool,
@@ -267,6 +287,8 @@ fn control(
         store,
         auth,
         chatgpt,
+        keys,
+        changed: broadcast::channel(64).0,
         runner,
         startup,
         reserved_only,
@@ -287,6 +309,20 @@ fn router(control: &'static Control) -> Router {
         )
         .route("/auth", get(auth_mode))
         .route("/me", get(me))
+        .route(
+            "/sessions/{id}/secrets/{name}",
+            axum::routing::put(put_session_secret).delete(delete_session_secret),
+        )
+        .route("/sessions/{id}/secrets", get(list_session_secrets))
+        .route("/secrets", get(list_user_secrets))
+        .route(
+            "/secrets/{name}",
+            axum::routing::put(put_user_secret).delete(delete_user_secret),
+        )
+        .route(
+            "/links/anthropic",
+            axum::routing::put(put_anthropic_key).delete(delete_anthropic_key),
+        )
         .route("/links/chatgpt", axum::routing::delete(unlink_chatgpt))
         .route("/links/chatgpt/start", post(start_link))
         .route("/links/chatgpt/finish", post(finish_link))
@@ -312,7 +348,9 @@ async fn auth_mode(State(control): State<&'static Control>) -> Json<serde_json::
     })
 }
 
-/// The caller, and the ChatGPT plan they linked: `{"subject", "chatgpt": {"email", "broken"}}`.
+/// The caller, the ChatGPT plan they linked and the Anthropic key they gave: `{"subject",
+/// "chatgpt": {"email", "broken"}, "anthropic": {"hint"}, "anthropic_default"}`, the last whether
+/// the install has a key their sessions run on without one.
 async fn me(
     State(control): State<&'static Control>,
     Caller(caller): Caller,
@@ -324,9 +362,21 @@ async fn me(
             .map_err(|e| failed("reading the ChatGPT link", e))?,
         None => None,
     };
-    Ok(Json(
-        serde_json::json!({ "subject": caller, "chatgpt": chatgpt }),
-    ))
+    let anthropic = match &control.keys.seal {
+        Some(_) => control
+            .store
+            .api_key(&caller, secrets::ANTHROPIC)
+            .await
+            .map_err(|e| failed("reading the Anthropic key", e))?
+            .map(|(_, hint)| serde_json::json!({ "hint": hint })),
+        None => None,
+    };
+    Ok(Json(serde_json::json!({
+        "subject": caller,
+        "chatgpt": chatgpt,
+        "anthropic": anthropic,
+        "anthropic_default": control.keys.house.is_some(),
+    })))
 }
 
 fn linking(control: &Control) -> Result<&ChatGpt, Failed> {
@@ -711,6 +761,184 @@ async fn remove_viewer(
     }
 }
 
+fn sealing(control: &Control) -> Result<&Seal, Failed> {
+    control.keys.seal.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "this control keeps no keys or secrets (no --link-key)".into(),
+    ))
+}
+
+/// What a sealed thing changes, for the leases it reaches.
+fn changed(control: &Control, what: Changed) {
+    // no lease held, no one listens
+    let _ = control.changed.send(what);
+}
+
+#[derive(Deserialize)]
+struct Key {
+    key: String,
+}
+
+/// The caller's Anthropic API key is this one, once Anthropic takes it: `{"hint"}`.
+async fn put_anthropic_key(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Json(Key { key }): Json<Key>,
+) -> Result<Json<serde_json::Value>, Failed> {
+    let seal = sealing(control)?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "the key is empty".into()));
+    }
+    control
+        .keys
+        .check_anthropic(key)
+        .await
+        .map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    let hint = secrets::hint(key);
+    control
+        .store
+        .put_api_key(
+            &caller,
+            secrets::ANTHROPIC,
+            &seal.seal(key.as_bytes()),
+            &hint,
+        )
+        .await
+        .map_err(|e| failed("keeping an Anthropic key", e))?;
+    changed(control, Changed::Owner(caller));
+    Ok(Json(serde_json::json!({ "hint": hint })))
+}
+
+async fn delete_anthropic_key(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+) -> Result<StatusCode, Failed> {
+    sealing(control)?;
+    match control
+        .store
+        .delete_api_key(&caller, secrets::ANTHROPIC)
+        .await
+    {
+        Ok(true) => {
+            changed(control, Changed::Owner(caller));
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(false) => Err((StatusCode::NOT_FOUND, "no Anthropic key was given".into())),
+        Err(e) => Err(failed("forgetting an Anthropic key", e)),
+    }
+}
+
+#[derive(Deserialize)]
+struct Secret {
+    value: String,
+}
+
+async fn list_secrets(control: &Control, scope: Scope<'_>) -> Result<Json<Vec<String>>, Failed> {
+    sealing(control)?;
+    match control.store.secret_names(scope).await {
+        Ok(names) => Ok(Json(names)),
+        Err(e) => Err(failed("listing secrets", e)),
+    }
+}
+
+async fn put_secret(
+    control: &Control,
+    scope: Scope<'_>,
+    name: &str,
+    value: &str,
+) -> Result<StatusCode, Failed> {
+    let seal = sealing(control)?;
+    secrets::check_name(name).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    secrets::check_value(value).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    control
+        .store
+        .put_secret(scope, name, &seal.seal(value.as_bytes()))
+        .await
+        .map_err(|e| failed("keeping a secret", e))?;
+    changed(control, scope.into());
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_secret(
+    control: &Control,
+    scope: Scope<'_>,
+    name: &str,
+) -> Result<StatusCode, Failed> {
+    sealing(control)?;
+    match control.store.delete_secret(scope, name).await {
+        Ok(true) => {
+            changed(control, scope.into());
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(false) => Err((StatusCode::NOT_FOUND, format!("no secret {name}"))),
+        Err(e) => Err(failed("forgetting a secret", e)),
+    }
+}
+
+impl From<Scope<'_>> for Changed {
+    fn from(scope: Scope<'_>) -> Changed {
+        match scope {
+            Scope::User(subject) => Changed::Owner(subject.to_string()),
+            Scope::Session(session) => Changed::Session(session),
+        }
+    }
+}
+
+/// The names of the caller's secrets for all their sessions.
+async fn list_user_secrets(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+) -> Result<Json<Vec<String>>, Failed> {
+    list_secrets(control, Scope::User(&caller)).await
+}
+
+async fn put_user_secret(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path(name): Path<String>,
+    Json(Secret { value }): Json<Secret>,
+) -> Result<StatusCode, Failed> {
+    put_secret(control, Scope::User(&caller), &name, &value).await
+}
+
+async fn delete_user_secret(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path(name): Path<String>,
+) -> Result<StatusCode, Failed> {
+    delete_secret(control, Scope::User(&caller), &name).await
+}
+
+/// The names of the session's own secrets (the caller's).
+async fn list_session_secrets(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<String>>, Failed> {
+    owned(control, id, &caller).await?;
+    list_secrets(control, Scope::Session(id)).await
+}
+
+async fn put_session_secret(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path((id, name)): Path<(Uuid, String)>,
+    Json(Secret { value }): Json<Secret>,
+) -> Result<StatusCode, Failed> {
+    owned(control, id, &caller).await?;
+    put_secret(control, Scope::Session(id), &name, &value).await
+}
+
+async fn delete_session_secret(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path((id, name)): Path<(Uuid, String)>,
+) -> Result<StatusCode, Failed> {
+    owned(control, id, &caller).await?;
+    delete_secret(control, Scope::Session(id), &name).await
+}
+
 /// The players' gRPC service (`Players`, see `protocol/proto`): HTTP/2, with keepalives as the
 /// connections' liveness.
 fn players(control: &'static Control) -> tonic::transport::server::Router {
@@ -780,9 +1008,10 @@ impl Players for Lessor {
         let held = Held {
             session,
             subject,
+            owner,
             // a dirigent acts as its owner
-            delegate: (spec.part == Part::Dirigent).then(|| owner.clone()),
-            plan: (spec.provider == Provider::Chatgpt).then_some(owner),
+            delegate: spec.part == Part::Dirigent,
+            provider: spec.provider,
             conn,
         };
         let acquired = pb::ToPlayer {
@@ -798,33 +1027,95 @@ impl Players for Lessor {
     }
 }
 
-/// The player's credentials: as its subject, and, a dirigent's, as its owner too; and, a
+/// The player's credentials: as its subject, and, a dirigent's, as its owner too; a
 /// ChatGPT-plan session's, an access token of its owner's plan (`rejected`: not the one handed
-/// out last, which OpenAI refused).
+/// out last, which OpenAI refused); an Anthropic session's, its owner's API key or the
+/// install's; and the session's secrets.
 async fn tokens(control: &Control, held: &Held, rejected: bool) -> pb::Tokens {
     let signer = &control.auth.signer;
     let subject = held.subject.as_str();
-    let (openai, openai_unavailable) = match (&held.plan, &control.chatgpt) {
-        (None, _) => (None, None),
-        (Some(_), None) => (None, Some("this control links no ChatGPT plans".into())),
-        (Some(owner), Some(chatgpt)) => match chatgpt.access(&control.store, owner, rejected).await
-        {
-            Ok(token) => (Some(token), None),
-            Err(why) => {
-                warn!(session = %held.session, owner, "no ChatGPT access token: {why}");
-                (None, Some(why.to_string()))
+    let owner = held.owner.as_str();
+    let (openai, openai_unavailable) = match (held.provider, &control.chatgpt) {
+        (Provider::Anthropic, _) => (None, None),
+        (Provider::Chatgpt, None) => (None, Some("this control links no ChatGPT plans".into())),
+        (Provider::Chatgpt, Some(chatgpt)) => {
+            match chatgpt.access(&control.store, owner, rejected).await {
+                Ok(token) => (Some(token), None),
+                Err(why) => {
+                    warn!(session = %held.session, owner, "no ChatGPT access token: {why}");
+                    (None, Some(why.to_string()))
+                }
             }
+        }
+    };
+    let (anthropic, anthropic_unavailable) = match held.provider {
+        Provider::Chatgpt => (None, None),
+        Provider::Anthropic => match anthropic_key(control, owner).await {
+            Ok(key) => (Some(key), None),
+            Err(why) => (None, Some(why)),
         },
+    };
+    let secrets = match session_secrets(control, held.session).await {
+        Ok(secrets) => secrets,
+        Err(e) => {
+            error!(session = %held.session, "reading the session's secrets: {e:#}");
+            Default::default()
+        }
     };
     pb::Tokens {
         player: signer.sign(subject, &[CHLIVE], None),
         owner: held
             .delegate
-            .as_deref()
-            .map(|owner| signer.sign(owner, &[CHLIVE, CONTROL], Some(subject))),
+            .then(|| signer.sign(owner, &[CHLIVE, CONTROL], Some(subject))),
         openai,
         openai_unavailable,
+        anthropic,
+        anthropic_unavailable,
+        secrets,
     }
+}
+
+/// The Anthropic key `owner`'s sessions run on: their own, or the install's; or why there's none.
+async fn anthropic_key(control: &Control, owner: &str) -> Result<String, String> {
+    let keys = &control.keys;
+    let own = match &keys.seal {
+        Some(seal) => match control.store.api_key(owner, secrets::ANTHROPIC).await {
+            Ok(Some((sealed, _))) => Some(seal.open(&sealed)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        },
+        None => None,
+    };
+    match (own, &keys.house) {
+        (Some(Ok(key)), _) => Ok(key),
+        (Some(Err(e)), _) => {
+            error!(owner, "reading an Anthropic key: {e:#}");
+            Err(format!("the Anthropic API key couldn't be read: {e:#}"))
+        }
+        (None, Some(house)) => Ok(house.clone()),
+        (None, None) => Err(
+            "no Anthropic API key: add yours in the web's account menu, or with \
+                             `dirigent link anthropic`"
+                .into(),
+        ),
+    }
+}
+
+/// A session's secrets, opened, by name.
+async fn session_secrets(
+    control: &Control,
+    session: Uuid,
+) -> anyhow::Result<HashMap<String, String>> {
+    let Some(seal) = &control.keys.seal else {
+        return Ok(HashMap::new());
+    };
+    control
+        .store
+        .session_secrets(session)
+        .await?
+        .into_iter()
+        .map(|(name, sealed)| Ok((name, seal.open(&sealed)?)))
+        .collect()
 }
 
 /// A lease held on a call.
@@ -832,18 +1123,37 @@ struct Held {
     session: Uuid,
     /// The player's.
     subject: String,
-    /// Who it acts as, a dirigent's: its owner.
-    delegate: Option<String>,
-    /// Whose ChatGPT plan pays for its model calls: its owner's, a ChatGPT-plan session's.
-    plan: Option<String>,
+    /// The session's owner, whose ChatGPT plan or API key pays for its model calls.
+    owner: String,
+    /// Whether it acts as its owner: a dirigent does.
+    delegate: bool,
+    provider: Provider,
     /// Which connection.
     conn: u64,
 }
 
+/// What changed of what a lease's credentials are made of: a user's (their key, or their
+/// secrets for all their sessions), or a session's (its secrets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Changed {
+    Owner(String),
+    Session(Uuid),
+}
+
+impl Held {
+    fn affected(&self, changed: &Changed) -> bool {
+        match changed {
+            Changed::Owner(owner) => *owner == self.owner,
+            Changed::Session(session) => *session == self.session,
+        }
+    }
+}
+
 /// A held lease, until its call ends: then given back (the player ended its stream) or kept
 /// for the grace period (the call broke). Meanwhile the player's credentials are sent afresh
-/// halfway through their life. Given back after a `Handoff`, the next player is started at
-/// once, unless the session was stopped.
+/// halfway through their life, and at once when what they're made of changes (a key, a
+/// secret). Given back after a `Handoff`, the next player is started at once, unless the session
+/// was stopped.
 async fn hold(
     control: &'static Control,
     held: Held,
@@ -855,9 +1165,27 @@ async fn hold(
     let subject = held.subject.as_str();
     let half = control.auth.signer.ttl / 2;
     let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
+    let mut changes = control.changed.subscribe();
     let mut handoff = false;
     let closed = loop {
         tokio::select! {
+            changed = changes.recv() => {
+                // missed some: any may have been this lease's
+                let ours = match changed {
+                    Ok(changed) => held.affected(&changed),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
+                };
+                if !ours {
+                    continue;
+                }
+                let tokens = pb::ToPlayer {
+                    msg: Some(pb::to_player::Msg::Tokens(tokens(control, &held, false).await)),
+                };
+                if tx.send(Ok(tokens)).await.is_err() {
+                    break false;
+                }
+            }
             _ = renew.tick() => {
                 let tokens = pb::ToPlayer {
                     msg: Some(pb::to_player::Msg::Tokens(tokens(control, &held, false).await)),
@@ -1157,7 +1485,7 @@ mod e2e {
 
     /// A control on ports of its own, with `runner` (given the gRPC address players use).
     async fn start_with(runner: impl FnOnce(&Ctl) -> &'static dyn Runner) -> Option<Ctl> {
-        start_full(None, Duration::from_secs(600), false, None, runner).await
+        start_full(None, Duration::from_secs(600), false, None, None, runner).await
     }
 
     /// The same, in `oidc` auth with `oidc`, its credentials good for `ttl`. It signs with the
@@ -1167,12 +1495,24 @@ mod e2e {
         ttl: Duration,
         reserved_only: bool,
         chatgpt: Option<ChatGptArgs>,
+        keys: Option<(KeyArgs, Seal)>,
         runner: impl FnOnce(&Ctl) -> &'static dyn Runner,
     ) -> Option<Ctl> {
         std::env::var_os("DIRIGENT_E2E")?;
         let key = std::env::var("DIRIGENT_SIGNING_KEY")
             .expect("DIRIGENT_SIGNING_KEY (the `e2e` script sets it)");
         let signer = Signer::load(key.as_ref(), "dirigent-control", ttl).unwrap();
+        let keys = match keys {
+            Some((args, seal)) => Keys::new(&args, Some(seal)).unwrap(),
+            None => {
+                let seal = chatgpt.as_ref().and_then(|a| a.link_key.as_deref());
+                let args = KeyArgs {
+                    anthropic_key: None,
+                    anthropic_api: "http://127.0.0.1:1".into(),
+                };
+                Keys::new(&args, seal.map(|k| Seal::load(k).unwrap())).unwrap()
+            }
+        };
         let chatgpt = chatgpt.map(|args| ChatGpt::new(&args, signer.kid()).unwrap().unwrap());
         let url = std::env::var("DIRIGENT_CONTROL_POSTGRES")
             .expect("DIRIGENT_CONTROL_POSTGRES (the `e2e` script sets it)");
@@ -1189,6 +1529,7 @@ mod e2e {
             store,
             Auth { signer, oidc },
             chatgpt,
+            keys,
             Some(runner(&ctl)),
             Duration::from_secs(1),
             reserved_only,
@@ -1576,7 +1917,8 @@ mod e2e {
     #[tokio::test]
     async fn e2e_reserved_only_control_leases_only_the_players_it_started() {
         let runner = recorder(false);
-        let Some(base) = start_full(None, Duration::from_secs(600), true, None, |_| runner).await
+        let Some(base) =
+            start_full(None, Duration::from_secs(600), true, None, None, |_| runner).await
         else {
             return;
         };
@@ -1710,7 +2052,8 @@ mod e2e {
     #[tokio::test]
     async fn e2e_a_lease_comes_with_credentials_sent_afresh_while_its_held() {
         let runner = recorder(false);
-        let Some(base) = start_full(None, Duration::from_secs(2), false, None, |_| runner).await
+        let Some(base) =
+            start_full(None, Duration::from_secs(2), false, None, None, |_| runner).await
         else {
             return;
         };
@@ -1782,9 +2125,14 @@ mod e2e {
         let provider = Provider::new();
         let oidc = auth::Oidc::start(&provider.args()).await.unwrap();
         let runner = recorder(false);
-        let Some(base) = start_full(Some(oidc), Duration::from_secs(600), false, None, |_| {
-            runner
-        })
+        let Some(base) = start_full(
+            Some(oidc),
+            Duration::from_secs(600),
+            false,
+            None,
+            None,
+            |_| runner,
+        )
         .await
         else {
             return;
@@ -2053,11 +2401,16 @@ mod e2e {
         std::env::var_os("DIRIGENT_E2E")?;
         let openai = chatgpt::fake::OpenAi::start().await;
         let keys = tempfile::tempdir().unwrap();
-        chatgpt::keygen(&keys.path().join("link.key")).unwrap();
+        seal::keygen(&keys.path().join("link.key")).unwrap();
         let args = openai.args(&keys.path().join("link.key"));
-        let ctl = start_full(None, Duration::from_secs(600), false, Some(args), |_| {
-            runner
-        })
+        let ctl = start_full(
+            None,
+            Duration::from_secs(600),
+            false,
+            Some(args),
+            None,
+            |_| runner,
+        )
         .await?;
         Some((ctl, openai, keys))
     }
@@ -2135,7 +2488,15 @@ mod e2e {
         };
         let user = new_user();
         let (_, me) = get_json(&base, &user, "/me").await;
-        assert_eq!(me, serde_json::json!({ "subject": user, "chatgpt": null }));
+        assert_eq!(
+            me,
+            serde_json::json!({
+                "subject": user,
+                "chatgpt": null,
+                "anthropic": null,
+                "anthropic_default": false,
+            })
+        );
         let plan = serde_json::json!({ "provider": "chatgpt", "model": "gpt-test" });
         let s = Uuid::new_v4();
         assert_eq!(
@@ -2222,6 +2583,226 @@ mod e2e {
                 .status(),
             reqwest::StatusCode::NOT_FOUND
         );
+    }
+
+    /// A control that keeps keys and secrets (with a link key of its own), checking keys with a
+    /// fake Anthropic, and `house` the install's key.
+    async fn start_keyed(
+        house: Option<&str>,
+    ) -> Option<(Ctl, secrets::fake::Anthropic, tempfile::TempDir)> {
+        std::env::var_os("DIRIGENT_E2E")?;
+        let anthropic = secrets::fake::Anthropic::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("link.key");
+        seal::keygen(&key).unwrap();
+        let args = KeyArgs {
+            anthropic_key: house.map(String::from),
+            anthropic_api: anthropic.url.clone(),
+        };
+        let keys = Some((args, Seal::load(&key).unwrap()));
+        let runner = recorder(false);
+        let ctl = start_full(None, Duration::from_secs(600), false, None, keys, |_| {
+            runner
+        })
+        .await?;
+        Some((ctl, anthropic, dir))
+    }
+
+    async fn send_json(
+        base: &Ctl,
+        user: &str,
+        method: reqwest::Method,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (reqwest::StatusCode, String) {
+        let res = call(user, method, base, path)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        (res.status(), res.text().await.unwrap())
+    }
+
+    async fn delete(base: &Ctl, user: &str, path: &str) -> reqwest::StatusCode {
+        let req = call(user, reqwest::Method::DELETE, base, path);
+        req.send().await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn e2e_an_anthropic_key_is_checked_kept_and_sent_on_the_owners_leases() {
+        let Some((base, _anthropic, _dir)) = start_keyed(Some("sk-house")).await else {
+            return;
+        };
+        let user = new_user();
+        let (_, me) = get_json(&base, &user, "/me").await;
+        assert_eq!(me["anthropic"], serde_json::Value::Null);
+        assert_eq!(me["anthropic_default"], true);
+        let put = reqwest::Method::PUT;
+        let (status, why) = send_json(
+            &base,
+            &user,
+            put.clone(),
+            "/links/anthropic",
+            serde_json::json!({ "key": "sk-bad" }),
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+        assert!(why.contains("invalid x-api-key"), "{why}");
+
+        // without a key of their own, the owner's sessions run on the install's
+        let s = Uuid::new_v4();
+        let made = put_json(&base, s, &user, serde_json::json!({})).await;
+        assert_eq!(made, reqwest::StatusCode::CREATED);
+        let mut ws = connect(&base).await;
+        acquire(&mut ws, s, &Uuid::new_v4().to_string(), None).await;
+        let tokens = ws.tokens.clone().unwrap();
+        assert_eq!(tokens.anthropic.as_deref(), Some("sk-house"));
+        assert_eq!(tokens.openai, None);
+
+        // theirs, once given, reaches the lease at once; and the install's again once removed
+        let (status, hint) = send_json(
+            &base,
+            &user,
+            put,
+            "/links/anthropic",
+            serde_json::json!({ "key": " sk-good-key-1234\n" }),
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{hint}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&hint).unwrap(),
+            serde_json::json!({ "hint": "1234" })
+        );
+        let key = next_tokens(&mut ws).await.anthropic;
+        assert_eq!(key.as_deref(), Some("sk-good-key-1234"));
+        let (_, me) = get_json(&base, &user, "/me").await;
+        assert_eq!(me["anthropic"], serde_json::json!({ "hint": "1234" }));
+        assert_eq!(
+            delete(&base, &user, "/links/anthropic").await,
+            reqwest::StatusCode::NO_CONTENT
+        );
+        let key = next_tokens(&mut ws).await.anthropic;
+        assert_eq!(key.as_deref(), Some("sk-house"));
+        assert_eq!(
+            delete(&base, &user, "/links/anthropic").await,
+            reqwest::StatusCode::NOT_FOUND
+        );
+        ws.close().await;
+
+        // an install without a key of its own says why there's none
+        let Some((base, _anthropic, _dir)) = start_keyed(None).await else {
+            return;
+        };
+        let s = Uuid::new_v4();
+        put_json(&base, s, &user, serde_json::json!({})).await;
+        let mut ws = connect(&base).await;
+        acquire(&mut ws, s, &Uuid::new_v4().to_string(), None).await;
+        let tokens = ws.tokens.clone().unwrap();
+        assert_eq!(tokens.anthropic, None);
+        let why = tokens.anthropic_unavailable.unwrap();
+        assert!(why.contains("dirigent link anthropic"), "{why}");
+        ws.close().await;
+    }
+
+    #[tokio::test]
+    async fn e2e_secrets_reach_their_sessions_leases_at_once_a_sessions_own_winning() {
+        let Some((base, _anthropic, _dir)) = start_keyed(None).await else {
+            return;
+        };
+        let user = new_user();
+        let viewer = new_user();
+        let (s, t) = (Uuid::new_v4(), Uuid::new_v4());
+        let with_viewer = serde_json::json!({ "viewers": [viewer] });
+        put_json(&base, s, &user, with_viewer).await;
+        put_json(&base, t, &user, serde_json::json!({})).await;
+        let put = |path: String, value: &str| {
+            let (base, user) = (&base, user.clone());
+            let body = serde_json::json!({ "value": value });
+            async move {
+                send_json(base, &user, reqwest::Method::PUT, &path, body)
+                    .await
+                    .0
+            }
+        };
+        let no_content = reqwest::StatusCode::NO_CONTENT;
+        assert_eq!(
+            put("/secrets/GITHUB_TOKEN".into(), "everyone's").await,
+            no_content
+        );
+        assert_eq!(
+            put(format!("/sessions/{s}/secrets/GITHUB_TOKEN"), "s's").await,
+            no_content
+        );
+        assert_eq!(
+            put(format!("/sessions/{s}/secrets/NPM_TOKEN"), "npm").await,
+            no_content
+        );
+        let bad = put(format!("/sessions/{s}/secrets/not-a-name"), "x").await;
+        assert_eq!(bad, reqwest::StatusCode::BAD_REQUEST);
+        let as_viewer = send_json(
+            &base,
+            &viewer,
+            reqwest::Method::PUT,
+            &format!("/sessions/{s}/secrets/MINE"),
+            serde_json::json!({ "value": "x" }),
+        )
+        .await;
+        assert_eq!(as_viewer.0, reqwest::StatusCode::FORBIDDEN);
+
+        let secrets = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let mut on_s = connect(&base).await;
+        acquire(&mut on_s, s, &Uuid::new_v4().to_string(), None).await;
+        let got = on_s.tokens.clone().unwrap().secrets;
+        assert_eq!(
+            got,
+            secrets(&[("GITHUB_TOKEN", "s's"), ("NPM_TOKEN", "npm")])
+        );
+        let mut on_t = connect(&base).await;
+        acquire(&mut on_t, t, &Uuid::new_v4().to_string(), None).await;
+        let got = on_t.tokens.clone().unwrap().secrets;
+        assert_eq!(got, secrets(&[("GITHUB_TOKEN", "everyone's")]));
+
+        // one for all the owner's sessions reaches both at once; one of s's own, only s
+        assert_eq!(put("/secrets/EXTRA".into(), "x").await, no_content);
+        let got = next_tokens(&mut on_s).await.secrets;
+        let want = [
+            ("EXTRA", "x"),
+            ("GITHUB_TOKEN", "s's"),
+            ("NPM_TOKEN", "npm"),
+        ];
+        assert_eq!(got, secrets(&want));
+        let got = next_tokens(&mut on_t).await.secrets;
+        assert_eq!(
+            got,
+            secrets(&[("EXTRA", "x"), ("GITHUB_TOKEN", "everyone's")])
+        );
+        let gone = delete(&base, &user, &format!("/sessions/{s}/secrets/GITHUB_TOKEN")).await;
+        assert_eq!(gone, no_content);
+        let got = next_tokens(&mut on_s).await.secrets;
+        let want = [
+            ("EXTRA", "x"),
+            ("GITHUB_TOKEN", "everyone's"),
+            ("NPM_TOKEN", "npm"),
+        ];
+        assert_eq!(got, secrets(&want));
+
+        // the names, never the values, to whoever sees the session
+        let (_, info) = get_json(&base, &viewer, &format!("/sessions/{s}")).await;
+        assert_eq!(
+            info["secrets"],
+            serde_json::json!(["EXTRA", "GITHUB_TOKEN", "NPM_TOKEN"])
+        );
+        let (_, own) = get_json(&base, &user, &format!("/sessions/{s}/secrets")).await;
+        assert_eq!(own, serde_json::json!(["NPM_TOKEN"]));
+        let (_, all) = get_json(&base, &user, "/secrets").await;
+        assert_eq!(all, serde_json::json!(["EXTRA", "GITHUB_TOKEN"]));
+        on_s.close().await;
+        on_t.close().await;
     }
 
     /// A ChatGpt of its own on the stack's Postgres, as a control just started would be: its
@@ -2329,6 +2910,93 @@ mod e2e {
         );
         let (_, me) = get_json(&base, &user, "/me").await;
         assert_eq!(me["chatgpt"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn e2e_the_cli_gives_an_anthropic_key_and_keeps_secrets_from_stdin() {
+        let Some((base, _anthropic, _dir)) = start_keyed(Some("sk-house")).await else {
+            return;
+        };
+        let user = new_user();
+        let home = tempfile::tempdir().unwrap();
+        let creds = home.path().join("credentials.json");
+        // the CLI with `args`, `input` on its stdin: what it printed, if it succeeded
+        let cli = |args: &[&str], input: &str| {
+            let mut c = tokio::process::Command::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../target/debug/dirigent"
+            ));
+            c.env("DIRIGENT_CREDENTIALS", &creds)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            let input = input.to_string();
+            async move {
+                use tokio::io::AsyncWriteExt;
+                let mut child = c.spawn().expect("the CLI (`e2e` builds it)");
+                let mut stdin = child.stdin.take().unwrap();
+                stdin.write_all(input.as_bytes()).await.unwrap();
+                drop(stdin);
+                let out = child.wait_with_output().await.unwrap();
+                let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let failed = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                match out.status.success() {
+                    true => Ok(printed),
+                    false => Err(failed),
+                }
+            }
+        };
+        let url = format!("http://{base}");
+        cli(&["login", "--control", &url, "--as", &user], "")
+            .await
+            .unwrap();
+        let whoami = cli(&["whoami"], "").await.unwrap();
+        assert!(whoami.contains("Anthropic: the install's key"), "{whoami}");
+        let refused = cli(&["link", "anthropic"], "sk-bad\n").await.unwrap_err();
+        assert!(refused.contains("invalid x-api-key"), "{refused}");
+        let linked = cli(&["link", "anthropic"], "sk-good-cli-9876\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            linked,
+            "Anthropic: your key …9876 (your sessions run on it)"
+        );
+        let whoami = cli(&["whoami"], "").await.unwrap();
+        assert!(whoami.contains("Anthropic: your key …9876"), "{whoami}");
+
+        let s = Uuid::new_v4();
+        put_json(&base, s, &user, serde_json::json!({})).await;
+        let session = s.to_string();
+        assert_eq!(
+            cli(&["secret", "set", "GITHUB_TOKEN"], "ghp_x\n")
+                .await
+                .unwrap(),
+            "Set GITHUB_TOKEN"
+        );
+        let set = cli(
+            &["secret", "set", "NPM_TOKEN", "--session", &session],
+            "n\n",
+        );
+        assert_eq!(set.await.unwrap(), "Set NPM_TOKEN");
+        assert_eq!(cli(&["secret", "list"], "").await.unwrap(), "GITHUB_TOKEN");
+        let own = cli(&["secret", "list", "--session", &session], "").await;
+        assert_eq!(own.unwrap(), "NPM_TOKEN");
+        let (_, info) = get_json(&base, &user, &format!("/sessions/{s}")).await;
+        assert_eq!(
+            info["secrets"],
+            serde_json::json!(["GITHUB_TOKEN", "NPM_TOKEN"])
+        );
+        let rm = cli(&["secret", "rm", "GITHUB_TOKEN"], "").await;
+        assert_eq!(rm.unwrap(), "Removed GITHUB_TOKEN");
+        assert_eq!(cli(&["secret", "list"], "").await.unwrap(), "");
+        let bad = cli(&["secret", "set", "lower"], "x\n").await.unwrap_err();
+        assert!(bad.contains("isn't a secret's name"), "{bad}");
+        assert_eq!(
+            cli(&["unlink", "anthropic"], "").await.unwrap(),
+            "Removed your Anthropic key"
+        );
     }
 
     #[tokio::test]

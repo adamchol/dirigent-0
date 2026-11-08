@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LiveClient, defaultUrl } from "@chlive/client";
 import { LiveClientProvider } from "@chlive/client/react";
 import { AnimatePresence, motion } from "motion/react";
-import { ChevronsUpDownIcon, LinkIcon, LogOutIcon, MenuIcon, MonitorIcon, MoonIcon, PlusIcon, SunIcon, UserRoundPenIcon, WaypointsIcon } from "lucide-react";
+import { ChevronsUpDownIcon, KeyRoundIcon, LinkIcon, LockKeyholeIcon, LogOutIcon, MenuIcon, MonitorIcon, MoonIcon, PlusIcon, SunIcon, UserRoundPenIcon, WaypointsIcon } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -39,6 +39,8 @@ import { useGoogle } from "./Login.tsx";
 import { Session, Viewers, type LiveStatus } from "./Session.tsx";
 import { RenameDialog, useTitles } from "./Rename.tsx";
 import { SyncDialog } from "./Sync.tsx";
+import { AnthropicKeyDialog } from "./Keys.tsx";
+import { SecretsDialog } from "./Secrets.tsx";
 import { NewSession, SessionMenu, SessionsSidebar, useSessions } from "./Sessions.tsx";
 import { tokens } from "./Timeline.tsx";
 
@@ -179,6 +181,9 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
   const [linking, setLinking] = useState(false);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [syncing, setSyncing] = useState<string | null>(null);
+  const [keying, setKeying] = useState(false);
+  // the user's secrets for all sessions (`""`), or a session's (its id)
+  const [secretsOf, setSecretsOf] = useState<string | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
   const client = useClient(props.who);
   const sessions = useSessions(props.who);
@@ -206,7 +211,17 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
       create={() => setCreating(true)}
       rename={setRenaming}
       openLocally={setSyncing}
-      account={<Account who={props.who} become={props.become} signOut={props.signOut} link={() => setLinking(true)} />}
+      secrets={setSecretsOf}
+      account={
+        <Account
+          who={props.who}
+          become={props.become}
+          signOut={props.signOut}
+          link={() => setLinking(true)}
+          keys={() => setKeying(true)}
+          secrets={() => setSecretsOf("")}
+        />
+      }
       className={className}
     />
   );
@@ -237,6 +252,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
                 changed={sessions.refresh}
                 rename={() => setRenaming(selected)}
                 openLocally={() => setSyncing(selected)}
+                secrets={() => setSecretsOf(selected)}
               />
             )}
           </div>
@@ -298,6 +314,16 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
       />
       <ChatGptDialog who={props.who} declared={!!props.become} open={linking} setOpen={setLinking} />
       <SyncDialog id={syncing} who={props.who} declared={!!props.become} close={() => setSyncing(null)} />
+      <AnthropicKeyDialog open={keying} who={props.who} me={me} changed={refreshMe} close={() => setKeying(false)} />
+      <SecretsDialog
+        open={secretsOf !== null}
+        who={props.who}
+        session={secretsOf ? sessions.list.find((s) => s.id === secretsOf) : undefined}
+        close={() => {
+          setSecretsOf(null);
+          sessions.refresh();
+        }}
+      />
     </LiveClientProvider>
   );
 }
@@ -380,7 +406,14 @@ function initials(user: string): string {
 }
 
 /** Who looks, and the theme; signing out, or (declared auth) looking as someone else. */
-function Account(props: { who: Who; become?: (user: string) => void; signOut?: () => void; link: () => void }) {
+function Account(props: {
+  who: Who;
+  become?: (user: string) => void;
+  signOut?: () => void;
+  link: () => void;
+  keys: () => void;
+  secrets: () => void;
+}) {
   const { theme, setTheme } = useTheme();
   const [draft, setDraft] = useState(props.who.user);
   useEffect(() => setDraft(props.who.user), [props.who.user]);
@@ -424,6 +457,12 @@ function Account(props: { who: Who; become?: (user: string) => void; signOut?: (
         <DropdownMenuGroup>
           <DropdownMenuItem onClick={props.link}>
             <LinkIcon /> ChatGPT plan
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={props.keys}>
+            <KeyRoundIcon /> Anthropic API key
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={props.secrets}>
+            <LockKeyholeIcon /> Secrets
           </DropdownMenuItem>
         </DropdownMenuGroup>
         <DropdownMenuSeparator />

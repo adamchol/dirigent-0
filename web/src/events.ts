@@ -73,7 +73,10 @@ export type Event =
       data: { call_id: string; name: string; content: string; is_error: boolean; meta?: unknown };
     }
   | { kind: "turn_ended"; data: { reason: "completed" | "aborted" | "failed"; interrupt?: string } }
-  | { kind: "titled"; data: Named };
+  | { kind: "titled"; data: Named }
+  /** The owner's answer to a dirigent's `request_secret` call `call`: never the value. */
+  | { kind: "secret_answered"; data: { session: string; name: string; provided: boolean; call: string } }
+  | { kind: "secrets_changed"; data: { names: string[] } };
 
 /** What a session is called and is about, by its player or (`hold`ing it) its owner. */
 export interface Named {
@@ -92,6 +95,17 @@ export type Item =
   | { t: "thinking"; key: string; text: string }
   /** A tool call with its result, once there is one. */
   | { t: "tool"; key: string; name: string; input: unknown; result?: { content: string; isError: boolean } }
+  /** A dirigent asking its owner for a secret a session needs (its `request_secret` call), and
+   * their answer, once given. */
+  | {
+      t: "request";
+      key: string;
+      session: string;
+      name: string;
+      why: string;
+      result?: { content: string; isError: boolean };
+      answer?: "provided" | "declined";
+    }
   | { t: "turn"; key: string; reason: string; interrupted: boolean; usage: Usage }
   /** Anything else: `dim` for the player's own doings, `error` for failures. */
   | { t: "note"; key: string; kind: string; tone: "dim" | "error"; text: string; detail?: string };
@@ -122,6 +136,7 @@ export function timeline(rows: readonly EventRow[]): Timeline {
   const items: Item[] = [];
   const users = new Map<string, { queued: boolean }>();
   const tools = new Map<string, Extract<Item, { t: "tool" }>>();
+  const requests = new Map<string, Extract<Item, { t: "request" }>>();
   let openTurn: string | undefined;
   let usage = NO_USAGE;
   const note = (row: EventRow, tone: "dim" | "error", text: string, detail?: string) =>
@@ -186,7 +201,18 @@ export function timeline(rows: readonly EventRow[]): Timeline {
           const key = `${row.id}:${i}`;
           if (b.type === "text" && b.text) items.push({ t: "text", key, text: b.text });
           else if (b.type === "thinking" && b.text) items.push({ t: "thinking", key, text: b.text });
-          else if (b.type === "tool_call") {
+          else if (b.type === "tool_call" && b.name === "request_secret") {
+            const input = (b.input ?? {}) as { session?: string; name?: string; why?: string };
+            const request: Extract<Item, { t: "request" }> = {
+              t: "request",
+              key: b.id,
+              session: input.session ?? "",
+              name: input.name ?? "",
+              why: input.why ?? "",
+            };
+            requests.set(b.id, request);
+            items.push(request);
+          } else if (b.type === "tool_call") {
             const tool = { t: "tool", key: b.id, name: b.name, input: b.input } as Extract<Item, { t: "tool" }>;
             tools.set(b.id, tool);
             items.push(tool);
@@ -195,8 +221,10 @@ export function timeline(rows: readonly EventRow[]): Timeline {
         break;
       case "tool_result": {
         const result = { content: e.data.content, isError: e.data.is_error };
+        const request = requests.get(e.data.call_id);
         const tool = tools.get(e.data.call_id);
-        if (tool) tool.result = result;
+        if (request) request.result = result;
+        else if (tool) tool.result = result;
         else items.push({ t: "tool", key: e.data.call_id, name: e.data.name, input: undefined, result });
         break;
       }
@@ -254,6 +282,15 @@ export function timeline(rows: readonly EventRow[]): Timeline {
         break;
       case "titled":
         note(row, "dim", `${e.data.hold ? "renamed" : "titled"}: ${e.data.title}`, e.data.description);
+        break;
+      case "secret_answered": {
+        const request = requests.get(e.data.call);
+        if (request) request.answer = e.data.provided ? "provided" : "declined";
+        note(row, "dim", `${e.data.provided ? "provided" : "declined"}: ${e.data.name}`);
+        break;
+      }
+      case "secrets_changed":
+        note(row, "dim", `secrets: ${e.data.names.join(", ") || "none"}`);
         break;
       default:
         note(row, "dim", (e as { kind: string }).kind);

@@ -28,6 +28,8 @@ import * as api from "./api.ts";
 import type { SessionInfo } from "./api.ts";
 import { callStart, contextSize, DELTAS_QUERY, LOG_QUERY, streamed, timeline, type DeltaRow, type EventRow } from "./events.ts";
 import { linked } from "./Link.tsx";
+import { useTitles } from "./Rename.tsx";
+import { ProvideDialog, type Request } from "./Secrets.tsx";
 import { Timeline } from "./Timeline.tsx";
 
 /** What the status bar shows of the session open. */
@@ -97,6 +99,13 @@ export function Session(props: {
       toast.error("Not sent", { description: (e as Error).message });
     }
   }
+
+  // a dirigent's request for a secret: provided through control, then answered in the log
+  const [providing, setProviding] = useState<Request | null>(null);
+  const titles = useTitles();
+  const answered = (r: Request, provided: boolean) =>
+    write("secret_answered", { session: r.session, name: r.name, provided, call: r.key });
+  const answer = (r: Request, provided: boolean) => (provided ? setProviding(r) : answered(r, false));
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
@@ -179,6 +188,7 @@ export function Session(props: {
                   me={props.who.user}
                   first={first.current ?? new Set()}
                   streaming={writing}
+                  answer={owner ? answer : undefined}
                 />
               )}
             </MessageScrollerContent>
@@ -192,6 +202,13 @@ export function Session(props: {
         running={running}
         send={(text) => write("user_message", { text })}
         interrupt={() => openTurn && write("user_interrupt", { turn: openTurn })}
+      />
+      <ProvideDialog
+        request={providing}
+        title={providing ? (titles.get(providing.session)?.title ?? `session ${providing.session.slice(0, 8)}`) : ""}
+        who={props.who}
+        provided={(r) => answered(r, true)}
+        close={() => setProviding(null)}
       />
     </div>
   );

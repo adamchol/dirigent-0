@@ -1,6 +1,7 @@
 //! The control plane's state, in Postgres (`db/postgres`): the sessions, and who may use each
 //! (`session_access`, which chlive grants from): its owner, its viewers, and the one player
-//! holding its lease.
+//! holding its lease; and what users keep with control, sealed (`seal`): their ChatGPT links,
+//! API keys and secrets.
 //! A lease row's `expires_at` is null while its player is connected; once it isn't, the player
 //! may come back for it until then, and past it the row is deleted ([`Store::sweep`]). A session
 //! with a lease is active; one without, idle. Control starts a player by reserving the lease for
@@ -513,6 +514,166 @@ impl Store {
             .await?;
         Ok(n == 1)
     }
+
+    /// `subject`'s API key for `provider`, as it's stored (sealed), and its hint.
+    pub async fn api_key(
+        &self,
+        subject: &str,
+        provider: &str,
+    ) -> anyhow::Result<Option<(Vec<u8>, String)>> {
+        let row = self
+            .db
+            .lock()
+            .await
+            .query_opt(
+                "SELECT key, hint FROM dirigent.api_keys WHERE subject = $1 AND provider = $2",
+                &[&subject, &provider],
+            )
+            .await?;
+        Ok(row.map(|r| (r.get(0), r.get(1))))
+    }
+
+    /// `subject`'s API key for `provider` is this one (sealed) now, whatever it was.
+    pub async fn put_api_key(
+        &self,
+        subject: &str,
+        provider: &str,
+        sealed: &[u8],
+        hint: &str,
+    ) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO dirigent.api_keys (subject, provider, key, hint) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (subject, provider) DO UPDATE SET key = $3, hint = $4, updated = now()",
+                &[&subject, &provider, &sealed, &hint],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Whether there was a key.
+    pub async fn delete_api_key(&self, subject: &str, provider: &str) -> anyhow::Result<bool> {
+        let n = self
+            .db
+            .lock()
+            .await
+            .execute(
+                "DELETE FROM dirigent.api_keys WHERE subject = $1 AND provider = $2",
+                &[&subject, &provider],
+            )
+            .await?;
+        Ok(n == 1)
+    }
+
+    /// The secret `name` of `scope` is this one (sealed) now, whatever it was.
+    pub async fn put_secret(
+        &self,
+        scope: Scope<'_>,
+        name: &str,
+        sealed: &[u8],
+    ) -> anyhow::Result<()> {
+        let db = self.db.lock().await;
+        match scope {
+            Scope::User(subject) => {
+                db.execute(
+                    "INSERT INTO dirigent.user_secrets (subject, name, value) VALUES ($1, $2, $3) \
+                     ON CONFLICT (subject, name) DO UPDATE SET value = $3, updated = now()",
+                    &[&subject, &name, &sealed],
+                )
+                .await?
+            }
+            Scope::Session(session) => {
+                db.execute(
+                    "INSERT INTO dirigent.session_secrets (session_id, name, value) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (session_id, name) DO UPDATE SET value = $3, updated = now()",
+                    &[&session, &name, &sealed],
+                )
+                .await?
+            }
+        };
+        Ok(())
+    }
+
+    /// Whether there was such a secret.
+    pub async fn delete_secret(&self, scope: Scope<'_>, name: &str) -> anyhow::Result<bool> {
+        let db = self.db.lock().await;
+        let n = match scope {
+            Scope::User(subject) => {
+                db.execute(
+                    "DELETE FROM dirigent.user_secrets WHERE subject = $1 AND name = $2",
+                    &[&subject, &name],
+                )
+                .await?
+            }
+            Scope::Session(session) => {
+                db.execute(
+                    "DELETE FROM dirigent.session_secrets WHERE session_id = $1 AND name = $2",
+                    &[&session, &name],
+                )
+                .await?
+            }
+        };
+        Ok(n == 1)
+    }
+
+    /// The names of `scope`'s secrets, sorted.
+    pub async fn secret_names(&self, scope: Scope<'_>) -> anyhow::Result<Vec<String>> {
+        let db = self.db.lock().await;
+        let rows = match scope {
+            Scope::User(subject) => {
+                db.query(
+                    "SELECT name FROM dirigent.user_secrets WHERE subject = $1 ORDER BY name",
+                    &[&subject],
+                )
+                .await?
+            }
+            Scope::Session(session) => {
+                db.query(
+                    "SELECT name FROM dirigent.session_secrets WHERE session_id = $1 ORDER BY name",
+                    &[&session],
+                )
+                .await?
+            }
+        };
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    /// The secrets a session's tools get, sealed, by name: its owner's for all their sessions,
+    /// and its own, which win.
+    pub async fn session_secrets(&self, session: Uuid) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+        let rows = self
+            .db
+            .lock()
+            .await
+            .query(
+                "SELECT name, value, 0 AS own FROM dirigent.user_secrets WHERE subject = \
+                   (SELECT subject FROM dirigent.session_access \
+                    WHERE session_id = $1 AND role = 'owner') \
+                 UNION ALL \
+                 SELECT name, value, 1 FROM dirigent.session_secrets WHERE session_id = $1 \
+                 ORDER BY own",
+                &[&session],
+            )
+            .await?;
+        let mut secrets: Vec<(String, Vec<u8>)> = Vec::new();
+        for row in rows {
+            let name: String = row.get(0);
+            secrets.retain(|(n, _)| *n != name);
+            secrets.push((name, row.get(1)));
+        }
+        Ok(secrets)
+    }
+}
+
+/// Whose secrets: a user's, for all their sessions, or one session's.
+#[derive(Debug, Clone, Copy)]
+pub enum Scope<'a> {
+    User(&'a str),
+    Session(Uuid),
 }
 
 /// A user's ChatGPT link (`dirigent.chatgpt_links`), its refresh token as it's stored:
@@ -527,13 +688,17 @@ pub struct Link {
     pub broken: Option<String>,
 }
 
-/// The sessions the caller (`$1`) owns or views, with their lease holders, owners and viewers,
-/// for [`session_info`].
+/// The sessions the caller (`$1`) owns or views, with their lease holders, owners, viewers and
+/// secrets' names, for [`session_info`].
 const SESSIONS: &str = "SELECT s.id, s.spec, s.epoch, p.subject, p.expires_at IS NULL, \
      coalesce(o.subject, ''), \
      ARRAY(SELECT v.subject FROM dirigent.session_access v \
            WHERE v.session_id = s.id AND v.role = 'viewer' ORDER BY v.subject), \
-     me.role, (extract(epoch FROM s.created) * 1000)::bigint \
+     me.role, (extract(epoch FROM s.created) * 1000)::bigint, \
+     ARRAY(SELECT name FROM (SELECT name FROM dirigent.session_secrets ss \
+             WHERE ss.session_id = s.id \
+           UNION SELECT name FROM dirigent.user_secrets us WHERE us.subject = o.subject) n \
+           ORDER BY name) \
      FROM dirigent.sessions s \
      JOIN dirigent.session_access me \
        ON me.session_id = s.id AND me.subject = $1 AND me.role IN ('owner', 'viewer') \
@@ -555,6 +720,7 @@ fn session_info(row: &Row) -> anyhow::Result<SessionInfo> {
         viewers: row.get(6),
         role: role(row.get(7)),
         created: row.get(8),
+        secrets: row.get(9),
     })
 }
 

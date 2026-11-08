@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use async_trait::async_trait;
 use chlive_client::{ClientOptions, LiveClient};
-use dirigent_protocol::control::{pb, Effort, SessionInfo};
+use dirigent_protocol::control::{pb, Effort, Role, SessionInfo};
 use dirigent_protocol::fold::Fold;
 use dirigent_protocol::rows::{EventRow, EVENTS, LOG_QUERY};
 use dirigent_protocol::{ContentBlock, Event, Update};
@@ -89,6 +89,7 @@ impl Director {
             Arc::new(InterruptSession(self.clone())),
             Arc::new(StartSession(self.clone())),
             Arc::new(StopSession(self.clone())),
+            Arc::new(RequestSecret(self.clone())),
         ]
     }
 
@@ -202,7 +203,7 @@ impl Tool for ListSessions {
     fn spec(&self) -> ToolSpec {
         spec(
             "list_sessions",
-            "List the sessions you can reach: each one's id, part (coder or dirigent), state (active: a player runs it; away: its player dropped and may come back; idle: none), model, source repository and ref, and your role in it (owner: you may write to it, start and stop it; viewer: you may only read it). Optionally only those whose repository URL contains `repo`.",
+            "List the sessions you can reach: each one's id, part (coder or dirigent), state (active: a player runs it; away: its player dropped and may come back; idle: none), model, source repository and ref, your role in it (owner: you may write to it, start and stop it, and ask for secrets for it; viewer: you may only read it), and the names of the secrets its tools have. Optionally only those whose repository URL contains `repo`.",
             json!({ "repo": { "type": "string", "description": "A part of the repository URL to match." } }),
             &[],
         )
@@ -237,8 +238,12 @@ impl Tool for ListSessions {
                 }
                 let part = format!("{:?}", s.spec.part).to_lowercase();
                 let role = format!("{:?}", s.role).to_lowercase();
+                let secrets = match s.secrets.is_empty() {
+                    true => "-".to_string(),
+                    false => s.secrets.join(","),
+                };
                 Some(format!(
-                    "{}\t{part}\t{}\t{}\t{source}\t{role}",
+                    "{}\t{part}\t{}\t{}\t{source}\t{role}\t{secrets}",
                     s.id,
                     state(s),
                     s.spec.model
@@ -249,7 +254,7 @@ impl Tool for ListSessions {
             return ToolOutput::ok("No sessions.");
         }
         ToolOutput::ok(format!(
-            "id\tpart\tstate\tmodel\tsource\trole\n{}",
+            "id\tpart\tstate\tmodel\tsource\trole\tsecrets\n{}",
             lines.join("\n")
         ))
     }
@@ -471,7 +476,7 @@ impl Tool for ReadSession {
     fn spec(&self) -> ToolSpec {
         spec(
             "read_session",
-            "Read what happened in a session, condensed: its workspace, and for each of its last turns the input, the tools it ran, its last reply and how the turn ended (or that it's still running).",
+            "Read what happened in a session, condensed: the secrets its tools have, its workspace, and for each of its last turns the input, the tools it ran, its last reply and how the turn ended (or that it's still running).",
             json!({
                 "session": { "type": "string", "description": SESSION },
                 "turns": { "type": "integer", "description": "How many of its last turns (default 5)." }
@@ -493,10 +498,97 @@ impl Tool for ReadSession {
         match self.0.log(&session).await {
             Ok(log) => {
                 let (text, _) = truncate_middle(&condense(&log, turns), MAX_READ, MAX_READ / 2);
-                ToolOutput::ok(text)
+                // the secrets its tools have, as control says (best effort)
+                let path = format!("/sessions/{session}");
+                let info = match self.0.api(reqwest::Method::GET, &path, None).await {
+                    Ok(res) => res.json::<SessionInfo>().await.ok(),
+                    Err(_) => None,
+                };
+                match info {
+                    Some(i) if !i.secrets.is_empty() => {
+                        ToolOutput::ok(format!("Secrets: {}\n\n{text}", i.secrets.join(", ")))
+                    }
+                    _ => ToolOutput::ok(text),
+                }
             }
             Err(e) => ToolOutput::error(e),
         }
+    }
+}
+
+struct RequestSecret(Arc<Director>);
+
+#[async_trait]
+impl Tool for RequestSecret {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "request_secret",
+            "Ask the user for a secret a session you own needs, when it reported one missing (e.g. GITHUB_TOKEN, so it can push): they see your request in this chat, with `why`, and either give it to that session (in its tools' environment, from its next command on; never in the log) or decline. Returns at once: their answer comes later as a <secret_answer> message, which says only whether it was provided. Then tell the session, e.g. with send_message. Never ask for a secret's value in your messages. list_sessions shows the secrets each session has already.",
+            json!({
+                "session": { "type": "string", "description": SESSION },
+                "name": { "type": "string", "description": "The secret's name, the environment variable the session's tools get: capital letters, digits and _ (e.g. GITHUB_TOKEN)." },
+                "why": { "type": "string", "description": "What the session needs it for, in a sentence, as the user sees it." }
+            }),
+            &["session", "name", "why"],
+        )
+    }
+
+    fn read_only(&self) -> bool {
+        false
+    }
+
+    async fn call(&self, input: Value, _: &ToolCtx, _: CancellationToken) -> ToolOutput {
+        let session = match session_id(&input) {
+            Ok(s) => s,
+            Err(e) => return ToolOutput::error(e),
+        };
+        let (name, why) = match (req_str(&input, "name"), req_str(&input, "why")) {
+            (Ok(n), Ok(w)) => (n, w),
+            (Err(e), _) | (_, Err(e)) => return ToolOutput::error(e),
+        };
+        if let Err(e) = secret_name(name) {
+            return ToolOutput::error(e);
+        }
+        if why.trim().is_empty() {
+            return ToolOutput::error("Say why the session needs it.");
+        }
+        let path = format!("/sessions/{session}");
+        let info: SessionInfo = match self.0.api(reqwest::Method::GET, &path, None).await {
+            Ok(res) => match res.json().await {
+                Ok(info) => info,
+                Err(e) => return ToolOutput::error(format!("control's session: {e}")),
+            },
+            Err(e) => return ToolOutput::error(e),
+        };
+        if info.role != Role::Owner {
+            return ToolOutput::error(
+                "Only the session's owner can give it secrets, and you only view it.",
+            );
+        }
+        let replaces = match info.secrets.iter().any(|s| s == name) {
+            true => " It has one by that name already: theirs would replace it.",
+            false => "",
+        };
+        ToolOutput::ok(format!(
+            "Asked the user for {name} for session {session}.{replaces} Their answer comes as a \
+             <secret_answer> message."
+        ))
+    }
+}
+
+/// Whether `name` may name a secret: an environment variable's name (control's rule).
+fn secret_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let first = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase() || c == '_');
+    let rest = chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    match first && rest && name.len() <= 64 {
+        true => Ok(()),
+        false => Err(format!(
+            "{name:?} isn't a secret's name: capital letters, digits and _, not starting with a \
+             digit, up to 64"
+        )),
     }
 }
 

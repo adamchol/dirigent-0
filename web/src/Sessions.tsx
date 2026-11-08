@@ -11,6 +11,7 @@ import {
   EllipsisIcon,
   FolderDownIcon,
   GitBranchIcon,
+  LockKeyholeIcon,
   OctagonXIcon,
   PencilIcon,
   PlayIcon,
@@ -127,6 +128,7 @@ export function SessionMenu(props: {
   changed: () => void;
   rename: () => void;
   openLocally: () => void;
+  secrets: () => void;
 }) {
   const { info, who, changed } = props;
   const owner = info?.role === "owner";
@@ -152,6 +154,11 @@ export function SessionMenu(props: {
             {owner && (
               <DropdownMenuItem onClick={props.rename}>
                 <PencilIcon /> Rename
+              </DropdownMenuItem>
+            )}
+            {owner && (
+              <DropdownMenuItem onClick={props.secrets}>
+                <LockKeyholeIcon /> Secrets
               </DropdownMenuItem>
             )}
             <DropdownMenuItem onClick={props.openLocally}>
@@ -208,6 +215,7 @@ export function SessionsSidebar(props: {
   create: () => void;
   rename: (id: string) => void;
   openLocally: (id: string) => void;
+  secrets: (id: string) => void;
   account: React.ReactNode;
   className?: string;
 }) {
@@ -265,6 +273,7 @@ function SessionItems(props: {
   titles: Map<string, Named>;
   rename: (id: string) => void;
   openLocally: (id: string) => void;
+  secrets: (id: string) => void;
   selected: string;
   select: (id: string) => void;
   who: api.Who;
@@ -342,6 +351,11 @@ function SessionItems(props: {
                   {owner && (
                     <DropdownMenuItem onClick={() => props.rename(s.id)}>
                       <PencilIcon /> Rename
+                    </DropdownMenuItem>
+                  )}
+                  {owner && (
+                    <DropdownMenuItem onClick={() => props.secrets(s.id)}>
+                      <LockKeyholeIcon /> Secrets
                     </DropdownMenuItem>
                   )}
                   <DropdownMenuItem onClick={() => props.openLocally(s.id)}>

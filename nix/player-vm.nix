@@ -3,7 +3,7 @@
 # - its environment, as the NoCloud user data (an env file: the template's lines, then
 #   control's for the player: DIRIGENT_SESSION, DIRIGENT_PLAYER_ID, DIRIGENT_EPOCH);
 # - Secrets as disks with serials `dirigent-secret<n>`, a file per key, named as the variable
-#   (DIRIGENT_KOPIA_TOKEN, ANTHROPIC_API_KEY, …);
+#   (DIRIGENT_KOPIA_TOKEN; API keys and sessions' secrets come on the lease instead);
 # - an empty disk with serial `dirigent-work`, formatted on first boot: the workspace and the
 #   player's state.
 # Deleted (a node drained, the VM deleted), KubeVirt shuts the VM down and the player gets

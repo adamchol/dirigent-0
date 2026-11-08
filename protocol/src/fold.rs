@@ -1,8 +1,8 @@
 //! How a log reads: folding its events in order gives what was *handled*, in the order it was
-//! handled. An input (a user's message, or a dirigent's session update) counts where the player
-//! took it (`TurnStarted` or `Steered`), as a [`Event::UserMessage`] of its text; until then it
-//! is queued. An interrupt counts only for the turn it
-//! names while that turn is running; the player records the result as `TurnEnded`.
+//! handled. An input (a user's message, a dirigent's session update, or an answer to its request
+//! for a secret) counts where the player took it (`TurnStarted` or `Steered`), as a
+//! [`Event::UserMessage`] of its text; until then it is queued. An interrupt counts only for the
+//! turn it names while that turn is running; the player records the result as `TurnEnded`.
 
 use crate::Event;
 
@@ -27,7 +27,9 @@ impl Fold {
     /// what isn't handled (yet).
     pub fn apply(&mut self, id: &str, ev: &Event) -> Option<Event> {
         match ev {
-            Event::UserMessage { .. } | Event::SessionUpdate { .. } => {
+            Event::UserMessage { .. }
+            | Event::SessionUpdate { .. }
+            | Event::SecretAnswered { .. } => {
                 let text = ev.input().expect("an input");
                 self.queued.push((id.to_string(), text));
                 None
@@ -67,7 +69,8 @@ impl Fold {
             | Event::CompactionFailed { .. }
             | Event::ToolResult { .. }
             | Event::Titled { .. }
-            | Event::FilesChanged { .. } => Some(ev.clone()),
+            | Event::FilesChanged { .. }
+            | Event::SecretsChanged { .. } => Some(ev.clone()),
         }
     }
 

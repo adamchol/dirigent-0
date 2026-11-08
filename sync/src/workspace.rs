@@ -56,6 +56,8 @@ impl Stat {
 pub struct Workspace {
     root: PathBuf,
     seen: HashMap<PathBuf, (Stat, String)>,
+    /// Values replaced in the files' blobs by `[secret:NAME]`, as `(NAME, value)`.
+    redact: Vec<(String, String)>,
 }
 
 impl Workspace {
@@ -63,6 +65,16 @@ impl Workspace {
         Workspace {
             root: root.to_path_buf(),
             seen: HashMap::new(),
+            redact: Vec::new(),
+        }
+    }
+
+    /// Replace each value in the files' blobs by `[secret:NAME]` from now on (`(NAME, value)`):
+    /// files are hashed again when these change, since their stat says nothing of it.
+    pub fn redact(&mut self, redact: Vec<(String, String)>) {
+        if redact != self.redact {
+            self.redact = redact;
+            self.seen.clear();
         }
     }
 
@@ -82,6 +94,7 @@ impl Workspace {
         let found = self.walk().await?;
         let mut files = Vec::new();
         let mut links = Vec::new();
+        let mut secret = Vec::new();
         let mut seen = HashMap::with_capacity(found.len());
         for (path, meta) in found {
             let stat = Stat::of(&meta);
@@ -90,6 +103,8 @@ impl Workspace {
                     seen.insert(path, (stat, blob));
                 }
                 _ if stat.mode == LINK => links.push((path, stat)),
+                // one with a secret in it, redacted
+                _ if self.has_secret(&path) => secret.push((path, stat)),
                 // a path git can't take one per line
                 _ if path.as_os_str().as_bytes().contains(&b'\n') => {}
                 _ => files.push((path, stat)),
@@ -124,6 +139,18 @@ impl Workspace {
                 seen.insert(path, (stat, blob.to_string()));
             }
         }
+        for (path, stat) in secret {
+            let Ok(text) = std::fs::read(self.root.join(&path)) else {
+                continue;
+            };
+            let mut cmd = repo.git();
+            cmd.args(["hash-object", "-w", "--stdin"]);
+            let out = repo.input(&mut cmd, self.redacted(text)).await?;
+            seen.insert(
+                path,
+                (stat, String::from_utf8_lossy(&out).trim().to_string()),
+            );
+        }
         for (path, stat) in links {
             let Ok(target) = std::fs::read_link(self.root.join(&path)) else {
                 continue;
@@ -146,6 +173,33 @@ impl Workspace {
             .collect();
         entries.sort_by(|a, b| a.2.cmp(&b.2));
         Ok(entries)
+    }
+
+    /// Whether the file at `path` has a value to redact in it.
+    fn has_secret(&self, path: &Path) -> bool {
+        if self.redact.is_empty() {
+            return false;
+        }
+        let Ok(text) = std::fs::read(self.root.join(path)) else {
+            return false;
+        };
+        self.redact
+            .iter()
+            .any(|(_, v)| contains(&text, v.as_bytes()))
+    }
+
+    /// `text` with each value replaced by `[secret:NAME]`, the longest first.
+    fn redacted(&self, mut text: Vec<u8>) -> Vec<u8> {
+        let mut values: Vec<&(String, String)> = self.redact.iter().collect();
+        values.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+        for (name, value) in values {
+            text = replace(
+                &text,
+                value.as_bytes(),
+                format!("[secret:{name}]").as_bytes(),
+            );
+        }
+        text
     }
 
     /// The files under the root a commit has, with their stat.
@@ -196,4 +250,27 @@ fn walk(root: &Path) -> anyhow::Result<Vec<(PathBuf, Metadata)>> {
     }
     found.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(found)
+}
+
+fn contains(text: &[u8], value: &[u8]) -> bool {
+    !value.is_empty() && text.windows(value.len()).any(|w| w == value)
+}
+
+/// `text` with every `from` replaced by `to`.
+pub fn replace(text: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    if from.is_empty() {
+        return text.to_vec();
+    }
+    let mut out = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i..].starts_with(from) {
+            out.extend_from_slice(to);
+            i += from.len();
+        } else {
+            out.push(text[i]);
+            i += 1;
+        }
+    }
+    out
 }

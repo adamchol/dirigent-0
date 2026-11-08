@@ -163,3 +163,47 @@ test("a title is a note, a held one a rename, and the latest per session names i
   expect([...named.keys()]).toEqual(["a"]);
   expect(named.get("a")?.hold).toBe(true);
 });
+
+test("a dirigent's request for a secret is a card its answer settles; a refused one says why", () => {
+  const ask = (id: string, session: string) => ({
+    type: "tool_call",
+    id,
+    name: "request_secret",
+    input: { session, name: "GITHUB_TOKEN", why: "to push" },
+  });
+  const t = timeline([
+    row("a", "assistant_message", {
+      content: [ask("c1", "s1"), ask("c2", "s2")],
+      stop_reason: { reason: "tool_use" },
+      usage: usage(1, 1),
+    }),
+    row("r1", "tool_result", { call_id: "c1", name: "request_secret", content: "Asked", is_error: false }),
+    row("r2", "tool_result", { call_id: "c2", name: "request_secret", content: "you only view it", is_error: true }),
+    row("ans", "secret_answered", { session: "s1", name: "GITHUB_TOKEN", provided: true, call: "c1" }, "user:dev"),
+    row("ch", "secrets_changed", { names: ["GITHUB_TOKEN", "NPM_TOKEN"] }),
+  ]);
+  const requests = t.items.filter((i) => i.t === "request");
+  expect(requests).toEqual([
+    {
+      t: "request",
+      key: "c1",
+      session: "s1",
+      name: "GITHUB_TOKEN",
+      why: "to push",
+      result: { content: "Asked", isError: false },
+      answer: "provided",
+    },
+    {
+      t: "request",
+      key: "c2",
+      session: "s2",
+      name: "GITHUB_TOKEN",
+      why: "to push",
+      result: { content: "you only view it", isError: true },
+    },
+  ]);
+  const notes = t.items.flatMap((i) => (i.t === "note" ? [i.text] : []));
+  expect(notes).toEqual(["provided: GITHUB_TOKEN", "secrets: GITHUB_TOKEN, NPM_TOKEN"]);
+  // not a tool step
+  expect(t.items.some((i) => i.t === "tool")).toBe(false);
+});

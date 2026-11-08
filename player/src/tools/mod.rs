@@ -24,6 +24,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::ToolSpec;
+use crate::secrets::Secrets;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolOutput {
@@ -80,14 +81,17 @@ pub struct ReadRecord {
 
 pub struct ToolCtx {
     pub workdir: &'static Path,
+    /// The session's secrets, for the environment of the processes tools start.
+    pub secrets: Secrets,
     reads: Mutex<HashMap<PathBuf, ReadRecord>>,
 }
 
 impl ToolCtx {
     /// `workdir` must already be canonical.
-    pub fn new(workdir: &'static Path) -> Self {
+    pub fn new(workdir: &'static Path, secrets: Secrets) -> Self {
         ToolCtx {
             workdir,
+            secrets,
             reads: Mutex::new(HashMap::new()),
         }
     }
@@ -288,7 +292,7 @@ pub(crate) mod testing {
     pub fn ctx() -> (tempfile::TempDir, ToolCtx) {
         let dir = tempfile::tempdir().unwrap();
         let root: &'static Path = Box::leak(dir.path().canonicalize().unwrap().into_boxed_path());
-        (dir, ToolCtx::new(root))
+        (dir, ToolCtx::new(root, Secrets::none()))
     }
 
     pub fn write(ctx: &ToolCtx, rel: &str, content: &str) -> PathBuf {

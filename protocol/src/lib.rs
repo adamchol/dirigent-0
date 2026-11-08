@@ -225,6 +225,18 @@ pub enum Event {
         parts: u32,
         bundle: String,
     },
+    /// From a session's owner, into a dirigent's log: their answer to its `request_secret` call
+    /// `call`, for the secret `name` of the session `session`, which they `provided` (to control,
+    /// never into the log) or declined. An input, as a session update is.
+    SecretAnswered {
+        session: String,
+        name: String,
+        provided: bool,
+        call: String,
+    },
+    /// From the player: the names of the secrets the session now has (its tools' environment),
+    /// as they changed while it held the session. Never their values.
+    SecretsChanged { names: Vec<String> },
 }
 
 impl Event {
@@ -252,10 +264,12 @@ impl Event {
         "turn_ended",
         "titled",
         "files_changed",
+        "secret_answered",
+        "secrets_changed",
     ];
 
-    /// An input's text, as the model reads it: a user's message, or a session update; `None`
-    /// for anything else.
+    /// An input's text, as the model reads it: a user's message, a session update, or an answer
+    /// to a secret's request; `None` for anything else.
     pub fn input(&self) -> Option<String> {
         match self {
             Event::UserMessage { text, .. } => Some(text.clone()),
@@ -282,6 +296,15 @@ impl Event {
                     "<session_update session=\"{session}\" offset=\"{offset}\">{what}.{reply}</session_update>"
                 ))
             }
+            Event::SecretAnswered {
+                session,
+                name,
+                provided,
+                ..
+            } => Some(format!(
+                "<secret_answer session=\"{session}\" name=\"{name}\">{}</secret_answer>",
+                if *provided { "provided" } else { "declined" }
+            )),
             _ => None,
         }
     }
@@ -327,7 +350,9 @@ mod tests {
             | Event::ToolResult { .. }
             | Event::TurnEnded { .. }
             | Event::Titled { .. }
-            | Event::FilesChanged { .. } => e.kind(),
+            | Event::FilesChanged { .. }
+            | Event::SecretAnswered { .. }
+            | Event::SecretsChanged { .. } => e.kind(),
         };
         let s = String::new;
         let usage = Usage::default();
@@ -408,6 +433,13 @@ mod tests {
                 parts: 1,
                 bundle: s(),
             },
+            Event::SecretAnswered {
+                session: s(),
+                name: s(),
+                provided: true,
+                call: s(),
+            },
+            Event::SecretsChanged { names: vec![] },
         ];
         let kinds: Vec<String> = events.iter().map(one).collect();
         assert_eq!(kinds, Event::KINDS);
@@ -457,5 +489,26 @@ mod tests {
         assert_eq!(serde_json::from_value::<Event>(wire).unwrap(), named(false));
         let held = serde_json::json!({"kind": "titled", "data": {"title": "Fix login", "description": "Makes the test pass.", "hold": true}});
         assert_eq!(serde_json::from_value::<Event>(held).unwrap(), named(true));
+    }
+
+    #[test]
+    fn an_answer_to_a_request_for_a_secret_is_an_input_without_its_value() {
+        let answer = |provided| Event::SecretAnswered {
+            session: "s1".into(),
+            name: "GITHUB_TOKEN".into(),
+            provided,
+            call: "c1".into(),
+        };
+        assert_eq!(
+            answer(true).input().unwrap(),
+            "<secret_answer session=\"s1\" name=\"GITHUB_TOKEN\">provided</secret_answer>"
+        );
+        assert_eq!(
+            answer(false).input().unwrap(),
+            "<secret_answer session=\"s1\" name=\"GITHUB_TOKEN\">declined</secret_answer>"
+        );
+        let wire = serde_json::to_value(answer(true)).unwrap();
+        assert_eq!(serde_json::from_value::<Event>(wire).unwrap(), answer(true));
+        assert_eq!(Event::SecretsChanged { names: vec![] }.input(), None);
     }
 }

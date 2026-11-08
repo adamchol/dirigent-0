@@ -13,6 +13,7 @@ import {
   FolderGitIcon,
   HistoryIcon,
   InfoIcon,
+  KeyRoundIcon,
   MinimizeIcon,
   PlugIcon,
   RefreshCwIcon,
@@ -22,6 +23,7 @@ import {
 } from "lucide-react";
 
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
+import { Button } from "@/components/ui/button";
 import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
 import { Message, MessageContent, MessageHeader } from "@/components/ui/message";
 import { MessageScrollerItem } from "@/components/ui/message-scroller";
@@ -37,6 +39,7 @@ import {
   TraceTitle,
 } from "@/components/ui/trace";
 import type { Item, Streamed, Usage } from "./events.ts";
+import type { Request } from "./Secrets.tsx";
 import { Markdown } from "./Markdown.tsx";
 import { describe, ToolDetail } from "./Tools.tsx";
 
@@ -73,6 +76,8 @@ export function Timeline(props: {
   first: ReadonlySet<string>;
   /** The reply being written, as its deltas have it so far. */
   streaming: readonly Streamed[];
+  /** Answer a dirigent's request for a secret: its owner's only. */
+  answer?: (request: Request, provided: boolean) => void;
 }) {
   const list = blocks(props.items);
   const last = list[list.length - 1];
@@ -90,7 +95,7 @@ export function Timeline(props: {
             animate={SETTLED}
             transition={{ duration: 0.35, ease: EASE }}
           >
-            <Entry block={block} running={props.running} sending={props.sending} me={props.me} />
+            <Entry block={block} running={props.running} sending={props.sending} me={props.me} answer={props.answer} />
           </motion.div>
         </MessageScrollerItem>
       ))}
@@ -178,7 +183,13 @@ function Writing({ blocks }: { blocks: readonly Streamed[] }) {
   );
 }
 
-function Entry(props: { block: Block; running: boolean; sending: ReadonlySet<string>; me: string }) {
+function Entry(props: {
+  block: Block;
+  running: boolean;
+  sending: ReadonlySet<string>;
+  me: string;
+  answer?: (request: Request, provided: boolean) => void;
+}) {
   const b = props.block;
   switch (b.t) {
     case "user": {
@@ -262,6 +273,8 @@ function Entry(props: { block: Block; running: boolean; sending: ReadonlySet<str
       );
     case "turn":
       return <TurnMarker reason={b.reason} interrupted={b.interrupted} usage={b.usage} />;
+    case "request":
+      return <SecretRequest request={b} answer={props.answer} />;
     case "note":
       return <Note kind={b.kind} tone={b.tone} text={b.text} detail={b.detail} />;
   }
@@ -374,4 +387,45 @@ export function tokens(n: number): string {
 function time(ts: string | Date): string {
   const d = ts instanceof Date ? ts : new Date(ts.includes("T") ? ts : `${ts.replace(" ", "T")}Z`);
   return isNaN(d.getTime()) ? String(ts) : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/** A dirigent's request for a secret: what it's for, and, to the owner, providing or declining
+ * it, until they have (or control refused the request). */
+function SecretRequest(props: { request: Request; answer?: (request: Request, provided: boolean) => void }) {
+  const r = props.request;
+  const refused = r.result?.isError;
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border bg-panel px-4 py-3 text-[13px]">
+      <div className="flex items-center gap-2">
+        <KeyRoundIcon className="size-4 shrink-0 text-muted-foreground" />
+        <span className="min-w-0">
+          Session{" "}
+          <a className="font-mono underline-offset-3 hover:underline" href={`#${r.session}`}>
+            {r.session.slice(0, 8)}
+          </a>{" "}
+          needs <code className="font-mono text-[12px] text-strong">{r.name}</code>
+        </span>
+      </div>
+      {r.why && <p className="text-muted-foreground">{r.why}</p>}
+      {refused ? (
+        <p className="text-destructive">{r.result!.content}</p>
+      ) : r.answer ? (
+        <p className="flex items-center gap-1.5 text-muted-foreground">
+          {r.answer === "provided" ? <CheckIcon className="size-3.5" /> : <XIcon className="size-3.5" />}
+          {r.answer === "provided" ? "Provided" : "Declined"}
+        </p>
+      ) : props.answer ? (
+        <div className="flex gap-2">
+          <Button size="sm" onClick={() => props.answer!(r, true)}>
+            <KeyRoundIcon /> Provide
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => props.answer!(r, false)}>
+            Decline
+          </Button>
+        </div>
+      ) : (
+        <p className="text-muted-foreground">Waiting for its owner.</p>
+      )}
+    </div>
+  );
 }

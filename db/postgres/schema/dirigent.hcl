@@ -95,8 +95,8 @@ table "dirigent.session_access" {
 # The kinds of events each subject may insert (chlive's second insert grant; the first says into
 # which sessions): kept by a trigger from `session_access`, since a grant reads one table keyed
 # by the subject. A player may insert every kind (into the session it holds); an owner only the
-# inputs, its messages and interrupts; a viewer nothing. The kinds are `dirigent_protocol::Event`'s
-# (a test keeps the list complete).
+# inputs (its messages, interrupts, renames, and answers to a dirigent's requests for secrets); a
+# viewer nothing. The kinds are `dirigent_protocol::Event`'s (a test keeps the list complete).
 table "dirigent.insert_kinds" {
   column "subject" { type = text }
   column "kind" { type = text }
@@ -113,12 +113,13 @@ function "dirigent.grant_insert_kinds" {
     DECLARE
       who text;
       wanted text[];
-      inputs text[] := ARRAY['user_message', 'user_interrupt', 'titled'];
+      inputs text[] := ARRAY['user_message', 'user_interrupt', 'titled', 'secret_answered'];
       every_kind text[] := inputs || ARRAY[
         'player_attached', 'player_detached', 'player_failed', 'workspace_ready',
         'workspace_restored', 'checkpoint', 'checkpoint_failed', 'turn_started', 'steered',
         'model_delta', 'assistant_message', 'model_cancelled', 'error', 'compacted',
-        'compaction_failed', 'tool_result', 'turn_ended', 'session_update', 'files_changed'];
+        'compaction_failed', 'tool_result', 'turn_ended', 'session_update', 'files_changed',
+        'secrets_changed'];
     BEGIN
       FOREACH who IN ARRAY ARRAY[OLD.subject, NEW.subject] LOOP
         CONTINUE WHEN who IS NULL;
@@ -176,13 +177,76 @@ table "dirigent.chatgpt_links" {
   primary_key { columns = [column.subject] }
 }
 
+# The model providers' API keys users gave, their sessions' model calls are paid with (by
+# `provider`: `anthropic`), encrypted with control's link key; `hint` is the key's last four
+# characters, all of it that's ever shown again.
+table "dirigent.api_keys" {
+  column "subject" { type = text }
+  column "provider" { type = text }
+  column "key" {
+    type = bytea
+    null = false
+  }
+  column "hint" {
+    type = text
+    null = false
+  }
+  column "updated" {
+    type    = timestamptz
+    null    = false
+    default = sql("now()")
+  }
+  primary_key { columns = [column.subject, column.provider] }
+}
+
+# The secrets a user gave all their sessions, by name (the variable their tools get), each
+# encrypted with control's link key. A session's own of the same name wins.
+table "dirigent.user_secrets" {
+  column "subject" { type = text }
+  column "name" { type = text }
+  column "value" {
+    type = bytea
+    null = false
+  }
+  column "updated" {
+    type    = timestamptz
+    null    = false
+    default = sql("now()")
+  }
+  primary_key { columns = [column.subject, column.name] }
+}
+
+# The secrets of one session, by name, encrypted with control's link key; gone with the session.
+table "dirigent.session_secrets" {
+  column "session_id" { type = uuid }
+  column "name" { type = text }
+  column "value" {
+    type = bytea
+    null = false
+  }
+  column "updated" {
+    type    = timestamptz
+    null    = false
+    default = sql("now()")
+  }
+  primary_key { columns = [column.session_id, column.name] }
+  foreign_key "session_secrets_session_id_fkey" {
+    columns    = [column.session_id]
+    references = [table.dirigent.sessions.column.id]
+    on_delete  = CASCADE
+  }
+}
+
 publication "dirigent_chlive" {
   tables = [table.dirigent.session_access, table.dirigent.insert_kinds]
 }
 
 grant {
   privileges = [SELECT, INSERT, UPDATE, DELETE]
-  on         = [table.dirigent.sessions, table.dirigent.session_access, table.dirigent.chatgpt_links]
+  on = [
+    table.dirigent.sessions, table.dirigent.session_access, table.dirigent.chatgpt_links,
+    table.dirigent.api_keys, table.dirigent.user_secrets, table.dirigent.session_secrets,
+  ]
   to         = [role.dirigent_control]
 }
 

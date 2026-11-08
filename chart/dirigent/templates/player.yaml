@@ -14,7 +14,8 @@ period to finish its turn, checkpoint and hand the session over: it isn't migrat
 {{- range $k, $v := .Values.player.env }}
 {{- $env = append $env (printf "%s=%s" $k (toString $v)) }}
 {{- end }}
-{{- $secrets := prepend .Values.player.secrets "dirigent-kopia" }}
+{{- /* the kopia repository's token; API keys and sessions' secrets come on the lease */}}
+{{- $secrets := list "dirigent-kopia" }}
 {{- $vm := dict
   "apiVersion" "kubevirt.io/v1"
   "kind" "VirtualMachineInstance"

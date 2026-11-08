@@ -34,6 +34,8 @@ export interface SessionInfo {
   role: "owner" | "viewer";
   /** When it was made, in milliseconds since the Unix epoch. */
   created: number;
+  /** The names of the secrets its tools get (its own, and its owner's for all their sessions). */
+  secrets?: string[];
 }
 
 /** How control knows its callers (`GET /auth`). */
@@ -45,10 +47,14 @@ export interface Link {
   broken: string | null;
 }
 
-/** Who the caller is to control, and their link (`GET /me`). */
+/** Who the caller is to control, their link, and their Anthropic key (`GET /me`). */
 export interface Me {
   subject: string;
   chatgpt: Link | null;
+  /** Their key's last four characters; none, they gave none. */
+  anthropic?: { hint: string } | null;
+  /** Whether the install has a key their sessions run on without one of their own. */
+  anthropic_default?: boolean;
 }
 
 /** A model a ChatGPT plan has. */
@@ -157,4 +163,36 @@ export function place(s: SessionInfo): string {
   const git = s.spec.source?.git;
   if (!git) return "Empty workspace";
   return git.ref ? `${repo(git.url)}@${git.ref}` : repo(git.url);
+}
+
+/** Give `who`'s Anthropic API key (control checks it with Anthropic first): its hint. */
+export async function setAnthropicKey(who: Who, key: string): Promise<{ hint: string }> {
+  return (await call(who, "PUT", "/links/anthropic", { key })).json();
+}
+
+export async function removeAnthropicKey(who: Who) {
+  await call(who, "DELETE", "/links/anthropic");
+}
+
+/** Where secrets live: all `who`'s sessions (none), or one session's (its id). */
+function secretsPath(session?: string): string {
+  return session ? `/sessions/${session}/secrets` : "/secrets";
+}
+
+/** The names of the secrets, all sessions' or `session`'s own. */
+export async function secrets(who: Who, session?: string): Promise<string[]> {
+  return (await call(who, "GET", secretsPath(session))).json();
+}
+
+export async function setSecret(who: Who, name: string, value: string, session?: string) {
+  await call(who, "PUT", `${secretsPath(session)}/${name}`, { value });
+}
+
+export async function removeSecret(who: Who, name: string, session?: string) {
+  await call(who, "DELETE", `${secretsPath(session)}/${name}`);
+}
+
+/** Whether `name` may name a secret (control's rule): an environment variable's name. */
+export function secretName(name: string): boolean {
+  return /^[A-Z_][A-Z0-9_]{0,63}$/.test(name);
 }
