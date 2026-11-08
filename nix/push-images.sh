@@ -28,19 +28,36 @@ if [ -n "${REGISTRY_PASSWORD:-}" ]; then
   helm registry login "$host" -u "$REGISTRY_USER" --password-stdin <<<"$REGISTRY_PASSWORD"
 fi
 
-# all at once, so they build in parallel; each one's path after, from the store
+# built where $BUILD_STORE says (e.g. ssh-ng://eu.nixbuild.net, CI's), which keeps what the
+# builds need, and only the archives and the chart copied here; else here (or your builders)
+build() {
+  if [ -n "${BUILD_STORE:-}" ]; then
+    nix build --store "$BUILD_STORE" --eval-store auto --builders "" --max-jobs 2 --no-link "$@"
+  else
+    nix build --no-link "$@"
+  fi
+}
+# here, from $BUILD_STORE: the path of $1, built
+fetch() {
+  local path
+  path=$(build --print-out-paths "$1")
+  [ -z "${BUILD_STORE:-}" ] || nix copy --from "$BUILD_STORE" --no-check-sigs "$path"
+  echo "$path"
+}
+
+# all at once, so they build in parallel; each one's path after
 installables=(.#chart)
 for image in "${images[@]}"; do installables+=(".#$image-image"); done
-nix build --no-link --print-build-logs "${installables[@]}"
+build --print-build-logs "${installables[@]}"
 for image in "${images[@]}"; do
-  archive=$(nix build ".#$image-image" --no-link --print-out-paths)
+  archive=$(fetch ".#$image-image")
   skopeo copy --retry-times 3 "docker-archive:$archive" "docker://$registry/dirigent-$image:$tag"
   for more in "$@"; do
     skopeo copy --retry-times 3 "docker://$registry/dirigent-$image:$tag" "docker://$registry/dirigent-$image:$more"
   done
 done
 
-chart=$(nix build .#chart --no-link --print-out-paths)
+chart=$(fetch .#chart)
 semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
 if [[ $tag =~ $semver ]]; then
   version=$tag
