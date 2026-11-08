@@ -134,7 +134,8 @@ impl Entry {
             | Event::ModelCancelled
             | Event::Error { .. }
             | Event::CompactionFailed { .. }
-            | Event::Titled { .. } => None,
+            | Event::Titled { .. }
+            | Event::FilesChanged { .. } => None,
         }
     }
 

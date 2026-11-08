@@ -815,7 +815,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chlive-client",
  "clap",
+ "dirigent-protocol",
+ "dirigent-sync",
+ "futures",
  "rand 0.9.5",
  "reqwest",
  "serde",
@@ -867,6 +871,7 @@ dependencies = [
  "chlive-client",
  "clap",
  "dirigent-protocol",
+ "dirigent-sync",
  "futures",
  "genai",
  "globset",
@@ -901,6 +906,18 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "dirigent-sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "dirigent-protocol",
+ "ignore",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

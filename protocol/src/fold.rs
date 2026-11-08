@@ -66,7 +66,8 @@ impl Fold {
             | Event::Compacted { .. }
             | Event::CompactionFailed { .. }
             | Event::ToolResult { .. }
-            | Event::Titled { .. } => Some(ev.clone()),
+            | Event::Titled { .. }
+            | Event::FilesChanged { .. } => Some(ev.clone()),
         }
     }
 

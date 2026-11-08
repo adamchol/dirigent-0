@@ -23,7 +23,7 @@ use tracing::{error, warn};
 use super::control::player_token;
 use super::Session;
 use dirigent_protocol::control::pb;
-use dirigent_protocol::rows::{EventRow, EVENTS, LOG_QUERY};
+use dirigent_protocol::rows::{EventRow, EVENTS, FILES_QUERY, LOG_QUERY};
 use dirigent_protocol::Event;
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -143,6 +143,25 @@ impl Session for ChliveSession {
         Ok(events)
     }
 
+    async fn files(&mut self) -> anyhow::Result<Vec<Event>> {
+        let rows = self
+            .client
+            .query(FILES_QUERY)
+            .param("session", &self.id)
+            .complete()
+            .fetch::<EventRow>()
+            .await
+            .context("reading the session's workspace")?;
+        let mut files = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            match row.event() {
+                Ok(ev) => files.push(ev),
+                Err(e) => warn!(offset = row.offset, "skipping a row of the workspace: {e}"),
+            }
+        }
+        Ok(files)
+    }
+
     async fn recv(&mut self) -> Option<(String, Event)> {
         loop {
             let row = match self.log.as_mut()?.next().await {
@@ -174,7 +193,10 @@ impl Session for ChliveSession {
             let _ = self.writes.send(Write { row, done: None });
             return id;
         }
-        self.own.insert(id.clone());
+        // the log the loop follows leaves the workspace out: those never come back
+        if !matches!(event, Event::FilesChanged { .. }) {
+            self.own.insert(id.clone());
+        }
         let (done, wait) = oneshot::channel();
         let kind = row.kind.clone();
         let _ = self.writes.send(Write {
@@ -316,7 +338,7 @@ mod e2e {
                 (Registry::new(d.tools()), Some(tokio::spawn(follow)))
             }
         };
-        let agent = Agent {
+        let mut agent = Agent {
             provider: provider.clone(),
             cfg: AgentConfig {
                 model: "mock",
@@ -329,7 +351,9 @@ mod e2e {
             tools: Arc::new(tools),
             workdir,
             checkpoints: Some(checkpoints),
+            mirror: None,
         };
+        let mirror = state.path().join("sync");
         let mut s = ChliveSession::new(session, lease.epoch, &stack.chlive, lease.tokens());
         let source = lease.spec.source.clone();
         let detach = Detach {
@@ -337,7 +361,10 @@ mod e2e {
             when: lease.detach(),
         };
         let task = tokio::spawn(async move {
-            let log = workspace::open(&mut s, workdir, source.as_ref(), Some(checkpoints)).await?;
+            let (log, m) =
+                workspace::open(&mut s, workdir, source.as_ref(), Some(checkpoints), &mirror)
+                    .await?;
+            agent.mirror = m.map(|m| &*Box::leak(Box::new(tokio::sync::Mutex::new(m))));
             agent.run(&mut s, log, detach).await
         });
         Player {
@@ -436,6 +463,20 @@ mod e2e {
                 Err(_) => panic!("timed out; the log has {:#?}", kinds(&last)),
             }
         }
+    }
+
+    /// The session's workspace in its log, read as [`USER`].
+    async fn files(stack: &Stack, session: &str) -> Vec<Event> {
+        client(stack, USER)
+            .query(FILES_QUERY)
+            .param("session", session)
+            .complete()
+            .fetch::<EventRow>()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.event().unwrap())
+            .collect()
     }
 
     /// The epochs of the players that attached, in order.
@@ -729,6 +770,15 @@ mod e2e {
         };
         let e = insert(&owner, forged).await.unwrap_err();
         assert!(e.message.contains("kind"), "{e}");
+        let files = Event::FilesChanged {
+            commit: "c".into(),
+            parent: None,
+            part: 0,
+            parts: 1,
+            bundle: String::new(),
+        };
+        let e = insert(&owner, files).await.unwrap_err();
+        assert!(e.message.contains("kind"), "{e}");
         let as_viewer = client(&stack, viewer);
         let e = insert(&as_viewer, say("me too")).await.unwrap_err();
         assert!(e.message.contains("session_id"), "{e}");
@@ -951,8 +1001,7 @@ mod e2e {
             r.iter().any(|r| r.kind == "workspace_ready")
         })
         .await;
-        std::fs::write(first.dir.path().join("notes.txt"), "mine").unwrap();
-        user.say("hi").await;
+        user.say("!echo mine > notes.txt").await;
         let log = log_until(&stack, &session, |r| {
             r.iter().any(|r| r.kind == "checkpoint")
         })
@@ -978,9 +1027,23 @@ mod e2e {
         let dir = second.dir.path();
         assert_eq!(
             std::fs::read_to_string(dir.join("notes.txt")).unwrap(),
-            "mine"
+            "mine\n"
         );
         assert_eq!(std::fs::read_to_string(dir.join("file")).unwrap(), "main\n");
+
+        // the workspace in the log: the clone, then the note; the restored workspace is as the
+        // log has it, so the next change builds on the note
+        let before = files(&stack, &session).await;
+        assert_eq!(before.len(), 2, "{before:?}");
+        user.say("!echo more > more.txt").await;
+        log_until(&stack, &session, |r| turns_ended(r) == 2).await;
+        let after = files(&stack, &session).await;
+        assert_eq!(after.len(), 3);
+        let parent = |e: &Event| match e {
+            Event::FilesChanged { commit, parent, .. } => (commit.clone(), parent.clone()),
+            _ => unreachable!(),
+        };
+        assert_eq!(parent(&after[2]).1, Some(parent(&before[1]).0));
         second.stop().await;
     }
 

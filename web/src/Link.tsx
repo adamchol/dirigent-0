@@ -47,7 +47,7 @@ export function ChatGptDialog(props: { who: Who; declared: boolean; open: boolea
             your own machine, so it's done with dirigent's CLI there.
           </DialogDescription>
         </DialogHeader>
-        <div className="flex flex-col gap-3">
+        <div className="flex min-w-0 flex-col gap-3">
           <Code code={login} language="bash" title="Sign in to this dirigent" />
           <Code code="dirigent link chatgpt" language="bash" title="Link your plan, in your browser" />
         </div>

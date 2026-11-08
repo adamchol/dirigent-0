@@ -3,6 +3,7 @@ mod checkpoints;
 mod compact;
 mod dirigent;
 mod history;
+mod mirror;
 mod process;
 mod provider;
 mod session;
@@ -15,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Mutex;
+
 use anyhow::Context;
 use clap::builder::styling::{AnsiColor, Styles};
 use clap::Parser;
@@ -23,6 +26,7 @@ use tracing::{info, warn};
 use crate::agent::{Agent, AgentConfig, Detach};
 use crate::checkpoints::Checkpoints;
 use crate::dirigent::Director;
+use crate::mirror::Mirror;
 use crate::provider::{Effort, Provider};
 use crate::session::chlive::ChliveSession;
 use crate::session::control::Lease;
@@ -98,8 +102,9 @@ struct Cli {
     #[arg(long, env = "DIRIGENT_KOPIA_TOKEN", hide_env_values = true)]
     kopia_token: Option<String>,
 
-    /// The player's own state, outside the workspace: kopia's config and cache. A new
-    /// directory in the system's temporary one when absent.
+    /// The player's own state, outside the workspace: kopia's config and cache, and the
+    /// repository the workspace is mirrored in. A new directory in the system's temporary one
+    /// when absent.
     #[arg(long, env = "DIRIGENT_STATE_DIR")]
     state_dir: Option<PathBuf>,
 
@@ -162,18 +167,18 @@ async fn main() -> anyhow::Result<()> {
         Some(p) => uuid(p, "--player-id")?,
         None => uuid::Uuid::new_v4().to_string(),
     };
+    let state = match &cli.state_dir {
+        Some(dir) => dir.clone(),
+        None => std::env::temp_dir().join(format!("dirigent-player-{player}")),
+    };
+    std::fs::create_dir_all(&state)?;
+    anyhow::ensure!(
+        !state.canonicalize()?.starts_with(workdir),
+        "--state-dir {} is inside the workspace",
+        state.display()
+    );
     let checkpoints: Option<&'static Checkpoints> = match &cli.kopia_token {
         Some(token) => {
-            let state = match &cli.state_dir {
-                Some(dir) => dir.clone(),
-                None => std::env::temp_dir().join(format!("dirigent-player-{player}")),
-            };
-            std::fs::create_dir_all(&state)?;
-            anyhow::ensure!(
-                !state.canonicalize()?.starts_with(workdir),
-                "--state-dir {} is inside the workspace",
-                state.display()
-            );
             let checkpoints = Checkpoints::connect(token, &state, &id).await?;
             Some(Box::leak(Box::new(checkpoints)))
         }
@@ -240,7 +245,16 @@ async fn main() -> anyhow::Result<()> {
             Some(m) => Box::leak(m.clone().into_boxed_str()),
             None => title_model,
         };
-        let log = workspace::open(&mut session, workdir, spec.source.as_ref(), checkpoints).await?;
+        let (log, mirror) = workspace::open(
+            &mut session,
+            workdir,
+            spec.source.as_ref(),
+            checkpoints,
+            &state.join("sync"),
+        )
+        .await?;
+        let mirror: Option<&'static Mutex<Mirror>> =
+            mirror.map(|m| &*Box::leak(Box::new(Mutex::new(m))));
         let (system, tools): (&'static str, Registry) = match spec.part {
             // after the workspace is made: its AGENTS.md is part of the prompt
             Part::Coder => (
@@ -271,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
             tools: Arc::new(tools),
             workdir,
             checkpoints,
+            mirror,
         };
         info!(
             session = id,

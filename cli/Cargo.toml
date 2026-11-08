@@ -2,14 +2,18 @@
 name = "dirigent-cli"
 version = "0.1.0"
 edition = "2021"
-description = "dirigent's command line: signing in, and linking accounts that pay for sessions"
+description = "dirigent's command line: signing in, linking accounts that pay for sessions, mirroring workspaces"
 
 [[bin]]
 name = "dirigent"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process"] }
+dirigent-protocol = { path = "../protocol" }
+dirigent-sync = { path = "../sync" }
+chlive-client = { git = "https://github.com/dialohq/chlive", branch = "master" }
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process", "signal", "sync"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

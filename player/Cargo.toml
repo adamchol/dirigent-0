@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 dirigent-protocol = { path = "../protocol" }
+dirigent-sync = { path = "../sync" }
 genai = "=0.7.0-beta.22"
 chlive-client = { git = "https://github.com/dialohq/chlive", branch = "master" }
 tonic = "0.14"

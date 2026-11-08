@@ -9,6 +9,7 @@ import {
   CodeIcon,
   CopyIcon,
   EllipsisIcon,
+  FolderDownIcon,
   GitBranchIcon,
   OctagonXIcon,
   PencilIcon,
@@ -125,6 +126,7 @@ export function SessionMenu(props: {
   who: api.Who;
   changed: () => void;
   rename: () => void;
+  openLocally: () => void;
 }) {
   const { info, who, changed } = props;
   const owner = info?.role === "owner";
@@ -152,6 +154,9 @@ export function SessionMenu(props: {
                 <PencilIcon /> Rename
               </DropdownMenuItem>
             )}
+            <DropdownMenuItem onClick={props.openLocally}>
+              <FolderDownIcon /> Open locally
+            </DropdownMenuItem>
             <DropdownMenuItem onClick={() => navigator.clipboard.writeText(props.id).then(() => toast.success("Session ID copied"))}>
               <CopyIcon /> Copy ID
             </DropdownMenuItem>
@@ -202,6 +207,7 @@ export function SessionsSidebar(props: {
   who: api.Who;
   create: () => void;
   rename: (id: string) => void;
+  openLocally: (id: string) => void;
   account: React.ReactNode;
   className?: string;
 }) {
@@ -258,6 +264,7 @@ function SessionItems(props: {
   list: SessionInfo[];
   titles: Map<string, Named>;
   rename: (id: string) => void;
+  openLocally: (id: string) => void;
   selected: string;
   select: (id: string) => void;
   who: api.Who;
@@ -337,6 +344,9 @@ function SessionItems(props: {
                       <PencilIcon /> Rename
                     </DropdownMenuItem>
                   )}
+                  <DropdownMenuItem onClick={() => props.openLocally(s.id)}>
+                    <FolderDownIcon /> Open locally
+                  </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => navigator.clipboard.writeText(s.id).then(() => toast.success("Session ID copied"))}>
                     <CopyIcon /> Copy ID
                   </DropdownMenuItem>

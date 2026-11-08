@@ -12,6 +12,7 @@ use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::checkpoints::Checkpoints;
+use crate::mirror::Mirror;
 use crate::process::{command, run};
 use crate::session::Session;
 
@@ -19,24 +20,45 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The session's log, once the workspace in `workdir` is made from `source`: with the event that
 /// says so appended, if there's one; or why it can't be made (which the player reports as it
-/// fails).
+/// fails). And the workspace's mirror (its repository in `mirror`), made from the log and
+/// brought up to date: a workspace restored from a checkpoint becomes the log's last commit, and
+/// what's changed since is committed. Without git, the workspace isn't mirrored.
 pub async fn open(
     session: &mut dyn Session,
-    workdir: &Path,
+    workdir: &'static Path,
     source: Option<&Source>,
     checkpoints: Option<&Checkpoints>,
-) -> anyhow::Result<Vec<(String, Event)>> {
+    mirror: &Path,
+) -> anyhow::Result<(Vec<(String, Event)>, Option<Mirror>)> {
     let mut log = session.load().await?;
+    let mut restored = false;
     match prepare(workdir, source, &log, checkpoints).await {
         Ok(None) => {}
         Ok(Some(ev)) => {
             info!(?ev, "workspace in place");
+            restored = matches!(ev, Event::WorkspaceRestored { .. });
             let id = session.publish(&ev).await;
             log.push((id, ev));
         }
         Err(error) => anyhow::bail!("the workspace couldn't be made: {error}"),
     }
-    Ok(log)
+    let files = session.files().await?;
+    let mut mirror = match Mirror::open(mirror, workdir, &files).await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("the workspace isn't mirrored: {e:#}");
+            return Ok((log, None));
+        }
+    };
+    if restored {
+        if let Err(e) = mirror.restore().await {
+            warn!("the workspace stays as its checkpoint has it: {e:#}");
+        }
+    }
+    for ev in mirror.snapshot("the player starts").await {
+        session.publish(&ev).await;
+    }
+    Ok((log, Some(mirror)))
 }
 
 /// Make the workspace in `workdir` (which exists) from `source`, as `log` (the session's log so
@@ -329,5 +351,101 @@ pub(crate) mod tests {
             "{got:?}"
         );
         assert!(other.join("file").exists() && !other.join("notes").exists());
+    }
+
+    /// A log, and the workspace's events, to open; what's published.
+    struct Logged {
+        log: Vec<(String, Event)>,
+        files: Vec<Event>,
+        published: Vec<Event>,
+    }
+
+    #[async_trait::async_trait]
+    impl Session for Logged {
+        async fn load(&mut self) -> anyhow::Result<Vec<(String, Event)>> {
+            Ok(self.log.clone())
+        }
+        async fn files(&mut self) -> anyhow::Result<Vec<Event>> {
+            Ok(self.files.clone())
+        }
+        async fn recv(&mut self) -> Option<(String, Event)> {
+            None
+        }
+        async fn publish(&mut self, event: &Event) -> String {
+            self.published.push(event.clone());
+            format!("p{}", self.published.len())
+        }
+    }
+
+    fn leak(path: &Path) -> &'static Path {
+        Box::leak(path.canonicalize().unwrap().into_boxed_path())
+    }
+
+    #[tokio::test]
+    async fn a_restored_workspace_gets_the_changes_after_its_checkpoint_from_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp = crate::checkpoints::tests::checkpoints(tmp.path()).await;
+        // the first machine: the workspace is checkpointed after a turn, then changed by the
+        // next turn's tools before the player stops
+        let old = tmp.path().join("old");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("keep"), "1").unwrap();
+        std::fs::write(old.join("gone"), "1").unwrap();
+        let mut first = Logged {
+            log: ready(false),
+            files: Vec::new(),
+            published: Vec::new(),
+        };
+        let (_, mirror) = open(
+            &mut first,
+            leak(&old),
+            None,
+            Some(&cp),
+            &tmp.path().join("s1"),
+        )
+        .await
+        .unwrap();
+        let mut mirror = mirror.unwrap();
+        let snapshot = cp.snapshot(&old, "t").await.unwrap();
+        std::fs::write(old.join("keep"), "2").unwrap();
+        std::fs::remove_file(old.join("gone")).unwrap();
+        let mut files = first.published.clone();
+        files.extend(mirror.snapshot("Bash c1").await);
+        assert_eq!(files.len(), 2, "{files:?}");
+
+        // the next, with a workspace and a state of its own
+        let work = tmp.path().join("ws");
+        std::fs::create_dir(&work).unwrap();
+        let mut next = Logged {
+            log: checkpointed(&snapshot),
+            files: files.clone(),
+            published: Vec::new(),
+        };
+        let (_, mirror) = open(
+            &mut next,
+            leak(&work),
+            None,
+            Some(&cp),
+            &tmp.path().join("s2"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next.published,
+            vec![Event::WorkspaceRestored { snapshot }],
+            "restored, with nothing new to mirror"
+        );
+        assert_eq!(std::fs::read_to_string(work.join("keep")).unwrap(), "2");
+        assert!(!work.join("gone").exists());
+
+        // and its next commit builds on the log's last
+        std::fs::write(work.join("new"), "n").unwrap();
+        let more = mirror.unwrap().snapshot("Write c2").await;
+        let (Event::FilesChanged { parent, .. }, Event::FilesChanged { commit, .. }) =
+            (&more[0], &files[1])
+        else {
+            panic!("{more:?}");
+        };
+        assert_eq!(parent.as_ref(), Some(commit));
     }
 }

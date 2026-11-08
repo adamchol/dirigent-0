@@ -38,6 +38,7 @@ import { ChatGptDialog, useMe } from "./Link.tsx";
 import { useGoogle } from "./Login.tsx";
 import { Session, Viewers, type LiveStatus } from "./Session.tsx";
 import { RenameDialog, useTitles } from "./Rename.tsx";
+import { SyncDialog } from "./Sync.tsx";
 import { NewSession, SessionMenu, SessionsSidebar, useSessions } from "./Sessions.tsx";
 import { tokens } from "./Timeline.tsx";
 
@@ -177,6 +178,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
   const [browsing, setBrowsing] = useState(false);
   const [linking, setLinking] = useState(false);
   const [renaming, setRenaming] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState<string | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
   const client = useClient(props.who);
   const sessions = useSessions(props.who);
@@ -203,6 +205,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
       who={props.who}
       create={() => setCreating(true)}
       rename={setRenaming}
+      openLocally={setSyncing}
       account={<Account who={props.who} become={props.become} signOut={props.signOut} link={() => setLinking(true)} />}
       className={className}
     />
@@ -227,7 +230,14 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
           <div className="ml-auto flex shrink-0 items-center gap-1 px-2">
             {info?.role === "owner" && <Viewers info={info} who={props.who} changed={sessions.refresh} />}
             {selected && (
-              <SessionMenu id={selected} info={info} who={props.who} changed={sessions.refresh} rename={() => setRenaming(selected)} />
+              <SessionMenu
+                id={selected}
+                info={info}
+                who={props.who}
+                changed={sessions.refresh}
+                rename={() => setRenaming(selected)}
+                openLocally={() => setSyncing(selected)}
+              />
             )}
           </div>
         </header>
@@ -287,6 +297,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
         close={() => setRenaming(null)}
       />
       <ChatGptDialog who={props.who} declared={!!props.become} open={linking} setOpen={setLinking} />
+      <SyncDialog id={syncing} who={props.who} declared={!!props.become} close={() => setSyncing(null)} />
     </LiveClientProvider>
   );
 }

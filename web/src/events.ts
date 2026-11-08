@@ -14,11 +14,12 @@ export interface EventRow {
   data: string;
 }
 
-/** `LOG_QUERY` (protocol/src/rows.rs): the log without its streaming deltas, in order. */
+/** `LOG_QUERY` (protocol/src/rows.rs): the log without its streaming deltas or its workspace's files
+ * (`files_changed`, which `dirigent sync` reads), in order. */
 export const LOG_QUERY =
   "select session_id, offset, partition, ts, id, author, kind, data " +
-  "from session_events where session_id = {session:UUID} and kind != 'model_delta' " +
-  "order by offset";
+  "from session_events where session_id = {session:UUID} " +
+  "and kind not in ('model_delta', 'files_changed') order by offset";
 
 export type ContentBlock =
   | { type: "text"; text: string }

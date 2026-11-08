@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::Value;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -14,6 +14,7 @@ use tracing::{info, warn};
 use crate::checkpoints::Checkpoints;
 use crate::compact;
 use crate::history::{History, CHARS_PER_TOKEN};
+use crate::mirror::Mirror;
 use crate::provider::{
     Accumulator, Completion, ContentBlock, Delta, Effort, Provider, ProviderError, Request,
     StopReason,
@@ -56,6 +57,8 @@ pub struct Agent {
     pub workdir: &'static Path,
     /// Where the workspace is snapshotted after every turn; none, it isn't.
     pub checkpoints: Option<&'static Checkpoints>,
+    /// Where the workspace is mirrored after every tool call that may change it; none, it isn't.
+    pub mirror: Option<&'static Mutex<Mirror>>,
 }
 
 pub const ABORTED_TOOL_RESULT: &str = "Tool call aborted by user interrupt";
@@ -285,7 +288,8 @@ fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -> Ve
             | Event::Error { .. }
             | Event::Compacted { .. }
             | Event::CompactionFailed { .. }
-            | Event::Titled { .. } => {}
+            | Event::Titled { .. }
+            | Event::FilesChanged { .. } => {}
         }
     }
     if !open {
@@ -481,6 +485,10 @@ impl Run<'_> {
             | Event::Steered { .. }
             | Event::TurnEnded { .. }
             | Event::Titled { .. } => {}
+            // the workspace, as a tool left it: in the log, never the history
+            Event::FilesChanged { .. } => {
+                self.session.publish(&ev).await;
+            }
         }
     }
 
@@ -678,6 +686,7 @@ impl Run<'_> {
         let ctx = self.ctx.clone();
         let token = t.token.clone();
         let tx = self.tx.clone();
+        let mirror = self.agent.mirror;
         tokio::spawn(async move {
             let send = |call: &Call, out: ToolOutput| {
                 info!(
@@ -728,6 +737,13 @@ impl Run<'_> {
             for call in &serial {
                 let tool = tools.get(&call.name).expect("checked above");
                 let out = run_one(&*tool, call, &ctx, token.clone()).await;
+                // what it changed is in the log before its result is
+                if let Some(mirror) = mirror {
+                    let why = format!("{} {}", call.name, call.id);
+                    for ev in mirror.lock().await.snapshot(&why).await {
+                        let _ = tx.send(ev);
+                    }
+                }
                 send(call, out);
             }
             while let Some(joined) = parallel.join_next().await {
@@ -899,7 +915,8 @@ fn log_event(ev: &Event) {
         | Event::Steered { .. }
         | Event::ToolResult { .. }
         | Event::ModelDelta { .. }
-        | Event::Titled { .. } => {}
+        | Event::Titled { .. }
+        | Event::FilesChanged { .. } => {}
     }
 }
 
@@ -954,6 +971,9 @@ mod tests {
         async fn load(&mut self) -> anyhow::Result<Vec<(String, Event)>> {
             Ok(std::mem::take(&mut self.log))
         }
+        async fn files(&mut self) -> anyhow::Result<Vec<Event>> {
+            Ok(Vec::new())
+        }
         async fn recv(&mut self) -> Option<(String, Event)> {
             self.inbox.recv().await
         }
@@ -993,17 +1013,33 @@ mod tests {
         cfg: AgentConfig,
         checkpoints: Option<&'static Checkpoints>,
     ) -> Harness {
+        start(log, cfg, checkpoints, None)
+    }
+
+    /// A harness whose workspace is mirrored, its repository in `state`.
+    fn mirrored(state: &Path) -> Harness {
+        let state: &'static Path = Box::leak(state.to_path_buf().into_boxed_path());
+        start(Vec::new(), CFG, None, Some(state))
+    }
+
+    fn start(
+        log: Vec<(String, Event)>,
+        cfg: AgentConfig,
+        checkpoints: Option<&'static Checkpoints>,
+        mirror: Option<&'static Path>,
+    ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let workdir: &'static Path =
             Box::leak(dir.path().canonicalize().unwrap().into_boxed_path());
         let provider = Arc::new(MockProvider::default());
         let published = Arc::new(Mutex::new(Vec::new()));
-        let agent = Agent {
+        let mut agent = Agent {
             provider: provider.clone(),
             cfg,
             tools: Arc::new(Registry::default_set()),
             workdir,
             checkpoints,
+            mirror: None,
         };
         let (tx, inbox) = mpsc::channel(8);
         let (detach, when) = watch::channel(None);
@@ -1013,6 +1049,10 @@ mod tests {
             published: published.clone(),
         };
         let task = tokio::spawn(async move {
+            if let Some(dir) = mirror {
+                let m = Mirror::open(dir, workdir, &[]).await?;
+                agent.mirror = Some(Box::leak(Box::new(tokio::sync::Mutex::new(m))));
+            }
             let log = session.load().await?;
             agent
                 .run(&mut session, log, Detach { epoch: 1, when })
@@ -1155,6 +1195,7 @@ mod tests {
                 Event::Compacted { summary, .. } => format!("compacted:{summary}"),
                 Event::CompactionFailed { message } => format!("compaction-failed:{message}"),
                 Event::TurnEnded { reason, .. } => format!("end:{reason:?}"),
+                Event::FilesChanged { .. } => "files".into(),
                 Event::ModelDelta { .. } | Event::Titled { .. } => unreachable!("filtered"),
             })
             .collect()
@@ -1505,6 +1546,80 @@ mod tests {
                 ContentBlock::Text { text: "b".into() }
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_changes_files_mirrors_them_before_its_result() {
+        let state = tempfile::tempdir().unwrap();
+        let h = mirrored(state.path());
+        let file = h.workdir.join("hello.txt");
+        h.provider.reset([
+            tool_script(&[(
+                "c1",
+                "Write",
+                json!({ "file_path": file, "content": "hi\n" }),
+            )]),
+            tool_script(&[("c2", "Read", json!({ "file_path": file }))]),
+            tool_script(&[("c3", "Bash", json!({ "command": "true" }))]),
+            tool_script(&[("c4", "Bash", json!({ "command": "rm hello.txt" }))]),
+            Script::text("done", Duration::ZERO),
+        ]);
+        h.send("go").await;
+        let workdir = h.workdir;
+        let published = h.published.clone();
+        let (kinds, _) = h.finish(1).await;
+        let kinds: Vec<_> = kinds
+            .iter()
+            .map(|k| k.split(':').take(2).collect::<Vec<_>>().join(":"))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "user:go",
+                "assistant:+tool",
+                "files",
+                "tool:Write",
+                "assistant:+tool",
+                "tool:Read",
+                "assistant:+tool",
+                "tool:Bash",
+                "assistant:+tool",
+                "files",
+                "tool:Bash",
+                "assistant:done",
+                "end:Completed",
+            ]
+        );
+
+        // the bundles add up to the workspace as each tool left it
+        let files: Vec<Event> = published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::FilesChanged { .. }))
+            .map(|(_, e)| e.clone())
+            .collect();
+        let mut bundles = dirigent_sync::Bundles::default();
+        let whole: Vec<_> = files.iter().filter_map(|e| bundles.push(e)).collect();
+        assert_eq!(whole.len(), 2);
+        assert_eq!(whole[1].parent.as_ref(), Some(&whole[0].commit));
+        let reader = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let repo = dirigent_sync::Repo::open(reader.path()).await.unwrap();
+        repo.fetch(&whole[0]).await.unwrap();
+        repo.checkout(out.path(), &whole[0].commit, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.path().join("hello.txt")).unwrap(),
+            "hi\n"
+        );
+        repo.fetch(&whole[1]).await.unwrap();
+        repo.checkout(out.path(), &whole[1].commit, true)
+            .await
+            .unwrap();
+        assert!(!out.path().join("hello.txt").exists());
+        assert!(!workdir.join("hello.txt").exists());
     }
 
     #[tokio::test]

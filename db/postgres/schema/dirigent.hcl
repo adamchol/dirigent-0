@@ -118,7 +118,7 @@ function "dirigent.grant_insert_kinds" {
         'player_attached', 'player_detached', 'player_failed', 'workspace_ready',
         'workspace_restored', 'checkpoint', 'checkpoint_failed', 'turn_started', 'steered',
         'model_delta', 'assistant_message', 'model_cancelled', 'error', 'compacted',
-        'compaction_failed', 'tool_result', 'turn_ended', 'session_update'];
+        'compaction_failed', 'tool_result', 'turn_ended', 'session_update', 'files_changed'];
     BEGIN
       FOREACH who IN ARRAY ARRAY[OLD.subject, NEW.subject] LOOP
         CONTINUE WHEN who IS NULL;

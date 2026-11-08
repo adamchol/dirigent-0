@@ -51,7 +51,7 @@ data:
 
     [[auth.issuers]]
     issuer = {{ $iss | quote }}
-    audiences = {{ toJson $.Values.auth.google.clientIds }}
+    audiences = {{ toJson (uniq (compact (append $.Values.auth.google.clientIds $.Values.auth.google.cli.clientId))) }}
     jwks_url = "https://www.googleapis.com/oauth2/v3/certs"
     algorithms = ["RS256"]
     subject_claim = "email"

@@ -1,13 +1,16 @@
-//! dirigent's command line. It signs you in to a dirigent (with Google, as the web does) and
-//! links the accounts your sessions' model calls are paid with: a ChatGPT plan, whose sign-in
-//! comes back to a listener only a process on your machine can have.
+//! dirigent's command line. It signs you in to a dirigent (with Google, as the web does),
+//! links the accounts your sessions' model calls are paid with (a ChatGPT plan, whose sign-in
+//! comes back to a listener only a process on your machine can have), and mirrors a session's
+//! workspace into a folder here.
 
 mod api;
 mod credentials;
 mod google;
 mod loopback;
 mod oauth;
+mod sync;
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -66,6 +69,21 @@ enum Command {
     Unlink { account: Account },
     /// The models your ChatGPT plan has.
     Models,
+    /// Mirror a session's workspace into a folder here, kept as the session changes it (to
+    /// read: a file you change that the session changes too is moved aside to `<file>.local`).
+    /// Needs git.
+    Sync {
+        /// The session's id.
+        session: String,
+        /// The folder; by default `./<the session's title>`.
+        dir: Option<PathBuf>,
+        /// chlive's WebSocket, when signed in to control's own API (`login --control`).
+        #[arg(long, env = "DIRIGENT_CHLIVE")]
+        chlive: Option<String>,
+        /// Sync once, then exit, rather than keep following the session.
+        #[arg(long)]
+        once: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -248,6 +266,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 println!("{}\t{}", m.slug, m.display_name);
             }
         }
+        Command::Sync {
+            session,
+            dir,
+            chlive,
+            once,
+        } => sync::sync(Api::signed_in(http)?, &session, dir, chlive, once).await?,
     }
     Ok(())
 }

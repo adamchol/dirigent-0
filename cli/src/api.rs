@@ -32,31 +32,46 @@ impl Api {
         let req = self
             .http
             .request(method, format!("{}{path}", self.creds.api));
-        let req = match &mut self.creds.auth {
+        Ok(match &self.creds.auth {
             Auth::Declared { subject } => req.header(CALLER, subject.as_str()),
-            Auth::Oidc {
-                client_id,
-                client_secret,
-                id_token,
-                refresh_token,
-            } => {
-                if oauth::expiring(id_token, 300) {
-                    let refresh = refresh_token
-                        .as_deref()
-                        .context("the Google sign-in expired (sign in again: dirigent login)")?;
-                    *id_token =
-                        google::refresh(&self.http, client_id, client_secret, refresh).await?;
-                    credentials::save(&self.path, &self.creds)?;
-                    let Auth::Oidc { id_token, .. } = &self.creds.auth else {
-                        unreachable!()
-                    };
-                    req.bearer_auth(id_token)
-                } else {
-                    req.bearer_auth(id_token.as_str())
-                }
-            }
+            Auth::Oidc { .. } => req.bearer_auth(self.id_token().await?),
+        })
+    }
+
+    /// The Google ID token, renewed (and saved) when it's about to expire.
+    async fn id_token(&mut self) -> anyhow::Result<String> {
+        let Auth::Oidc {
+            client_id,
+            client_secret,
+            id_token,
+            refresh_token,
+        } = &mut self.creds.auth
+        else {
+            anyhow::bail!("not signed in with Google");
         };
-        Ok(req)
+        if oauth::expiring(id_token, 300) {
+            let refresh = refresh_token
+                .as_deref()
+                .context("the Google sign-in expired (sign in again: dirigent login)")?;
+            *id_token = google::refresh(&self.http, client_id, client_secret, refresh).await?;
+            let token = id_token.clone();
+            credentials::save(&self.path, &self.creds)?;
+            return Ok(token);
+        }
+        Ok(id_token.clone())
+    }
+
+    /// A credential for chlive: signed in with Google, the ID token; in `declared` auth, one
+    /// control signs.
+    pub async fn chlive_token(&mut self) -> anyhow::Result<String> {
+        #[derive(serde::Deserialize)]
+        struct Token {
+            token: String,
+        }
+        match &self.creds.auth {
+            Auth::Declared { .. } => Ok(self.post::<Token>("/token", &()).await?.token),
+            Auth::Oidc { .. } => self.id_token().await,
+        }
     }
 
     pub async fn get<T: DeserializeOwned>(&mut self, path: &str) -> anyhow::Result<T> {

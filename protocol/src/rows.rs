@@ -10,10 +10,14 @@ use crate::Event;
 
 pub const EVENTS: &str = "session_events";
 
-/// A session's log without its streaming deltas, in order (chlive dialect; `session` is the
-/// session id).
+/// A session's log without its streaming deltas or its workspace's files, in order (chlive
+/// dialect; `session` is the session id).
 pub const LOG_QUERY: &str = "select session_id, offset, partition, ts, id, author, kind, data \
-     from session_events where session_id = {session:UUID} and kind != 'model_delta' \
+     from session_events where session_id = {session:UUID} \
+     and kind not in ('model_delta', 'files_changed') order by offset";
+/// A session's workspace: its `files_changed` rows, in order.
+pub const FILES_QUERY: &str = "select session_id, offset, partition, ts, id, author, kind, \
+     data from session_events where session_id = {session:UUID} and kind = 'files_changed' \
      order by offset";
 /// A session's log with its streaming deltas, in order.
 pub const SESSION_QUERY: &str = "select session_id, offset, partition, ts, id, author, kind, \

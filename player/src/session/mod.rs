@@ -14,6 +14,10 @@ pub trait Session: Send {
     /// The log so far, oldest first: each event with its id (resume).
     async fn load(&mut self) -> anyhow::Result<Vec<(String, Event)>>;
 
+    /// The workspace's events (`FilesChanged`), oldest first, which `load` leaves out: read
+    /// once, as the workspace is opened.
+    async fn files(&mut self) -> anyhow::Result<Vec<Event>>;
+
     /// The next event users append, with its id. `None` means no more will come.
     /// Must be cancel-safe: the loop polls it inside `select!`.
     async fn recv(&mut self) -> Option<(String, Event)>;

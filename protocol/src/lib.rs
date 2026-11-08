@@ -211,6 +211,20 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         hold: bool,
     },
+    /// From the player, as it starts and after each tool call that changed the workspace: the
+    /// workspace as a commit of the player's own git repository (never the workspace's), with
+    /// `bundle` holding the objects new since `parent` (a git bundle, base64), so the commits
+    /// add up to the workspace from the log alone (see `dirigent_sync`). A bundle too big for one
+    /// row is split over `parts` rows, `part` counting from 0. The log the loop reads leaves
+    /// these out (`rows::LOG_QUERY`); they're read on their own (`rows::FILES_QUERY`).
+    FilesChanged {
+        commit: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
+        part: u32,
+        parts: u32,
+        bundle: String,
+    },
 }
 
 impl Event {
@@ -237,6 +251,7 @@ impl Event {
         "tool_result",
         "turn_ended",
         "titled",
+        "files_changed",
     ];
 
     /// An input's text, as the model reads it: a user's message, or a session update; `None`
@@ -311,7 +326,8 @@ mod tests {
             | Event::SessionUpdate { .. }
             | Event::ToolResult { .. }
             | Event::TurnEnded { .. }
-            | Event::Titled { .. } => e.kind(),
+            | Event::Titled { .. }
+            | Event::FilesChanged { .. } => e.kind(),
         };
         let s = String::new;
         let usage = Usage::default();
@@ -384,6 +400,13 @@ mod tests {
                 title: s(),
                 description: s(),
                 hold: false,
+            },
+            Event::FilesChanged {
+                commit: s(),
+                parent: None,
+                part: 0,
+                parts: 1,
+                bundle: s(),
             },
         ];
         let kinds: Vec<String> = events.iter().map(one).collect();

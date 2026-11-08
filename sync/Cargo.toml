@@ -1,0 +1,16 @@
+[package]
+name = "dirigent-sync"
+version = "0.1.0"
+edition = "2021"
+description = "A workspace as git commits carried in a session's log: made by the player, checked out by the CLI"
+
+[dependencies]
+dirigent-protocol = { path = "../protocol" }
+tokio = { version = "1", features = ["rt", "macros", "process", "fs", "io-util", "time"] }
+ignore = "0.4"
+base64 = "0.22"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
