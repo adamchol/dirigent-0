@@ -29,6 +29,8 @@ jobs:
           nix_conf: |
             experimental-features = nix-command flakes
             access-tokens = github.com=${{ github.token }}
+            extra-substituters = https://openmig.cachix.org
+            extra-trusted-public-keys = openmig.cachix.org-1:Aq6s2uCRbfkN/M9U2czjzjjWrOZVopfe1rv5+1cxLpo=
       - uses: nixbuild/nixbuild-action@v27
         with:
           nixbuild_token: ${{ secrets.NIXBUILD_TOKEN }}
