@@ -117,6 +117,16 @@ web:
     host: ""
     tls: []
     annotations: {}
+  # or a Gateway API HTTPRoute, attached to your Gateway(s): `parentRefs` as the route's (e.g.
+  # [{name: gateway, namespace: gateway-system}]), and the `hostnames` it answers, all when empty.
+  # `timeouts` are the route rule's: `/live` is a long-lived WebSocket, which some Gateways end
+  # at their request timeout.
+  httpRoute:
+    enabled: false
+    parentRefs: []
+    hostnames: []
+    timeouts: {}
+    annotations: {}
 
 networkPolicy:
   enabled: true
