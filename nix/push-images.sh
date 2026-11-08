@@ -29,7 +29,9 @@ if [ -n "${REGISTRY_PASSWORD:-}" ]; then
 fi
 
 # all at once, so they build in parallel; each one's path after, from the store
-nix build --no-link .#chart "${images[@]/%/-image}" --print-build-logs
+installables=(.#chart)
+for image in "${images[@]}"; do installables+=(".#$image-image"); done
+nix build --no-link --print-build-logs "${installables[@]}"
 for image in "${images[@]}"; do
   archive=$(nix build ".#$image-image" --no-link --print-out-paths)
   skopeo copy --retry-times 3 "docker-archive:$archive" "docker://$registry/dirigent-$image:$tag"
