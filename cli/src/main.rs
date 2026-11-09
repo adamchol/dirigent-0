@@ -142,8 +142,6 @@ struct Me {
     subject: String,
     chatgpt: Option<Link>,
     anthropic: Option<Hint>,
-    #[serde(default)]
-    anthropic_default: bool,
 }
 
 #[derive(Deserialize)]
@@ -268,10 +266,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     broken: Some(why),
                 }) => println!("ChatGPT: {email}, broken: {why} (dirigent link chatgpt)"),
             }
-            match (me.anthropic, me.anthropic_default) {
-                (Some(Hint { hint }), _) => println!("Anthropic: your key …{hint}"),
-                (None, true) => println!("Anthropic: the install's key (dirigent link anthropic)"),
-                (None, false) => println!("Anthropic: no key (dirigent link anthropic)"),
+            match me.anthropic {
+                Some(Hint { hint }) => println!("Anthropic: your key …{hint}"),
+                None => println!("Anthropic: no key (dirigent link anthropic)"),
             }
         }
         Command::Link {

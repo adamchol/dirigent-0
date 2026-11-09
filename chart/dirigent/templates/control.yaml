@@ -113,13 +113,6 @@ spec:
             # what users' ChatGPT links, API keys and secrets are encrypted with
             - name: DIRIGENT_LINK_KEY
               value: /etc/dirigent/link/link.key
-            {{- if or .Values.anthropic.existingSecret .Values.anthropic.key }}
-            - name: ANTHROPIC_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.anthropic.existingSecret | default "dirigent-anthropic" }}
-                  key: key
-            {{- end }}
             - name: DIRIGENT_KUBE_TEMPLATE
               value: /etc/dirigent/player/vm.json
             - name: DIRIGENT_KUBE_NAME

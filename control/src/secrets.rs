@@ -1,7 +1,7 @@
-//! What sessions run with besides their spec: the model provider's API key (the owner's, or the
-//! install's), and secrets for their tools (the owner's for all their sessions, and each
-//! session's own), kept sealed in Postgres and sent to the session's player on its lease, so no
-//! value is ever in the log.
+//! What sessions run with besides their spec: the model provider's API key (the owner's), and
+//! secrets for their tools (the owner's for all their sessions, and each session's own), kept
+//! sealed in Postgres and sent to the session's player on its lease, so no value is ever in the
+//! log.
 
 use std::time::Duration;
 
@@ -16,11 +16,6 @@ pub const MAX_VALUE: usize = 64 * 1024;
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct KeyArgs {
-    /// The install's Anthropic API key: the one sessions whose owner gave none of their own run
-    /// on. Without it, those sessions can't call Anthropic's models.
-    #[arg(long, env = "ANTHROPIC_API_KEY", hide_env_values = true)]
-    pub anthropic_key: Option<String>,
-
     /// Anthropic's API, which users' keys are checked against as they're given.
     #[arg(
         long,
@@ -33,8 +28,6 @@ pub struct KeyArgs {
 pub struct Keys {
     /// What keys and secrets are sealed with; none without a link key, and then none are kept.
     pub seal: Option<Seal>,
-    /// The install's Anthropic key.
-    pub house: Option<String>,
     api: String,
     http: reqwest::Client,
 }
@@ -43,7 +36,6 @@ impl Keys {
     pub fn new(args: &KeyArgs, seal: Option<Seal>) -> anyhow::Result<Keys> {
         Ok(Keys {
             seal,
-            house: args.anthropic_key.clone().filter(|k| !k.is_empty()),
             api: args.anthropic_api.trim_end_matches('/').into(),
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
@@ -181,7 +173,6 @@ mod tests {
     async fn a_key_is_checked_with_anthropic() {
         let anthropic = fake::Anthropic::start().await;
         let args = KeyArgs {
-            anthropic_key: None,
             anthropic_api: anthropic.url.clone(),
         };
         let keys = Keys::new(&args, None).unwrap();

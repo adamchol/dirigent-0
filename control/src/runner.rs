@@ -28,8 +28,7 @@ pub trait Runner: Send + Sync {
     async fn start(&self, session: Uuid, player: &str, epoch: i64) -> anyhow::Result<()>;
 }
 
-/// The environment a player gets: what it needs, and none of control's own (its Postgres, the
-/// install's Anthropic key, which goes on the lease).
+/// The environment a player gets: what it needs, and none of control's own (its Postgres).
 const PASSED_ON: &[&str] = &[
     "PATH",
     "HOME",

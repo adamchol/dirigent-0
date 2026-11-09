@@ -94,15 +94,6 @@ player:
   env: {}
   nodeSelector: {}
 
-# The install's Anthropic API key: the one sessions run on whose owner gave none of their own
-# (users give theirs in the web's account menu, or with `dirigent link anthropic`). Control holds
-# it and hands it to those sessions' players on their lease. `existingSecret`: a Secret whose
-# `key` it is; or `key` itself, which the chart keeps in one. Neither: those sessions can't call
-# Anthropic's models.
-anthropic:
-  existingSecret: ""
-  key: ""
-
 control:
   resources:
     requests: { cpu: 100m, memory: 128Mi }

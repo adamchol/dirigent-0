@@ -1,6 +1,6 @@
 // The Anthropic API key a user's sessions run on: given to control, which checks it with
 // Anthropic, keeps it encrypted and hands it to their players on their leases; only its last four
-// characters are shown again. Without one, the install's key, if it has one.
+// characters are shown again. Without one, their sessions can't call Anthropic's models.
 
 import { useEffect, useState } from "react";
 import { KeyRoundIcon, Trash2Icon } from "lucide-react";
@@ -63,9 +63,7 @@ export function AnthropicKeyDialog(props: { open: boolean; who: Who; me: Me | nu
               Your sessions on Claude run on it.{" "}
               {own
                 ? `Yours ends in …${own.hint}.`
-                : props.me?.anthropic_default
-                  ? "Until you give one, they run on this dirigent's own key."
-                  : "This dirigent has no key of its own, so they need yours."}
+                : "Until you give one, they can't call Claude."}
             </DialogDescription>
           </DialogHeader>
           <FieldGroup>

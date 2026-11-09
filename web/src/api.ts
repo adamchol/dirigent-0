@@ -53,8 +53,6 @@ export interface Me {
   chatgpt: Link | null;
   /** Their key's last four characters; none, they gave none. */
   anthropic?: { hint: string } | null;
-  /** Whether the install has a key their sessions run on without one of their own. */
-  anthropic_default?: boolean;
 }
 
 /** A model a ChatGPT plan has. */

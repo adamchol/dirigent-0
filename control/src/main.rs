@@ -168,7 +168,7 @@ struct Control {
     auth: Auth,
     /// The ChatGPT plans linked, which sessions may run on; none without a link key.
     chatgpt: Option<ChatGpt>,
-    /// Users' API keys and secrets, and the install's key.
+    /// Users' API keys and secrets.
     keys: Keys,
     /// What changed of leases' credentials, which their holders send again at once.
     changed: broadcast::Sender<Changed>,
@@ -349,8 +349,7 @@ async fn auth_mode(State(control): State<&'static Control>) -> Json<serde_json::
 }
 
 /// The caller, the ChatGPT plan they linked and the Anthropic key they gave: `{"subject",
-/// "chatgpt": {"email", "broken"}, "anthropic": {"hint"}, "anthropic_default"}`, the last whether
-/// the install has a key their sessions run on without one.
+/// "chatgpt": {"email", "broken"}, "anthropic": {"hint"}}`.
 async fn me(
     State(control): State<&'static Control>,
     Caller(caller): Caller,
@@ -375,7 +374,6 @@ async fn me(
         "subject": caller,
         "chatgpt": chatgpt,
         "anthropic": anthropic,
-        "anthropic_default": control.keys.house.is_some(),
     })))
 }
 
@@ -1075,7 +1073,7 @@ async fn tokens(control: &Control, held: &Held, rejected: bool) -> pb::Tokens {
     }
 }
 
-/// The Anthropic key `owner`'s sessions run on: their own, or the install's; or why there's none.
+/// The Anthropic key `owner`'s sessions run on, their own; or why there's none.
 async fn anthropic_key(control: &Control, owner: &str) -> Result<String, String> {
     let keys = &control.keys;
     let own = match &keys.seal {
@@ -1086,14 +1084,13 @@ async fn anthropic_key(control: &Control, owner: &str) -> Result<String, String>
         },
         None => None,
     };
-    match (own, &keys.house) {
-        (Some(Ok(key)), _) => Ok(key),
-        (Some(Err(e)), _) => {
+    match own {
+        Some(Ok(key)) => Ok(key),
+        Some(Err(e)) => {
             error!(owner, "reading an Anthropic key: {e:#}");
             Err(format!("the Anthropic API key couldn't be read: {e:#}"))
         }
-        (None, Some(house)) => Ok(house.clone()),
-        (None, None) => Err(
+        None => Err(
             "no Anthropic API key: add yours in the web's account menu, or with \
                              `dirigent link anthropic`"
                 .into(),
@@ -1507,7 +1504,6 @@ mod e2e {
             None => {
                 let seal = chatgpt.as_ref().and_then(|a| a.link_key.as_deref());
                 let args = KeyArgs {
-                    anthropic_key: None,
                     anthropic_api: "http://127.0.0.1:1".into(),
                 };
                 Keys::new(&args, seal.map(|k| Seal::load(k).unwrap())).unwrap()
@@ -2494,7 +2490,6 @@ mod e2e {
                 "subject": user,
                 "chatgpt": null,
                 "anthropic": null,
-                "anthropic_default": false,
             })
         );
         let plan = serde_json::json!({ "provider": "chatgpt", "model": "gpt-test" });
@@ -2586,17 +2581,14 @@ mod e2e {
     }
 
     /// A control that keeps keys and secrets (with a link key of its own), checking keys with a
-    /// fake Anthropic, and `house` the install's key.
-    async fn start_keyed(
-        house: Option<&str>,
-    ) -> Option<(Ctl, secrets::fake::Anthropic, tempfile::TempDir)> {
+    /// fake Anthropic.
+    async fn start_keyed() -> Option<(Ctl, secrets::fake::Anthropic, tempfile::TempDir)> {
         std::env::var_os("DIRIGENT_E2E")?;
         let anthropic = secrets::fake::Anthropic::start().await;
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("link.key");
         seal::keygen(&key).unwrap();
         let args = KeyArgs {
-            anthropic_key: house.map(String::from),
             anthropic_api: anthropic.url.clone(),
         };
         let keys = Some((args, Seal::load(&key).unwrap()));
@@ -2630,13 +2622,12 @@ mod e2e {
 
     #[tokio::test]
     async fn e2e_an_anthropic_key_is_checked_kept_and_sent_on_the_owners_leases() {
-        let Some((base, _anthropic, _dir)) = start_keyed(Some("sk-house")).await else {
+        let Some((base, _anthropic, _dir)) = start_keyed().await else {
             return;
         };
         let user = new_user();
         let (_, me) = get_json(&base, &user, "/me").await;
         assert_eq!(me["anthropic"], serde_json::Value::Null);
-        assert_eq!(me["anthropic_default"], true);
         let put = reqwest::Method::PUT;
         let (status, why) = send_json(
             &base,
@@ -2649,17 +2640,19 @@ mod e2e {
         assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
         assert!(why.contains("invalid x-api-key"), "{why}");
 
-        // without a key of their own, the owner's sessions run on the install's
+        // without a key, the owner's sessions' leases say why there's none
         let s = Uuid::new_v4();
         let made = put_json(&base, s, &user, serde_json::json!({})).await;
         assert_eq!(made, reqwest::StatusCode::CREATED);
         let mut ws = connect(&base).await;
         acquire(&mut ws, s, &Uuid::new_v4().to_string(), None).await;
         let tokens = ws.tokens.clone().unwrap();
-        assert_eq!(tokens.anthropic.as_deref(), Some("sk-house"));
+        assert_eq!(tokens.anthropic, None);
+        let why = tokens.anthropic_unavailable.unwrap();
+        assert!(why.contains("dirigent link anthropic"), "{why}");
         assert_eq!(tokens.openai, None);
 
-        // theirs, once given, reaches the lease at once; and the install's again once removed
+        // theirs, once given, reaches the lease at once; and goes once removed
         let (status, hint) = send_json(
             &base,
             &user,
@@ -2681,32 +2674,19 @@ mod e2e {
             delete(&base, &user, "/links/anthropic").await,
             reqwest::StatusCode::NO_CONTENT
         );
-        let key = next_tokens(&mut ws).await.anthropic;
-        assert_eq!(key.as_deref(), Some("sk-house"));
+        let tokens = next_tokens(&mut ws).await;
+        assert_eq!(tokens.anthropic, None);
+        assert!(tokens.anthropic_unavailable.is_some());
         assert_eq!(
             delete(&base, &user, "/links/anthropic").await,
             reqwest::StatusCode::NOT_FOUND
         );
         ws.close().await;
-
-        // an install without a key of its own says why there's none
-        let Some((base, _anthropic, _dir)) = start_keyed(None).await else {
-            return;
-        };
-        let s = Uuid::new_v4();
-        put_json(&base, s, &user, serde_json::json!({})).await;
-        let mut ws = connect(&base).await;
-        acquire(&mut ws, s, &Uuid::new_v4().to_string(), None).await;
-        let tokens = ws.tokens.clone().unwrap();
-        assert_eq!(tokens.anthropic, None);
-        let why = tokens.anthropic_unavailable.unwrap();
-        assert!(why.contains("dirigent link anthropic"), "{why}");
-        ws.close().await;
     }
 
     #[tokio::test]
     async fn e2e_secrets_reach_their_sessions_leases_at_once_a_sessions_own_winning() {
-        let Some((base, _anthropic, _dir)) = start_keyed(None).await else {
+        let Some((base, _anthropic, _dir)) = start_keyed().await else {
             return;
         };
         let user = new_user();
@@ -2914,7 +2894,7 @@ mod e2e {
 
     #[tokio::test]
     async fn e2e_the_cli_gives_an_anthropic_key_and_keeps_secrets_from_stdin() {
-        let Some((base, _anthropic, _dir)) = start_keyed(Some("sk-house")).await else {
+        let Some((base, _anthropic, _dir)) = start_keyed().await else {
             return;
         };
         let user = new_user();
@@ -2953,7 +2933,7 @@ mod e2e {
             .await
             .unwrap();
         let whoami = cli(&["whoami"], "").await.unwrap();
-        assert!(whoami.contains("Anthropic: the install's key"), "{whoami}");
+        assert!(whoami.contains("Anthropic: no key"), "{whoami}");
         let refused = cli(&["link", "anthropic"], "sk-bad\n").await.unwrap_err();
         assert!(refused.contains("invalid x-api-key"), "{refused}");
         let linked = cli(&["link", "anthropic"], "sk-good-cli-9876\n")
