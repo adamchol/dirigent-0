@@ -71,7 +71,7 @@ checkpoints:
     tls: true
     # a Secret with `accessKey` and `secretKey`
     existingSecret: ""
-  # or a single-node Garage, deployed by the chart, its bucket and key made by the checkpoints' Job
+  # or a single-node Garage, deployed by the chart, with the bucket and a key of its own
   garage:
     enabled: false
     image: { repository: docker.io/dxflrs/garage, tag: v2.5.0, pullPolicy: IfNotPresent }

@@ -36,6 +36,14 @@ dirigent-garage:3900
 {{- end -}}
 {{- end }}
 
+{{- define "dirigent.s3Secret" -}}
+{{- if .Values.checkpoints.garage.enabled -}}
+dirigent-garage
+{{- else -}}
+{{- required "checkpoints.s3.existingSecret (or checkpoints.garage.enabled)" .Values.checkpoints.s3.existingSecret -}}
+{{- end -}}
+{{- end }}
+
 {{- define "dirigent.clickhouseUrl" -}}
 {{- printf "%s://%s:%v" (ternary "https" "http" .Values.clickhouse.secure) (required "clickhouse.host" .Values.clickhouse.host) .Values.clickhouse.port -}}
 {{- end }}

@@ -1,7 +1,8 @@
 {{- if .Values.checkpoints.garage.enabled }}
-{{- /* A single-node Garage for the checkpoints, instead of your S3. Its layout, bucket and key are
-made through its admin API by the checkpoints' Job (dirigent-kopia), which fetches the key from
-it each time; only the RPC secret (a single node's, unused) and the admin token are kept here. */}}
+{{- /* A single-node Garage for the checkpoints, instead of your S3: it lays itself out and makes
+the bucket with this Secret's key (`--single-node --default-bucket`). The key's id is GK and 24
+hex digits, as Garage's are; the RPC secret is a single node's, unused. */}}
+{{- $key := include "dirigent.password" (list . "dirigent-garage" "accessKey") }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -9,8 +10,9 @@ metadata:
   labels:
     {{- include "dirigent.labels" . | nindent 4 }}
 stringData:
+  accessKey: {{ ternary $key (printf "GK%s" (trunc 24 $key)) (hasPrefix "GK" $key) | quote }}
+  secretKey: {{ include "dirigent.password" (list . "dirigent-garage" "secretKey") | quote }}
   rpcSecret: {{ include "dirigent.password" (list . "dirigent-garage" "rpcSecret") | quote }}
-  adminToken: {{ include "dirigent.password" (list . "dirigent-garage" "adminToken") | quote }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -31,9 +33,6 @@ data:
     [s3_api]
     s3_region = "us-east-1"
     api_bind_addr = "[::]:3900"
-
-    [admin]
-    api_bind_addr = "[::]:3903"
 ---
 apiVersion: v1
 kind: Service
@@ -47,7 +46,6 @@ spec:
     app.kubernetes.io/component: garage
   ports:
     - { name: s3, port: 3900, targetPort: s3 }
-    - { name: admin, port: 3903, targetPort: admin }
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -75,18 +73,20 @@ spec:
           image: "{{ .repository }}:{{ .tag }}"
           imagePullPolicy: {{ .pullPolicy }}
           {{- end }}
-          command: [/garage, -c, /etc/garage/garage.toml, server]
+          command: [/garage, -c, /etc/garage/garage.toml, server, --single-node, --default-bucket]
           env:
             - name: GARAGE_RPC_SECRET
               valueFrom: { secretKeyRef: { name: dirigent-garage, key: rpcSecret } }
-            - name: GARAGE_ADMIN_TOKEN
-              valueFrom: { secretKeyRef: { name: dirigent-garage, key: adminToken } }
+            - name: GARAGE_DEFAULT_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: dirigent-garage, key: accessKey } }
+            - name: GARAGE_DEFAULT_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: dirigent-garage, key: secretKey } }
+            - name: GARAGE_DEFAULT_BUCKET
+              value: {{ .Values.checkpoints.s3.bucket | quote }}
           ports:
             - { name: s3, containerPort: 3900 }
-            - { name: admin, containerPort: 3903 }
-          # not /health, which fails until the Job has applied the layout (through the Service)
           readinessProbe:
-            tcpSocket: { port: admin }
+            tcpSocket: { port: s3 }
           volumeMounts:
             - { name: config, mountPath: /etc/garage, readOnly: true }
             - { name: data, mountPath: /data }
