@@ -1,4 +1,4 @@
-# The chart's images and the chart, built in nixbuild.net's store (the runner evaluates the
+# The chart's own images and the chart, built in nixbuild.net's store (the runner evaluates the
 # flake and gets only the archives, as its disk is too small for everything the builds need) and
 # pushed to GHCR by nix/push-images.sh: master as sha-<commit> and master, a v1.2.3 tag as 1.2.3.
 # Pull requests only build.
@@ -46,7 +46,7 @@ jobs:
         run: |
           nix build --store "$BUILD_STORE" --eval-store auto --builders "" --max-jobs 2 \
             --no-link --print-build-logs .#chart \
-            .#{control,chlive,web,migrations,kube-tools,rustfs,ingest,player-vm}-image
+            .#{control,web,tools,player-vm}-image
       - name: Push
         if: github.event_name != 'pull_request'
         env:

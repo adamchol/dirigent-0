@@ -1,0 +1,107 @@
+{{- if .Values.checkpoints.garage.enabled }}
+{{- /* A single-node Garage for the checkpoints, instead of your S3. Its layout, bucket and key are
+made through its admin API by the checkpoints' Job (dirigent-kopia), which fetches the key from
+it each time; only the RPC secret (a single node's, unused) and the admin token are kept here. */}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dirigent-garage
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+stringData:
+  rpcSecret: {{ include "dirigent.password" (list . "dirigent-garage" "rpcSecret") | quote }}
+  adminToken: {{ include "dirigent.password" (list . "dirigent-garage" "adminToken") | quote }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dirigent-garage
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+data:
+  # us-east-1, the region S3 clients sign for when given none (kopia, curl)
+  garage.toml: |
+    metadata_dir = "/data/meta"
+    data_dir = "/data/data"
+    db_engine = "lmdb"
+    replication_factor = 1
+    rpc_bind_addr = "[::]:3901"
+    rpc_public_addr = "127.0.0.1:3901"
+
+    [s3_api]
+    s3_region = "us-east-1"
+    api_bind_addr = "[::]:3900"
+
+    [admin]
+    api_bind_addr = "[::]:3903"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dirigent-garage
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "dirigent.selector" . | nindent 4 }}
+    app.kubernetes.io/component: garage
+  ports:
+    - { name: s3, port: 3900, targetPort: s3 }
+    - { name: admin, port: 3903, targetPort: admin }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dirigent-garage
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: garage
+spec:
+  serviceName: dirigent-garage
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "dirigent.selector" . | nindent 6 }}
+      app.kubernetes.io/component: garage
+  template:
+    metadata:
+      labels:
+        {{- include "dirigent.selector" . | nindent 8 }}
+        app.kubernetes.io/component: garage
+    spec:
+      containers:
+        - name: garage
+          {{- with .Values.checkpoints.garage.image }}
+          image: "{{ .repository }}:{{ .tag }}"
+          imagePullPolicy: {{ .pullPolicy }}
+          {{- end }}
+          command: [/garage, -c, /etc/garage/garage.toml, server]
+          env:
+            - name: GARAGE_RPC_SECRET
+              valueFrom: { secretKeyRef: { name: dirigent-garage, key: rpcSecret } }
+            - name: GARAGE_ADMIN_TOKEN
+              valueFrom: { secretKeyRef: { name: dirigent-garage, key: adminToken } }
+          ports:
+            - { name: s3, containerPort: 3900 }
+            - { name: admin, containerPort: 3903 }
+          # not /health, which fails until the Job has applied the layout (through the Service)
+          readinessProbe:
+            tcpSocket: { port: admin }
+          volumeMounts:
+            - { name: config, mountPath: /etc/garage, readOnly: true }
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: config
+          configMap: { name: dirigent-garage }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.checkpoints.garage.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.checkpoints.garage.storage }}
+{{- end }}

@@ -16,30 +16,23 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s/dirigent-%s:%s" $root.Values.images.registry (index . 1) (default $root.Chart.AppVersion $root.Values.images.tag) -}}
 {{- end }}
 
-{{/* A password generated once, kept across upgrades: (list $ "secret-name" "key") */}}
+{{/* A password generated once, kept across upgrades: (list $ "secret-name" "key"); 64 hex digits,
+as Garage's RPC secret must be */}}
 {{- define "dirigent.password" -}}
 {{- $root := index . 0 -}}
 {{- $found := lookup "v1" "Secret" $root.Release.Namespace (index . 1) -}}
 {{- if and $found (hasKey $found.data (index . 2)) -}}
 {{- index $found.data (index . 2) | b64dec -}}
 {{- else -}}
-{{- randAlphaNum 32 -}}
+{{- randAlphaNum 32 | sha256sum -}}
 {{- end -}}
 {{- end }}
 
 {{- define "dirigent.s3Endpoint" -}}
-{{- if .Values.checkpoints.rustfs.enabled -}}
-dirigent-rustfs:9000
+{{- if .Values.checkpoints.garage.enabled -}}
+dirigent-garage:3900
 {{- else -}}
-{{- required "checkpoints.s3.endpoint (or checkpoints.rustfs.enabled)" .Values.checkpoints.s3.endpoint -}}
-{{- end -}}
-{{- end }}
-
-{{- define "dirigent.s3Secret" -}}
-{{- if .Values.checkpoints.rustfs.enabled -}}
-dirigent-rustfs
-{{- else -}}
-{{- required "checkpoints.s3.existingSecret" .Values.checkpoints.s3.existingSecret -}}
+{{- required "checkpoints.s3.endpoint (or checkpoints.garage.enabled)" .Values.checkpoints.s3.endpoint -}}
 {{- end -}}
 {{- end }}
 

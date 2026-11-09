@@ -3,8 +3,9 @@ then ClickHouse's users for chlive and the ingestion (what scripts/clickhouse-de
 does in dev): before control starts, every time (they're no-ops when done). */}}
 {{- define "dirigent.migrate" }}
         - name: migrate
-          image: {{ include "dirigent.image" (list . "migrations") }}
+          image: {{ include "dirigent.image" (list . "tools") }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
+          workingDir: /dirigent
           command: ["bash", "-euo", "pipefail", "-c"]
           args:
             - |

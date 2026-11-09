@@ -11,17 +11,18 @@
         "flake-parts": [
           "flake-parts"
         ],
+        "nix2container": "nix2container",
         "nixpkgs": [
           "nixpkgs"
         ],
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1793922897,
-        "narHash": "sha256-p3PN6I+ueoI8SHyZeTrITvcsCyS8GqyIQGFxTswk0k4=",
+        "lastModified": 1794221289,
+        "narHash": "sha256-sdEmoW4lWf6gfO9wGLE1u8wtzYnWHVvyB/DmMzbrNxM=",
         "ref": "master",
-        "rev": "9743d4300a4c38e9a77f2fb7f8e37fd0ea9ccc96",
-        "revCount": 131,
+        "rev": "95ca2bca52bf42b6a5ce4b65642b13c7551ce4db",
+        "revCount": 132,
         "type": "git",
         "url": "https://github.com/dialohq/chlive"
       },
@@ -34,16 +35,16 @@
     "continuous-backup": {
       "flake": false,
       "locked": {
-        "lastModified": 1792668058,
-        "narHash": "sha256-i5m2/PP/pmntv3boIXGk9Opom4EO3jaC+eWl3pdaIPs=",
+        "lastModified": 1794152958,
+        "narHash": "sha256-qdCB0B0fBItMTLCQ8VJCLREaO5CDaTcnD+hZmQ+thHE=",
         "owner": "dialohq",
         "repo": "clickhouse-continuous-backup",
-        "rev": "4bfe2915182a3ad9b1411480419451dc7a760bf1",
+        "rev": "f86f9f67ed8e6b89e913557830c86f92d958ed70",
         "type": "github"
       },
       "original": {
         "owner": "dialohq",
-        "ref": "pause-server",
+        "ref": "main",
         "repo": "clickhouse-continuous-backup",
         "type": "github"
       }
@@ -86,6 +87,27 @@
       "original": {
         "owner": "hercules-ci",
         "repo": "flake-parts",
+        "type": "github"
+      }
+    },
+    "nix2container": {
+      "inputs": {
+        "nixpkgs": [
+          "chlive",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793342482,
+        "narHash": "sha256-poBaF2bJUH3yGMav3TSOi7k84jy8BnU8HD6PONQAwak=",
+        "owner": "nlewo",
+        "repo": "nix2container",
+        "rev": "42d1df94f001a9416ef08be7b305144074aca9d2",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nlewo",
+        "repo": "nix2container",
         "type": "github"
       }
     },

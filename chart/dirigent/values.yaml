@@ -1,9 +1,12 @@
 # dirigent's chart. Its own parts: control (sessions, the players' leases, and their VMs), chlive
 # (the sessions' logs, live), the web UI, and the players' VM template. Required on the cluster:
 # KubeVirt (the players' VMs) and CloudNativePG (the chart's Postgres). Required of you:
-# ClickHouse, Kafka, and S3 for the workspaces' checkpoints (or RustFS, deployed by the chart).
+# ClickHouse, Kafka, and S3 for the workspaces' checkpoints (or Garage, deployed by the chart).
 # One install per namespace: its objects are named `dirigent-*`.
 
+# The chart's own: control, web, tools (its Jobs) and player-vm (the players' disk); chlive's, the
+# ingestion's and Garage's are theirs (chlive.image, ingestion.connect.image,
+# checkpoints.garage.image).
 images:
   registry: ghcr.io/adamchol
   # the chart's appVersion when empty
@@ -62,15 +65,16 @@ kafka:
 # The workspaces' checkpoints: a kopia repository in S3.
 checkpoints:
   s3:
-    # host:port; empty with rustfs.enabled
+    # host:port; empty with garage.enabled
     endpoint: ""
     bucket: dirigent-workspaces
     tls: true
     # a Secret with `accessKey` and `secretKey`
     existingSecret: ""
-  # or a single-node RustFS, deployed by the chart
-  rustfs:
+  # or a single-node Garage, deployed by the chart, its bucket and key made by the checkpoints' Job
+  garage:
     enabled: false
+    image: { repository: docker.io/dxflrs/garage, tag: v2.5.0, pullPolicy: IfNotPresent }
     storage: 50Gi
     storageClass: ""
 
@@ -106,6 +110,9 @@ control:
   startup: 600
 
 chlive:
+  # the published image of the flake's chlive (sha-<12 chars of its commit>; `nix flake check`
+  # checks it)
+  image: { repository: ghcr.io/dialohq/chlive, tag: sha-95ca2bca52bf, pullPolicy: IfNotPresent }
   resources:
     requests: { cpu: 250m, memory: 512Mi }
   cacheSize: 10Gi
@@ -143,12 +150,12 @@ ingestion:
   pauseServerUrl: ""
   fullnameOverride: dirigent-ingest
   stateNamespace: dirigent
-  # the flake's `ingest` image (continuous-backup's own isn't published); images.registry and
-  # images.tag don't reach a subchart, so change these with them
+  # continuous-backup's image, of the flake's commit (its tags are the image's Nix hash), for
+  # Connect and the pause server; its JVM has Kafka's default heap (at most 2 GiB)
   connect:
     image:
-      repository: ghcr.io/adamchol/dirigent-ingest
-      tag: 0.1.0
+      repository: ghcr.io/dialohq/durable-clickhouse-connect
+      tag: qma97pnxbq3czznxdrys14ra3drg7kyn
   kafka:
     bootstrapServers: ""
     existingSecret: ""

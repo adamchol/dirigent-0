@@ -39,7 +39,7 @@ spec:
       initContainers:
         # chlive starts only with every issuer's keys: control's first
         - name: control-keys
-          image: {{ include "dirigent.image" (list . "kube-tools") }}
+          image: {{ include "dirigent.image" (list . "tools") }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           command: ["bash", "-c"]
           args:
@@ -48,7 +48,7 @@ spec:
         # the Kafka credentials (librdkafka properties, e.g. sasl.password) join the config here, so
         # they're only ever in the Secret
         - name: kafka-properties
-          image: {{ include "dirigent.image" (list . "kube-tools") }}
+          image: {{ include "dirigent.image" (list . "tools") }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           command: ["bash", "-euo", "pipefail", "-c"]
           args:
@@ -67,8 +67,8 @@ spec:
       {{- end }}
       containers:
         - name: chlive
-          image: {{ include "dirigent.image" (list . "chlive") }}
-          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          image: "{{ .Values.chlive.image.repository }}:{{ .Values.chlive.image.tag }}"
+          imagePullPolicy: {{ .Values.chlive.image.pullPolicy }}
           args: [--config, {{ ternary "/run/chlive/chlive.toml" "/etc/chlive/chlive.toml" (not (empty .Values.kafka.existingSecret)) }}]
           env:
             - name: CHLIVE_RO_PASSWORD

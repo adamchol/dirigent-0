@@ -1,4 +1,5 @@
-# The chart's images and the chart, to a registry (CI's, .github/workflows/images.yml, and yours):
+# The chart's own images and the chart, to a registry (CI's, .github/workflows/images.yml, and
+# yours):
 #   push-images [--registry R] TAG [TAG…]
 # The images are built from the flake here, pushed as R/dirigent-<name>:TAG and tagged with the
 # more TAGs too. The chart is pushed to oci://R/charts, its images R's at TAG: versioned TAG when
@@ -19,7 +20,7 @@ fi
 }
 tag=$1
 shift
-images=(control chlive web migrations kube-tools rustfs ingest player-vm)
+images=(control web tools player-vm)
 cd "${DNVR_ROOT:-$PWD}"
 
 if [ -n "${REGISTRY_PASSWORD:-}" ]; then
@@ -68,11 +69,7 @@ out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 cp -r "$chart" "$out/dirigent"
 chmod -R u+w "$out/dirigent"
-# the images' registry, and the ingestion subchart's image, which images.* don't reach
-sed -i \
-  -e "s|^  registry: .*|  registry: $registry|" \
-  -e "s|^      repository: .*/dirigent-ingest$|      repository: $registry/dirigent-ingest|" \
-  -e "/repository: .*\/dirigent-ingest$/{n;s|^      tag: .*|      tag: \"$tag\"|}" \
-  "$out/dirigent/values.yaml"
+# the images' registry
+sed -i "s|^  registry: .*|  registry: $registry|" "$out/dirigent/values.yaml"
 helm package "$out/dirigent" -d "$out" --version "$version" --app-version "$tag"
 helm push "$out/dirigent-$version.tgz" "oci://$registry/charts"

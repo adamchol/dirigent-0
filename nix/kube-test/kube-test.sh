@@ -41,7 +41,7 @@ up() {
 }
 
 load() {
-  for image in control chlive web migrations kube-tools rustfs ingest player-vm; do
+  for image in control web tools player-vm; do
     archive=$(nix build "$root#$image-image" --no-link --print-out-paths)
     ctr images import "$archive" >/dev/null
     echo "[kube-test] loaded $image"
@@ -78,7 +78,9 @@ e2e() {
   local control=$!
   kubectl -n dirigent port-forward svc/dirigent-chlive 18080:8080 >>"$logs" 2>&1 &
   local chlive=$!
-  trap 'kill $control $chlive 2>/dev/null' EXIT
+  # shellcheck disable=SC2064 # the pids now: the locals are gone when it runs; either may have
+  # ended already
+  trap "kill $control $chlive 2>/dev/null || true" EXIT
   timeout 30 bash -c 'until curl -fs -o /dev/null http://127.0.0.1:18090/auth; do sleep 1; done'
   cd "$root" || exit
   DIRIGENT_KUBE_E2E=1 CHLIVE_URL=ws://127.0.0.1:18080/live DIRIGENT_CONTROL_HTTP=http://127.0.0.1:18090 \

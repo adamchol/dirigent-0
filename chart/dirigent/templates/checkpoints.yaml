@@ -1,7 +1,8 @@
 {{- /* The kopia repository the players checkpoint their workspaces to, made once (the bucket
-too, where it can be), with the checkpoints' policy: `.gitignore`d files and files over 50 MB
-left out, and no snapshot ever expires (the log refers to them). Its token, which players
-connect with, goes in the Secret `dirigent-kopia` (DIRIGENT_KOPIA_TOKEN). */}}
+too, where it can be; with checkpoints.garage, Garage's layout, bucket and key), with the
+checkpoints' policy: `.gitignore`d files and files over 50 MB left out, and no snapshot ever
+expires (the log refers to them). Its token, which players connect with, goes in the Secret
+`dirigent-kopia` (DIRIGENT_KOPIA_TOKEN). */}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -58,20 +59,42 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: kopia
-          image: {{ include "dirigent.image" (list . "kube-tools") }}
+          image: {{ include "dirigent.image" (list . "tools") }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           command: ["bash", "-euo", "pipefail", "-c"]
           args:
             - |
               export HOME=/tmp KOPIA_CONFIG_PATH=/tmp/kopia/repo.config KOPIA_CHECK_FOR_UPDATES=false
               scheme=http; tls=(--disable-tls); [ "$S3_TLS" = true ] && { scheme=https; tls=(); }
-              # the bucket, if it can be made (RustFS answers 503 for a moment after it's up)
-              for _ in $(seq 60); do
-                code=$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 \
-                  --user "$S3_ACCESS_KEY:$S3_SECRET_KEY" -X PUT "$scheme://$S3_ENDPOINT/$S3_BUCKET" || true)
-                case "$code" in 200|409) break ;; esac
-                sleep 2
-              done
+              if [ -n "${GARAGE_ADMIN:-}" ]; then
+                api() {
+                  curl -fsS -H "Authorization: Bearer $GARAGE_ADMIN_TOKEN" \
+                    -H 'Content-Type: application/json' "$GARAGE_ADMIN/v2/$1" "${@:2}"
+                }
+                for _ in $(seq 60); do status=$(api GetClusterStatus) && break; sleep 2; done
+                # its one node, all the capacity (a single node's is only a weight)
+                if [ "$(jq .layoutVersion <<<"$status")" = 0 ]; then
+                  api UpdateClusterLayout -d "$(jq -c '{roles: [{id: .nodes[0].id, zone: "dc1",
+                    capacity: 1000000000, tags: []}]}' <<<"$status")" >/dev/null
+                  api ApplyClusterLayout -d '{"version": 1}' >/dev/null
+                fi
+                key=$(api "GetKeyInfo?search=dirigent-checkpoints&showSecretKey=true" 2>/dev/null \
+                  || api CreateKey -d '{"name": "dirigent-checkpoints"}')
+                S3_ACCESS_KEY=$(jq -r .accessKeyId <<<"$key")
+                S3_SECRET_KEY=$(jq -r .secretAccessKey <<<"$key")
+                bucket=$(api "GetBucketInfo?globalAlias=$S3_BUCKET" 2>/dev/null \
+                  || api CreateBucket -d "$(jq -nc --arg b "$S3_BUCKET" '{globalAlias: $b}')")
+                api AllowBucketKey -d "$(jq -c --arg k "$S3_ACCESS_KEY" '{bucketId: .id, accessKeyId: $k,
+                  permissions: {read: true, write: true, owner: true}}' <<<"$bucket")" >/dev/null
+              else
+                # the bucket, if it can be made
+                for _ in $(seq 60); do
+                  code=$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 \
+                    --user "$S3_ACCESS_KEY:$S3_SECRET_KEY" -X PUT "$scheme://$S3_ENDPOINT/$S3_BUCKET" || true)
+                  case "$code" in 200|409) break ;; esac
+                  sleep 2
+                done
+              fi
               s3=(--bucket "$S3_BUCKET" --endpoint "$S3_ENDPOINT" "${tls[@]}"
                 --access-key "$S3_ACCESS_KEY" --secret-access-key "$S3_SECRET_KEY" --password "$KOPIA_PASSWORD")
               if ! kopia repository connect s3 "${s3[@]}" >/dev/null 2>&1; then
@@ -90,10 +113,17 @@ spec:
             - name: S3_BUCKET
               value: {{ .Values.checkpoints.s3.bucket | quote }}
             - name: S3_TLS
-              value: {{ ternary "false" (toString .Values.checkpoints.s3.tls) .Values.checkpoints.rustfs.enabled | quote }}
+              value: {{ ternary "false" (toString .Values.checkpoints.s3.tls) .Values.checkpoints.garage.enabled | quote }}
+            {{- if .Values.checkpoints.garage.enabled }}
+            - name: GARAGE_ADMIN
+              value: http://dirigent-garage:3903
+            - name: GARAGE_ADMIN_TOKEN
+              valueFrom: { secretKeyRef: { name: dirigent-garage, key: adminToken } }
+            {{- else }}
             - name: S3_ACCESS_KEY
-              valueFrom: { secretKeyRef: { name: {{ include "dirigent.s3Secret" . }}, key: accessKey } }
+              valueFrom: { secretKeyRef: { name: {{ required "checkpoints.s3.existingSecret" .Values.checkpoints.s3.existingSecret }}, key: accessKey } }
             - name: S3_SECRET_KEY
-              valueFrom: { secretKeyRef: { name: {{ include "dirigent.s3Secret" . }}, key: secretKey } }
+              valueFrom: { secretKeyRef: { name: {{ .Values.checkpoints.s3.existingSecret }}, key: secretKey } }
+            {{- end }}
             - name: KOPIA_PASSWORD
               valueFrom: { secretKeyRef: { name: dirigent-kopia-password, key: password } }

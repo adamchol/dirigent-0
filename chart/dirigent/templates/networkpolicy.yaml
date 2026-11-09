@@ -38,14 +38,14 @@ spec:
               app.kubernetes.io/component: chlive
       ports:
         - { protocol: TCP, port: 8080 }
-    {{- if .Values.checkpoints.rustfs.enabled }}
+    {{- if .Values.checkpoints.garage.enabled }}
     - to:
         - podSelector:
             matchLabels:
               {{- include "dirigent.selector" . | nindent 14 }}
-              app.kubernetes.io/component: rustfs
+              app.kubernetes.io/component: garage
       ports:
-        - { protocol: TCP, port: 9000 }
+        - { protocol: TCP, port: 3900 }
     {{- end }}
     - to:
         - ipBlock:

@@ -9,12 +9,14 @@
     dnvr.url = "github:dialohq/dnvr/feat/rex-runner";
     dnvr.inputs.nixpkgs.follows = "nixpkgs";
     # Kafka Connect's ClickHouse sink (exactly once) and its pause server, which chlive's
-    # snapshots go through; the pause server's Keeper storage is on this branch
+    # snapshots go through: its chart (vendored into ours) and the dev stack's; its image is
+    # published (ingestion.connect.image)
     continuous-backup = {
-      url = "github:dialohq/clickhouse-continuous-backup/pause-server";
+      url = "github:dialohq/clickhouse-continuous-backup/main";
       flake = false;
     };
-    # the chlive server (`chlive`) and its ClickHouse build
+    # the chlive server: its TS client (the web's), the dev stack's server and ClickHouse; its
+    # image is published as sha-<12 chars of the commit>, the chart's chlive.image (checked)
     chlive = {
       url = "git+https://github.com/dialohq/chlive?ref=master";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -86,10 +88,9 @@
               lib
               dirigent
               web
-              chlive
               openmig
               ;
-            inherit (inputs) nixpkgs continuous-backup;
+            inherit (inputs) nixpkgs;
             version = "0.1.0";
           };
         in
@@ -114,7 +115,17 @@
           );
 
           # The migrations match the schema: `openmig check` replays them into scratch servers.
+          # The chart's chlive.image is the flake's chlive's.
           checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            chlive-image =
+              let
+                tag = "sha-${lib.substring 0 12 inputs.chlive.rev}";
+              in
+              pkgs.runCommand "dirigent-chlive-image-check" { } ''
+                grep -q 'repository: ghcr.io/dialohq/chlive, tag: ${tag},' ${./chart/dirigent/values.yaml} \
+                  || { echo "chart/dirigent/values.yaml: chlive.image.tag isn't ${tag}, flake.lock's chlive" >&2; exit 1; }
+                touch $out
+              '';
             migrations =
               pkgs.runCommand "dirigent-migrations-check"
                 {

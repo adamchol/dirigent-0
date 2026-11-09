@@ -47,7 +47,7 @@ let
     # the checkpoints' object store and kopia repository, and control's players' sessions
     # (workspaces and players' state)
     extraData = [
-      ".dnvr/rustfs"
+      ".dnvr/garage"
       ".dnvr/kopia"
       ".dnvr/sessions"
     ];
@@ -96,10 +96,10 @@ in
     jq
     curl
     # the player clones sessions' sources with git, and checkpoints workspaces with kopia (to
-    # RustFS, S3)
+    # Garage, S3)
     git
     kopia
-    rustfs
+    garage_2
     nixfmt
     dnvrState
     # the web UI (web/)
@@ -165,35 +165,68 @@ in
       '';
     };
 
-    # RustFS: the S3 store workspaces are checkpointed to (through kopia-repo). Publishes `url`.
-    rustfs = {
+    # Garage: the S3 store workspaces are checkpointed to (through kopia-repo), a single node.
+    # Publishes `url` and `admin`, its admin API (token dirigent-dev-admin).
+    garage = {
+      env.GARAGE_ADMIN_TOKEN = "dirigent-dev-admin";
+      env.GARAGE_RPC_SECRET = "0000000000000000000000000000000000000000000000000000000000000000";
       command = ''
         cd "$DNVR_ROOT"
-        mkdir -p .dnvr/rustfs
-        port=$(dnvr-state pick-port)
-        dnvr-state set url "http://127.0.0.1:$port"
-        exec rustfs server --address "127.0.0.1:$port" \
-          --access-key dirigent --secret-key dirigent-dev-secret .dnvr/rustfs
+        mkdir -p .dnvr/garage
+        s3=$(dnvr-state pick-port) admin=$(dnvr-state pick-port) rpc=$(dnvr-state pick-port)
+        cat > .dnvr/garage/garage.toml <<EOF
+        metadata_dir = "$DNVR_ROOT/.dnvr/garage/meta"
+        data_dir = "$DNVR_ROOT/.dnvr/garage/data"
+        db_engine = "lmdb"
+        replication_factor = 1
+        rpc_bind_addr = "127.0.0.1:$rpc"
+        rpc_public_addr = "127.0.0.1:$rpc"
+        [s3_api]
+        s3_region = "us-east-1"
+        api_bind_addr = "127.0.0.1:$s3"
+        [admin]
+        api_bind_addr = "127.0.0.1:$admin"
+        EOF
+        dnvr-state set url "http://127.0.0.1:$s3"
+        dnvr-state set admin "http://127.0.0.1:$admin"
+        exec garage -c .dnvr/garage/garage.toml server
       '';
     };
 
-    # The kopia repository on RustFS, made once, with the checkpoints' policy: `.gitignore`d files
-    # and files over 50 MB are left out, and no snapshot ever expires (the log refers to them).
-    # Publishes `token`, which players connect with; then idles.
+    # The kopia repository on Garage, made once (Garage's layout, bucket and key too, as the chart's
+    # Job does), with the checkpoints' policy: `.gitignore`d files and files over 50 MB are left
+    # out, and no snapshot ever expires (the log refers to them). Publishes `token`, which players
+    # connect with; then idles.
     kopia-repo = {
-      env.S3 = "dnvr://rustfs/url";
+      env = {
+        S3 = "dnvr://garage/url";
+        GARAGE_ADMIN = "dnvr://garage/admin";
+        GARAGE_ADMIN_TOKEN = "dirigent-dev-admin";
+      };
       command = ''
         cd "$DNVR_ROOT"
         mkdir -p .dnvr/kopia
         export KOPIA_CONFIG_PATH=.dnvr/kopia/admin.config KOPIA_LOG_DIR=.dnvr/kopia/logs \
           KOPIA_CHECK_FOR_UPDATES=false
-        # the bucket; RustFS answers 503 for a moment after it's up
-        timeout 60 sh -c "until curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 \
-          --user dirigent:dirigent-dev-secret -X PUT '$S3/dirigent-workspaces' -o /dev/null \
-          || curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 --user dirigent:dirigent-dev-secret \
-          -I '$S3/dirigent-workspaces' -o /dev/null; do sleep 1; done"
+        api() {
+          curl -fsS -H "Authorization: Bearer $GARAGE_ADMIN_TOKEN" \
+            -H 'Content-Type: application/json' "$GARAGE_ADMIN/v2/$1" "''${@:2}"
+        }
+        for _ in $(seq 60); do status=$(api GetClusterStatus) && break; sleep 1; done
+        if [ "$(jq .layoutVersion <<<"$status")" = 0 ]; then
+          api UpdateClusterLayout -d "$(jq -c '{roles: [{id: .nodes[0].id, zone: "dc1",
+            capacity: 1000000000, tags: []}]}' <<<"$status")" >/dev/null
+          api ApplyClusterLayout -d '{"version": 1}' >/dev/null
+        fi
+        key=$(api "GetKeyInfo?search=dirigent-checkpoints&showSecretKey=true" 2>/dev/null \
+          || api CreateKey -d '{"name": "dirigent-checkpoints"}')
+        bucket=$(api "GetBucketInfo?globalAlias=dirigent-workspaces" 2>/dev/null \
+          || api CreateBucket -d '{"globalAlias": "dirigent-workspaces"}')
+        api AllowBucketKey -d "$(jq -nc --argjson b "$bucket" --argjson k "$key" '{bucketId: $b.id,
+          accessKeyId: $k.accessKeyId, permissions: {read: true, write: true, owner: true}}')" >/dev/null
         s3=(--bucket dirigent-workspaces --endpoint "''${S3#http://}" --disable-tls
-          --access-key dirigent --secret-access-key dirigent-dev-secret --password dirigent-dev)
+          --access-key "$(jq -r .accessKeyId <<<"$key")"
+          --secret-access-key "$(jq -r .secretAccessKey <<<"$key")" --password dirigent-dev)
         if ! kopia repository connect s3 "''${s3[@]}" >/dev/null 2>&1; then
           kopia repository create s3 "''${s3[@]}"
         fi
