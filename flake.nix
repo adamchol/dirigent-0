@@ -5,8 +5,8 @@
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
-    # the rex runner is on this branch until it's merged
-    dnvr.url = "github:dialohq/dnvr/feat/rex-runner";
+    # the rex runner and the Garage preset are on this branch until they're merged
+    dnvr.url = "github:dialohq/dnvr/feat/garage-preset";
     dnvr.inputs.nixpkgs.follows = "nixpkgs";
     # Kafka Connect's ClickHouse sink (exactly once) and its pause server, which chlive's
     # snapshots go through: its chart (vendored into ours) and the dev stack's; its image is

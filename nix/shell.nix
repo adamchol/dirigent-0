@@ -99,7 +99,6 @@ in
     # Garage, S3)
     git
     kopia
-    garage_2
     nixfmt
     dnvrState
     # the web UI (web/)
@@ -165,68 +164,33 @@ in
       '';
     };
 
-    # Garage: the S3 store workspaces are checkpointed to (through kopia-repo), a single node.
-    # Publishes `url` and `admin`, its admin API (token dirigent-dev-admin).
+    # Garage (dnvr's preset): the S3 store workspaces are checkpointed to (through kopia-repo), a
+    # single node with the bucket, and the preset's fixed dev key. Publishes `endpoint`, `region`,
+    # the key, and `bucket.dirigent-workspaces` once it takes requests.
     garage = {
-      env.GARAGE_ADMIN_TOKEN = "dirigent-dev-admin";
-      env.GARAGE_RPC_SECRET = "0000000000000000000000000000000000000000000000000000000000000000";
-      command = ''
-        cd "$DNVR_ROOT"
-        mkdir -p .dnvr/garage
-        s3=$(dnvr-state pick-port) admin=$(dnvr-state pick-port) rpc=$(dnvr-state pick-port)
-        cat > .dnvr/garage/garage.toml <<EOF
-        metadata_dir = "$DNVR_ROOT/.dnvr/garage/meta"
-        data_dir = "$DNVR_ROOT/.dnvr/garage/data"
-        db_engine = "lmdb"
-        replication_factor = 1
-        rpc_bind_addr = "127.0.0.1:$rpc"
-        rpc_public_addr = "127.0.0.1:$rpc"
-        [s3_api]
-        s3_region = "us-east-1"
-        api_bind_addr = "127.0.0.1:$s3"
-        [admin]
-        api_bind_addr = "127.0.0.1:$admin"
-        EOF
-        dnvr-state set url "http://127.0.0.1:$s3"
-        dnvr-state set admin "http://127.0.0.1:$admin"
-        exec garage -c .dnvr/garage/garage.toml server
-      '';
+      imports = [ presets.garage ];
+      buckets = [ "dirigent-workspaces" ];
+      port = null;
     };
 
-    # The kopia repository on Garage, made once (Garage's layout, bucket and key too, as the chart's
-    # Job does), with the checkpoints' policy: `.gitignore`d files and files over 50 MB are left
-    # out, and no snapshot ever expires (the log refers to them). Publishes `token`, which players
-    # connect with; then idles.
+    # The kopia repository on Garage, made once, with the checkpoints' policy: `.gitignore`d files
+    # and files over 50 MB are left out, and no snapshot ever expires (the log refers to them).
+    # Publishes `token`, which players connect with; then idles.
     kopia-repo = {
       env = {
-        S3 = "dnvr://garage/url";
-        GARAGE_ADMIN = "dnvr://garage/admin";
-        GARAGE_ADMIN_TOKEN = "dirigent-dev-admin";
+        S3 = "dnvr://garage/endpoint";
+        S3_REGION = "dnvr://garage/region";
+        S3_ACCESS_KEY = "dnvr://garage/accessKey";
+        S3_SECRET_KEY = "dnvr://garage/secretKey";
+        BUCKET = "dnvr://garage/bucket.dirigent-workspaces";
       };
       command = ''
         cd "$DNVR_ROOT"
         mkdir -p .dnvr/kopia
         export KOPIA_CONFIG_PATH=.dnvr/kopia/admin.config KOPIA_LOG_DIR=.dnvr/kopia/logs \
           KOPIA_CHECK_FOR_UPDATES=false
-        api() {
-          curl -fsS -H "Authorization: Bearer $GARAGE_ADMIN_TOKEN" \
-            -H 'Content-Type: application/json' "$GARAGE_ADMIN/v2/$1" "''${@:2}"
-        }
-        for _ in $(seq 60); do status=$(api GetClusterStatus) && break; sleep 1; done
-        if [ "$(jq .layoutVersion <<<"$status")" = 0 ]; then
-          api UpdateClusterLayout -d "$(jq -c '{roles: [{id: .nodes[0].id, zone: "dc1",
-            capacity: 1000000000, tags: []}]}' <<<"$status")" >/dev/null
-          api ApplyClusterLayout -d '{"version": 1}' >/dev/null
-        fi
-        key=$(api "GetKeyInfo?search=dirigent-checkpoints&showSecretKey=true" 2>/dev/null \
-          || api CreateKey -d '{"name": "dirigent-checkpoints"}')
-        bucket=$(api "GetBucketInfo?globalAlias=dirigent-workspaces" 2>/dev/null \
-          || api CreateBucket -d '{"globalAlias": "dirigent-workspaces"}')
-        api AllowBucketKey -d "$(jq -nc --argjson b "$bucket" --argjson k "$key" '{bucketId: $b.id,
-          accessKeyId: $k.accessKeyId, permissions: {read: true, write: true, owner: true}}')" >/dev/null
-        s3=(--bucket dirigent-workspaces --endpoint "''${S3#http://}" --disable-tls
-          --access-key "$(jq -r .accessKeyId <<<"$key")"
-          --secret-access-key "$(jq -r .secretAccessKey <<<"$key")" --password dirigent-dev)
+        s3=(--bucket "$BUCKET" --endpoint "''${S3#http://}" --disable-tls --region "$S3_REGION"
+          --access-key "$S3_ACCESS_KEY" --secret-access-key "$S3_SECRET_KEY" --password dirigent-dev)
         if ! kopia repository connect s3 "''${s3[@]}" >/dev/null 2>&1; then
           kopia repository create s3 "''${s3[@]}"
         fi
