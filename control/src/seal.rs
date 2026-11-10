@@ -62,10 +62,15 @@ pub fn keygen(path: &Path) -> anyhow::Result<()> {
     if path.exists() {
         return Ok(());
     }
+    crate::token::write_private(path, new_key().as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// A new link key, as its file holds it: 32 random bytes, base64.
+pub fn new_key() -> String {
     let mut key = [0u8; 32];
     rand::rng().fill_bytes(&mut key);
-    crate::token::write_private(path, STANDARD.encode(key).as_bytes())
-        .with_context(|| format!("writing {}", path.display()))
+    STANDARD.encode(key)
 }
 
 #[cfg(test)]

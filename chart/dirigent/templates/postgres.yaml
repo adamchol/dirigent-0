@@ -1,17 +1,6 @@
-{{- /* The chart's Postgres: control's state, and chlive's grants (logical replication). */}}
-{{- range $role := list "dirigent_control" "dirigent_chlive" }}
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ $role | replace "_" "-" }}-postgres
-  labels:
-    {{- include "dirigent.labels" $ | nindent 4 }}
-type: kubernetes.io/basic-auth
-stringData:
-  username: {{ $role }}
-  password: {{ include "dirigent.password" (list $ (printf "%s-postgres" ($role | replace "_" "-")) "password") | quote }}
----
-{{- end }}
+{{- /* The chart's Postgres: control's state, and chlive's grants (logical replication). Its
+roles' passwords are in dirigent-control-postgres and dirigent-chlive-postgres, which control
+makes (`control ensure-secrets`). */}}
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:

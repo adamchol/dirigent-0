@@ -155,7 +155,7 @@ ingestion:
     port: 8443
     secure: true
     database: dirigent
-    # made by the chart's ClickHouse migrations
+    # its users, which the migrations make; their passwords are control's (`control ensure-secrets`)
     credentialsSecret:
       name: dirigent-clickhouse-sink
   pauseServer:

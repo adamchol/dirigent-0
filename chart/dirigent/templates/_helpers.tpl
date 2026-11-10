@@ -16,18 +16,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s/dirigent-%s:%s" $root.Values.images.registry (index . 1) (default $root.Chart.AppVersion $root.Values.images.tag) -}}
 {{- end }}
 
-{{/* A password generated once, kept across upgrades: (list $ "secret-name" "key"); 64 hex digits,
-as Garage's RPC secret must be */}}
-{{- define "dirigent.password" -}}
-{{- $root := index . 0 -}}
-{{- $found := lookup "v1" "Secret" $root.Release.Namespace (index . 1) -}}
-{{- if and $found (hasKey $found.data (index . 2)) -}}
-{{- index $found.data (index . 2) | b64dec -}}
-{{- else -}}
-{{- randAlphaNum 32 | sha256sum -}}
-{{- end -}}
-{{- end }}
-
 {{- define "dirigent.s3Endpoint" -}}
 {{- if .Values.checkpoints.garage.enabled -}}
 dirigent-garage:3900

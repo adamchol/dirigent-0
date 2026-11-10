@@ -115,8 +115,23 @@
           );
 
           # The migrations match the schema: `openmig check` replays them into scratch servers.
-          # The chart's chlive.image is the flake's chlive's.
+          # The chart's chlive.image is the flake's chlive's. The chart renders no Secrets
+          # (control makes them), and the same each time, so a rendering can be kept in git.
           checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            chart-render =
+              pkgs.runCommand "dirigent-chart-render-check" { nativeBuildInputs = [ pkgs.kubernetes-helm ]; }
+                ''
+                  export HOME=$TMPDIR
+                  for i in 1 2; do
+                    helm template dirigent ${chart} -n dirigent -a postgresql.cnpg.io/v1 -a kubevirt.io/v1 \
+                      -f ${./nix/kube-test/values.yaml} > render$i.yaml
+                  done
+                  ! grep -n '^kind: Secret$' render1.yaml \
+                    || { echo "the chart renders a Secret (control makes them: control ensure-secrets)" >&2; exit 1; }
+                  diff render1.yaml render2.yaml \
+                    || { echo "the chart renders differently each time" >&2; exit 1; }
+                  touch $out
+                '';
             chlive-image =
               let
                 tag = "sha-${lib.substring 0 12 inputs.chlive.rev}";

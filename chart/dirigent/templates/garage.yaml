@@ -1,19 +1,7 @@
 {{- if .Values.checkpoints.garage.enabled }}
 {{- /* A single-node Garage for the checkpoints, instead of your S3: it lays itself out and makes
-the bucket with this Secret's key (`--single-node --default-bucket`). The key's id is GK and 24
-hex digits, as Garage's are; the RPC secret is a single node's, unused. */}}
-{{- $key := include "dirigent.password" (list . "dirigent-garage" "accessKey") }}
-apiVersion: v1
-kind: Secret
-metadata:
-  name: dirigent-garage
-  labels:
-    {{- include "dirigent.labels" . | nindent 4 }}
-stringData:
-  accessKey: {{ ternary $key (printf "GK%s" (trunc 24 $key)) (hasPrefix "GK" $key) | quote }}
-  secretKey: {{ include "dirigent.password" (list . "dirigent-garage" "secretKey") | quote }}
-  rpcSecret: {{ include "dirigent.password" (list . "dirigent-garage" "rpcSecret") | quote }}
----
+the bucket with the key in dirigent-garage (`--single-node --default-bucket`), which control
+makes (`control ensure-secrets --garage`); its RPC secret is a single node's, unused. */}}
 apiVersion: v1
 kind: ConfigMap
 metadata:

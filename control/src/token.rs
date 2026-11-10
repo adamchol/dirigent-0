@@ -142,10 +142,7 @@ pub fn keygen(dir: &Path) -> anyhow::Result<()> {
     crate::seal::keygen(&dir.join("link.key"))?;
     let pem = dir.join("key.pem");
     if !pem.exists() {
-        std::fs::create_dir_all(dir)?;
-        let key = SigningKey::from_bytes(&rand::random());
-        let text = key.to_pkcs8_pem(Default::default())?;
-        write_private(&pem, text.as_bytes())?;
+        write_private(&pem, new_key_pem()?.as_bytes())?;
     }
     let signer = Signer::load(&pem, "", Duration::ZERO)?;
     std::fs::write(
@@ -153,6 +150,12 @@ pub fn keygen(dir: &Path) -> anyhow::Result<()> {
         serde_json::to_string_pretty(&signer.jwks())?,
     )?;
     Ok(())
+}
+
+/// A new signing key: Ed25519, PKCS#8 PEM.
+pub fn new_key_pem() -> anyhow::Result<String> {
+    let key = SigningKey::from_bytes(&rand::random());
+    Ok(key.to_pkcs8_pem(Default::default())?.to_string())
 }
 
 /// A new file only its owner may read.

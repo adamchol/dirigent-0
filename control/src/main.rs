@@ -6,6 +6,7 @@
 //! that's lost without giving the lease back is started again once the lease expires.
 
 mod auth;
+mod bootstrap;
 mod chatgpt;
 mod leases;
 mod runner;
@@ -155,6 +156,17 @@ enum Command {
     /// Make a signing key in `dir` (`key.pem`), unless it has one, and write its public half
     /// (`jwks.json`, chlive's `jwks_file`).
     Keygen { dir: PathBuf },
+    /// Make the chart's Secrets, those that are missing, in the service account's namespace;
+    /// fill in the keys they lack, and change no value (control's first init container).
+    EnsureSecrets {
+        /// The chart's Garage's too.
+        #[arg(long)]
+        garage: bool,
+        /// Write control's signing and link keys here too (`key.pem`, `link.key`): its pod can't
+        /// mount their Secrets, which don't exist yet when its volumes are mounted.
+        #[arg(long)]
+        keys: Option<PathBuf>,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,8 +212,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli: &'static Cli = Box::leak(Box::new(Cli::parse()));
-    if let Some(Command::Keygen { dir }) = &cli.command {
-        return token::keygen(dir);
+    match &cli.command {
+        Some(Command::Keygen { dir }) => return token::keygen(dir),
+        Some(Command::EnsureSecrets { garage, keys }) => {
+            return bootstrap::ensure(*garage, keys.as_deref()).await
+        }
+        None => {}
     }
     let postgres = cli.postgres.as_deref().expect("required");
     let signing_key = cli.signing_key.as_deref().expect("required");
