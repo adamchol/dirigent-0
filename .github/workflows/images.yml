@@ -1,7 +1,7 @@
 # The chart's own images and the chart, built in nixbuild.net's store (the runner evaluates the
 # flake and gets only the archives, as its disk is too small for everything the builds need) and
-# pushed to GHCR by nix/push-images.sh: master as sha-<commit> and master, a v1.2.3 tag as 1.2.3.
-# Pull requests only build.
+# pushed to GHCR by nix/push-images.sh: master as sha-<commit> and master, a v1.2.3 tag as 1.2.3
+# (which must be Chart.yaml's version). Pull requests only build.
 name: images
 
 on:
@@ -27,6 +27,17 @@ jobs:
       BUILD_STORE: ssh-ng://eu.nixbuild.net
     steps:
       - uses: actions/checkout@v6
+      # a release's tag, v1.2.3, is its chart's version and appVersion (Chart.yaml): the chart in
+      # git at the tag then pulls the images published for it
+      - name: Check the chart's version
+        if: github.ref_type == 'tag'
+        run: |
+          want=${GITHUB_REF_NAME#v}
+          for key in version appVersion; do
+            got=$(sed -n "s/^$key: //p" chart/dirigent/Chart.yaml)
+            [ "$got" = "$want" ] \
+              || { echo "::error file=chart/dirigent/Chart.yaml::$key is $got, the tag $GITHUB_REF_NAME wants $want"; exit 1; }
+          done
       - uses: nixbuild/nix-quick-install-action@v35
         with:
           nix_conf: |

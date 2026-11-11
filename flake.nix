@@ -75,6 +75,13 @@
             } $out/wasm
           '';
           web = pkgs.callPackage ./nix/packages/web.nix { inherit chliveClient; };
+          # the chart's `version` or `appVersion` (Chart.yaml), which a release's tag is (v<it>);
+          # the images' tag here is its appVersion, which the chart pulls when images.tag is empty
+          chartVersion =
+            key:
+            lib.head (
+              builtins.match ".*\n${key}: ([^\n]+)\n.*" (builtins.readFile ./chart/dirigent/Chart.yaml)
+            );
           # the chart, with continuous-backup's vendored in (its dependency)
           chart = pkgs.runCommand "dirigent-chart" { } ''
             cp -r ${./chart/dirigent} $out
@@ -91,7 +98,7 @@
               openmig
               ;
             inherit (inputs) nixpkgs;
-            version = "0.1.0";
+            version = chartVersion "appVersion";
           };
         in
         {
@@ -118,6 +125,12 @@
           # The chart's chlive.image is the flake's chlive's. The chart renders no Secrets
           # (control makes them), and the same each time, so a rendering can be kept in git.
           checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            # one version, the chart's and its images' (a release's tag is checked against it)
+            chart-version =
+              assert lib.assertMsg (
+                chartVersion "version" == chartVersion "appVersion"
+              ) "chart/dirigent/Chart.yaml: version and appVersion differ";
+              pkgs.runCommand "dirigent-chart-version-check" { } "touch $out";
             chart-render =
               pkgs.runCommand "dirigent-chart-render-check" { nativeBuildInputs = [ pkgs.kubernetes-helm ]; }
                 ''
