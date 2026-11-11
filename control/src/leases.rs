@@ -557,6 +557,61 @@ impl Store {
         Ok(())
     }
 
+    /// A web sign-in for `subject`, until `ttl` from now (and as long again from each use): its
+    /// id, with `secret`'s SHA-256 kept for it. Their sign-ins that expired go.
+    pub async fn open_web_session(
+        &self,
+        subject: &str,
+        secret: &[u8],
+        ttl: Duration,
+    ) -> anyhow::Result<Uuid> {
+        let id = Uuid::new_v4();
+        let db = self.db.lock().await;
+        db.execute(
+            "DELETE FROM dirigent.web_sessions WHERE subject = $1 AND expires < now()",
+            &[&subject],
+        )
+        .await?;
+        db.execute(
+            "INSERT INTO dirigent.web_sessions (id, subject, secret, expires) \
+             VALUES ($1, $2, $3, now() + make_interval(secs => $4))",
+            &[&id, &subject, &sha256(secret), &ttl.as_secs_f64()],
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Who the web sign-in `id` is, if `secret` is its own and it hasn't expired: it's good for
+    /// `ttl` from now on.
+    pub async fn web_session(
+        &self,
+        id: Uuid,
+        secret: &[u8],
+        ttl: Duration,
+    ) -> anyhow::Result<Option<String>> {
+        let row = self
+            .db
+            .lock()
+            .await
+            .query_opt(
+                "UPDATE dirigent.web_sessions SET expires = now() + make_interval(secs => $3) \
+                 WHERE id = $1 AND secret = $2 AND expires > now() RETURNING subject",
+                &[&id, &sha256(secret), &ttl.as_secs_f64()],
+            )
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    /// The web sign-in `id` is over.
+    pub async fn close_web_session(&self, id: Uuid) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .await
+            .execute("DELETE FROM dirigent.web_sessions WHERE id = $1", &[&id])
+            .await?;
+        Ok(())
+    }
+
     /// `subject`'s ChatGPT link, if they linked one.
     pub async fn link(&self, subject: &str) -> anyhow::Result<Option<Link>> {
         let row = self
@@ -864,4 +919,10 @@ fn role(r: &str) -> Role {
         "owner" => Role::Owner,
         _ => Role::Viewer,
     }
+}
+
+/// What a web sign-in's secret is kept as.
+fn sha256(secret: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    sha2::Sha256::digest(secret).to_vec()
 }

@@ -68,6 +68,27 @@ impl Auth {
     }
 }
 
+impl Auth {
+    /// Who the OpenID provider's ID token in `headers` says, and only such a token's (none of
+    /// control's own): the caller of a new web sign-in.
+    pub async fn provider_caller(&self, headers: &HeaderMap) -> Result<String, String> {
+        let Some(oidc) = &self.oidc else {
+            return Err("there's no OpenID provider".into());
+        };
+        let token = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .ok_or("no bearer token")?;
+        let claimed: Map<String, Value> = jsonwebtoken::dangerous::insecure_decode_claims(token)
+            .map_err(|_| "a malformed token".to_string())?;
+        if claimed.get("iss").and_then(Value::as_str) == Some(self.signer.issuer.as_str()) {
+            return Err("a sign-in takes the OpenID provider's token, not control's".into());
+        }
+        oidc.verify(token).await
+    }
+}
+
 /// `--auth oidc`: the provider whose ID tokens humans present.
 #[derive(clap::Args, Debug, Clone, Default)]
 pub struct OidcArgs {

@@ -64,10 +64,10 @@ export interface Model {
   display_name: string;
 }
 
-/** Who calls: a subject; signed in, with the ID token that says so. */
+/** Who calls: a subject; signed in, with the token of their sign-in (control's, for it and chlive). */
 export interface Who {
   user: string;
-  idToken?: string;
+  token?: string;
 }
 
 export async function auth(): Promise<Auth> {
@@ -76,9 +76,9 @@ export async function auth(): Promise<Auth> {
   return res.json();
 }
 
-/** A chlive credential: the ID token, signed in; else, in `declared` auth, one control signs. */
+/** A chlive credential: the sign-in's token, signed in; else, in `declared` auth, one control signs. */
 export async function token(who: Who): Promise<string> {
-  if (who.idToken) return who.idToken;
+  if (who.token) return who.token;
   return (await (await call(who, "POST", "/token")).json()).token;
 }
 
@@ -97,8 +97,8 @@ export function provider(s: SessionInfo): Provider {
 }
 
 async function call(who: Who, method: string, path: string, body?: unknown): Promise<Response> {
-  const headers: Record<string, string> = who.idToken
-    ? { authorization: `Bearer ${who.idToken}` }
+  const headers: Record<string, string> = who.token
+    ? { authorization: `Bearer ${who.token}` }
     : { "dirigent-user": who.user };
   if (body !== undefined) headers["content-type"] = "application/json";
   const res = await fetch(`/api${path}`, {

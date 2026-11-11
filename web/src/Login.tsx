@@ -1,7 +1,8 @@
-// Signing in with Google, in control's `oidc` auth: Google Identity Services' button gives an
-// ID token (a JWT, good for about an hour), which goes to control as a bearer token and to
-// chlive as the credential. Shortly before it expires, Google is asked again, silently for a
-// user who signed in before; if that fails, the button comes back.
+// Signing in, in control's `oidc` auth: Google Identity Services' button gives an ID token,
+// which control trades once for a sign-in of its own (control/src/signin.rs), kept in an
+// `HttpOnly` cookie the page can't read. From that, control gives tokens of its own (good for
+// minutes), which go to control as bearer tokens and to chlive as the credential; a new one is
+// asked for before each expires. A page loaded again keeps the sign-in; signing out ends it.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
@@ -9,7 +10,7 @@ import type { Who } from "./api.ts";
 
 const GSI = "https://accounts.google.com/gsi/client";
 /** A new token is asked for this long before the one in hand expires. */
-const RENEW_BEFORE_MS = 5 * 60_000;
+const RENEW_BEFORE_MS = 60_000;
 
 interface Credential {
   credential: string;
@@ -64,20 +65,57 @@ function claims(token: string): { email?: string; exp?: number } {
   }
 }
 
-/** Who signed in with Google (`client_id` the web's), once they have; and the element for the
- * sign-in button, shown until then. */
+/** A sign-in's answer: who, and control's token for its API and chlive. */
+interface SignedIn {
+  subject: string;
+  token: string;
+}
+
+/** Control's sign-in: opened with Google's ID token, or (none) renewed from its cookie; none if
+ * there's none to renew. */
+async function signIn(idToken?: string): Promise<SignedIn | null> {
+  const res = await fetch(idToken ? "/api/session" : "/api/session/token", {
+    method: "POST",
+    headers: idToken ? { authorization: `Bearer ${idToken}` } : {},
+  });
+  if (res.status === 401 && !idToken) return null;
+  if (!res.ok) throw new Error(`${res.status}: ${(await res.text()) || res.statusText}`);
+  return res.json();
+}
+
+/** Who signed in (`client_id` the web's Google client), once they have: by the sign-in their
+ * cookie holds, or with Google's button, shown (`button`) when there's none; `checking` until
+ * that's known. */
 export function useGoogle(clientId: string): {
   who: Who | null;
+  checking: boolean;
   button: React.RefObject<HTMLDivElement | null>;
   error: string;
   signOut: () => void;
 } {
-  const [token, setToken] = useState<string | null>(null);
+  const [signedIn, setSignedIn] = useState<SignedIn | null>(null);
+  const [checking, setChecking] = useState(true);
   const [error, setError] = useState("");
   const button = useRef<HTMLDivElement | null>(null);
   const id = useRef<Gsi | null>(null);
 
+  // the sign-in there is; else Google's button
   useEffect(() => {
+    let gone = false;
+    signIn()
+      .catch(() => null)
+      .then((s) => {
+        if (gone) return;
+        setSignedIn(s);
+        setChecking(false);
+      });
+    return () => {
+      gone = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (checking || signedIn) return;
     let gone = false;
     gsi().then(
       (g) => {
@@ -85,7 +123,8 @@ export function useGoogle(clientId: string): {
         id.current = g;
         g.initialize({
           client_id: clientId,
-          callback: (r) => setToken(r.credential),
+          callback: (r) =>
+            signIn(r.credential).then(setSignedIn, (e) => setError(`Not signed in: ${(e as Error).message}`)),
           auto_select: true,
           use_fedcm_for_prompt: true,
         });
@@ -97,35 +136,29 @@ export function useGoogle(clientId: string): {
     return () => {
       gone = true;
     };
-  }, [clientId]);
+  }, [clientId, checking, signedIn]);
 
-  // renew it before it expires; expired, it's gone
+  // a new token before this one expires; the sign-in over, so is this
   useEffect(() => {
-    if (!token) {
-      if (button.current && id.current) id.current.renderButton(button.current, buttonStyle());
-      return;
-    }
-    const exp = (claims(token).exp ?? 0) * 1000;
-    const renew = setTimeout(() => id.current?.prompt(), Math.max(0, exp - Date.now() - RENEW_BEFORE_MS));
-    const expire = setTimeout(() => setToken(null), Math.max(0, exp - Date.now()));
-    return () => {
-      clearTimeout(renew);
-      clearTimeout(expire);
-    };
-  }, [token]);
+    if (!signedIn) return;
+    const exp = (claims(signedIn.token).exp ?? 0) * 1000;
+    const renew = setTimeout(
+      () => signIn().then(setSignedIn, () => setSignedIn(null)),
+      Math.max(0, exp - Date.now() - RENEW_BEFORE_MS),
+    );
+    return () => clearTimeout(renew);
+  }, [signedIn]);
 
-  // the same while the token is
-  const who = useMemo(() => {
-    const email = token ? claims(token).email : undefined;
-    return token && email ? { user: `user:${email}`, idToken: token } : null;
-  }, [token]);
+  // the same while the sign-in is
+  const who = useMemo(() => (signedIn ? { user: signedIn.subject, token: signedIn.token } : null), [signedIn]);
   return {
     who,
+    checking,
     button,
     error,
     signOut: () => {
       id.current?.disableAutoSelect();
-      setToken(null);
+      fetch("/api/session", { method: "DELETE" }).finally(() => setSignedIn(null));
     },
   };
 }

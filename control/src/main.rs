@@ -13,6 +13,7 @@ mod prune;
 mod runner;
 mod seal;
 mod secrets;
+mod signin;
 mod token;
 
 use std::collections::HashMap;
@@ -151,6 +152,10 @@ struct Cli {
     #[arg(long, default_value_t = 600)]
     token_ttl: u64,
 
+    /// How long a web sign-in lasts unused, in days (each use starts it again).
+    #[arg(long, env = "DIRIGENT_SESSION_DAYS", default_value_t = 30)]
+    session_days: u64,
+
     /// More arguments for each player (e.g. `-- --mock`).
     #[arg(last = true)]
     player_args: Vec<String>,
@@ -200,6 +205,8 @@ struct Control {
     /// finds the connection or drops a lease no one is connected for.
     attached: Mutex<HashMap<Uuid, Attached>>,
     connections: AtomicU64,
+    /// How long a web sign-in lasts unused (`--session-days`).
+    sign_in_ttl: Duration,
 }
 
 struct Attached {
@@ -275,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
         pruner,
         Duration::from_secs(cli.startup),
         cli.reserved_only,
+        Duration::from_secs(cli.session_days * 86400),
     );
     tokio::spawn(sweep(control));
     if let Some(pruner) = pruner {
@@ -314,6 +322,7 @@ fn control(
     pruner: Option<&'static Pruner>,
     startup: Duration,
     reserved_only: bool,
+    sign_in_ttl: Duration,
 ) -> &'static Control {
     Box::leak(Box::new(Control {
         store,
@@ -327,6 +336,7 @@ fn control(
         reserved_only,
         attached: Default::default(),
         connections: AtomicU64::new(0),
+        sign_in_ttl,
     }))
 }
 
@@ -365,6 +375,8 @@ fn router(control: &'static Control) -> Router {
         .route("/links/chatgpt/start", post(start_link))
         .route("/links/chatgpt/finish", post(finish_link))
         .route("/links/chatgpt/models", get(chatgpt_models))
+        .route("/session", post(open_sign_in).delete(close_sign_in))
+        .route("/session/token", post(sign_in_token))
         .route("/token", post(chlive_token))
         .route("/.well-known/jwks.json", get(jwks))
         .with_state(control)
@@ -506,6 +518,110 @@ async fn chlive_token(
     }
     let token = control.auth.signer.sign(&caller, &[CHLIVE], None);
     Ok(Json(serde_json::json!({ "token": token })))
+}
+
+/// A web sign-in's answer: who it is, and a token of control's for its API and chlive.
+fn signed_in(subject: String, control: &Control, cookie: String) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let token = control.auth.signer.sign(&subject, &[CONTROL, CHLIVE], None);
+    (
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Json(serde_json::json!({ "subject": subject, "token": token })),
+    )
+        .into_response()
+}
+
+fn no_sign_in(why: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::UNAUTHORIZED,
+        [(axum::http::header::SET_COOKIE, signin::clear_cookie())],
+        why.to_string(),
+    )
+        .into_response()
+}
+
+fn cookies(headers: &axum::http::HeaderMap) -> &str {
+    headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
+/// Sign in on the web (`oidc` auth), with the OpenID provider's ID token: a sign-in of
+/// control's, held in a cookie (`signin`), and a first token.
+async fn open_sign_in(
+    State(control): State<&'static Control>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, Failed> {
+    if control.auth.oidc.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "there are no sign-ins in declared auth".into(),
+        ));
+    }
+    let subject = control
+        .auth
+        .provider_caller(&headers)
+        .await
+        .map_err(|why| (StatusCode::UNAUTHORIZED, why))?;
+    let secret = signin::secret();
+    let id = control
+        .store
+        .open_web_session(&subject, &secret, control.sign_in_ttl)
+        .await
+        .map_err(|e| failed("opening a sign-in", e))?;
+    info!(subject, "signed in");
+    let cookie = signin::set_cookie(id, &secret, control.sign_in_ttl.as_secs());
+    Ok(signed_in(subject, control, cookie))
+}
+
+/// A fresh token for the web sign-in in the cookie, which lasts as long again from now.
+async fn sign_in_token(
+    State(control): State<&'static Control>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, Failed> {
+    if control.auth.oidc.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "there are no sign-ins in declared auth".into(),
+        ));
+    }
+    let Some((id, secret, value)) = signin::from_cookies(cookies(&headers)) else {
+        return Ok(no_sign_in("not signed in"));
+    };
+    match control
+        .store
+        .web_session(id, &secret, control.sign_in_ttl)
+        .await
+    {
+        Ok(Some(subject)) => {
+            let cookie = signin::renew_cookie(value, control.sign_in_ttl.as_secs());
+            Ok(signed_in(subject, control, cookie))
+        }
+        Ok(None) => Ok(no_sign_in("the sign-in is over")),
+        Err(e) => Err(failed("reading a sign-in", e)),
+    }
+}
+
+/// Sign out: the sign-in in the cookie is over.
+async fn close_sign_in(
+    State(control): State<&'static Control>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, Failed> {
+    use axum::response::IntoResponse;
+    if let Some((id, _, _)) = signin::from_cookies(cookies(&headers)) {
+        control
+            .store
+            .close_web_session(id)
+            .await
+            .map_err(|e| failed("ending a sign-in", e))?;
+    }
+    Ok((
+        StatusCode::NO_CONTENT,
+        [(axum::http::header::SET_COOKIE, signin::clear_cookie())],
+    )
+        .into_response())
 }
 
 /// Control's public key, which its credentials are verified with.
@@ -1664,6 +1780,7 @@ mod e2e {
             pruner,
             Duration::from_secs(1),
             reserved_only,
+            Duration::from_secs(3600),
         );
         tokio::spawn(sweep(control));
         if let Some(pruner) = pruner {
@@ -2395,6 +2512,128 @@ mod e2e {
         reqwest::Client::new()
             .request(method, format!("http://{base}{path}"))
             .bearer_auth(token)
+    }
+
+    /// The sign-in cookie's value in an answer's `Set-Cookie` (empty when it's cleared).
+    fn sign_in_cookie(res: &reqwest::Response) -> String {
+        let set = res.headers()[reqwest::header::SET_COOKIE].to_str().unwrap();
+        let value = set.split(';').next().unwrap().split_once('=').unwrap().1;
+        value.to_string()
+    }
+
+    #[tokio::test]
+    async fn e2e_a_web_sign_in_gives_tokens_until_it_ends() {
+        use auth::test_provider::Provider;
+        let provider = Provider::new();
+        let oidc = auth::Oidc::start(&provider.args()).await.unwrap();
+        let runner = recorder(false);
+        let Some(base) = start_full(
+            Some(oidc),
+            Duration::from_secs(600),
+            false,
+            None,
+            None,
+            |_| runner,
+        )
+        .await
+        else {
+            return;
+        };
+        let http = reqwest::Client::new();
+        let refresh = |cookie: &str| {
+            http.post(format!("http://{base}/session/token"))
+                .header(
+                    reqwest::header::COOKIE,
+                    format!("{}={cookie}", signin::COOKIE),
+                )
+                .send()
+        };
+        let opened = bearer(
+            &provider.id_token("me@x.com"),
+            reqwest::Method::POST,
+            &base,
+            "/session",
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(opened.status(), reqwest::StatusCode::OK);
+        let cookie = sign_in_cookie(&opened);
+        let body: serde_json::Value = opened.json().await.unwrap();
+        assert_eq!(body["subject"], "user:me@x.com");
+
+        // its tokens are control's, for its API and chlive
+        let again = refresh(&cookie).await.unwrap();
+        assert_eq!(again.status(), reqwest::StatusCode::OK);
+        assert_eq!(sign_in_cookie(&again), cookie);
+        let token = again.json::<serde_json::Value>().await.unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let minted = claims(&token);
+        assert_eq!(
+            (minted.sub.as_str(), minted.aud.clone()),
+            (
+                "user:me@x.com",
+                vec![CONTROL.to_string(), CHLIVE.to_string()]
+            )
+        );
+        let listed = bearer(&token, reqwest::Method::GET, &base, "/sessions")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), reqwest::StatusCode::OK);
+        // which make no sign-ins of their own
+        let by_minted = bearer(&token, reqwest::Method::POST, &base, "/session")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(by_minted.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // a wrong secret is no sign-in, nor is one expired
+        let (id, _) = cookie.split_once('.').unwrap();
+        let wrong = format!("{id}.{}", "A".repeat(43));
+        let res = refresh(&wrong).await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(sign_in_cookie(&res), "");
+        let pg = std::env::var("DIRIGENT_CONTROL_POSTGRES").unwrap();
+        let (db, conn) = tokio_postgres::connect(&pg, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let id = Uuid::parse_str(id).unwrap();
+        let expire = |at: &'static str| {
+            let sql = format!("UPDATE dirigent.web_sessions SET expires = {at} WHERE id = $1");
+            let db = &db;
+            async move { db.execute(&sql, &[&id]).await.unwrap() }
+        };
+        expire("now() - interval '1 second'").await;
+        assert_eq!(
+            refresh(&cookie).await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        expire("now() + interval '1 hour'").await;
+        assert_eq!(
+            refresh(&cookie).await.unwrap().status(),
+            reqwest::StatusCode::OK
+        );
+
+        // signed out, it's over
+        let out = http
+            .delete(format!("http://{base}/session"))
+            .header(
+                reqwest::header::COOKIE,
+                format!("{}={cookie}", signin::COOKIE),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(out.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(sign_in_cookie(&out), "");
+        assert_eq!(
+            refresh(&cookie).await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

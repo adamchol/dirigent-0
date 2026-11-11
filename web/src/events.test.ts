@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { callStart, contextSize, streamed, timeline, titles, type EventRow } from "./events.ts";
+import { callStart, contextSize, startup, streamed, timeline, titles, type EventRow } from "./events.ts";
 
 let offset = 0;
 function row(id: string, kind: string, data?: unknown, author = "player:p"): EventRow {
@@ -206,4 +206,37 @@ test("a dirigent's request for a secret is a card its answer settles; a refused 
   expect(notes).toEqual(["provided: GITHUB_TOKEN", "secrets: GITHUB_TOKEN, NPM_TOKEN"]);
   // not a tool step
   expect(t.items.some((i) => i.t === "tool")).toBe(false);
+});
+
+test("a starting session waits on its machine, its workspace, then the turn", () => {
+  const asked = [row("m", "user_message", { text: "go" }, "user:dev")];
+  // control holds the lease for epoch 2's player, which hasn't attached
+  expect(startup(asked, 2)?.phase).toBe("machine");
+  const attached = [...asked, row("a", "player_attached", { epoch: 2 })];
+  expect(startup(attached, 2)?.phase).toBe("workspace");
+  expect(startup(attached, 2, "o/r")?.label).toBe("Cloning o/r…");
+  expect(startup(attached, 2)?.label).toBe("Preparing the workspace…");
+  const ready = [...attached, row("w", "workspace_ready", {})];
+  expect(startup(ready, 2)?.phase).toBe("turn");
+  // the turn takes it: the timeline's own "Working…" from there
+  expect(startup([...ready, row("t", "turn_started", { input: "m" })], 2)).toBeNull();
+  // idle, it waits on nothing
+  expect(startup(ready, null)).toBeNull();
+});
+
+test("a session with a checkpoint restores its workspace, and an earlier player's is no one's", () => {
+  const log = [
+    row("a1", "player_attached", { epoch: 1 }),
+    row("w1", "workspace_ready", {}),
+    row("m", "user_message", { text: "go" }, "user:dev"),
+    row("t", "turn_started", { input: "m" }),
+    row("e", "turn_ended", { reason: "completed" }),
+    row("c", "checkpoint", { turn: "t", snapshot: "k" }),
+    row("d", "player_detached", { epoch: 1 }),
+  ];
+  expect(startup(log, 2)?.phase).toBe("machine");
+  const back = [...log, row("a2", "player_attached", { epoch: 2 })];
+  expect(startup(back, 2)?.label).toBe("Restoring the workspace from its checkpoint…");
+  // nothing queued once it's restored: waiting for a message, not starting
+  expect(startup([...back, row("r", "workspace_restored", { snapshot: "k" })], 2)).toBeNull();
 });

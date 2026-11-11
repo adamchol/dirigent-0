@@ -248,6 +248,31 @@ table "dirigent.session_secrets" {
   }
 }
 
+# The web's sign-ins: a user who signed in (with Google) holds a session's secret in a cookie,
+# which control mints its own short-lived tokens from until `expires` (pushed on as it's used);
+# `secret` is its SHA-256. Signing out deletes it.
+table "dirigent.web_sessions" {
+  column "id" { type = uuid }
+  column "subject" {
+    type = text
+    null = false
+  }
+  column "secret" {
+    type = bytea
+    null = false
+  }
+  column "created" {
+    type    = timestamptz
+    null    = false
+    default = sql("now()")
+  }
+  column "expires" {
+    type = timestamptz
+    null = false
+  }
+  primary_key { columns = [column.id] }
+}
+
 publication "dirigent_chlive" {
   tables = [table.dirigent.session_access, table.dirigent.insert_kinds]
 }
@@ -257,6 +282,7 @@ grant {
   on = [
     table.dirigent.sessions, table.dirigent.session_access, table.dirigent.chatgpt_links,
     table.dirigent.api_keys, table.dirigent.user_secrets, table.dirigent.session_secrets,
+    table.dirigent.web_sessions,
   ]
   to         = [role.dirigent_control]
 }

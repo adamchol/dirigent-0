@@ -26,11 +26,22 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "./api.ts";
 import type { SessionInfo } from "./api.ts";
-import { callStart, contextSize, DELTAS_QUERY, LOG_QUERY, streamed, timeline, type DeltaRow, type EventRow } from "./events.ts";
+import {
+  callStart,
+  contextSize,
+  DELTAS_QUERY,
+  LOG_QUERY,
+  startup,
+  streamed,
+  timeline,
+  type DeltaRow,
+  type EventRow,
+  type Phase,
+} from "./events.ts";
 import { linked } from "./Link.tsx";
 import { useTitles } from "./Rename.tsx";
 import { ProvideDialog, type Request } from "./Secrets.tsx";
-import { Timeline } from "./Timeline.tsx";
+import { Startup, Timeline } from "./Timeline.tsx";
 
 /** What the status bar shows of the session open. */
 export interface LiveStatus {
@@ -39,6 +50,8 @@ export interface LiveStatus {
   error?: string;
   /** A turn is running. */
   running: boolean;
+  /** What it waits on before its turn, while it starts. */
+  startup?: Phase;
   /** The model's context at its last call, in tokens. */
   context: number;
 }
@@ -73,11 +86,23 @@ export function Session(props: {
   });
   const writing = useMemo(() => (openTurn !== undefined ? streamed(deltas.rows) : []), [deltas.rows, openTurn]);
 
+  // what it waits on before its turn: its machine, its workspace, the turn's start
+  const git = props.info?.spec.source?.git;
+  const holder = props.info?.player ? props.info.epoch : null;
+  const waiting = useMemo(() => startup(log.rows, holder, git ? api.repo(git.url) : undefined), [log.rows, holder, git]);
+  // since when: when the log says, or, earlier, when it was seen here (the log doesn't say for
+  // the machine, and a log's time can be off)
+  const seen = useRef<{ key: string; at: number } | null>(null);
+  const key = waiting ? `${holder}/${waiting.phase}` : "";
+  if (waiting && seen.current?.key !== key) seen.current = { key, at: Date.now() };
+  const since = waiting ? Math.min(waiting.since ?? Infinity, seen.current!.at) : undefined;
+
   const { report } = props;
   const running = openTurn !== undefined;
+  const phase = waiting?.phase;
   useEffect(() => {
-    report({ log: log.status, error: log.error?.message, running, context });
-  }, [report, log.status, log.error?.message, running, context]);
+    report({ log: log.status, error: log.error?.message, running, context, startup: phase });
+  }, [report, log.status, log.error?.message, running, context, phase]);
 
   // what's there when the log first comes in isn't animated in
   const first = useRef<Set<string> | null>(null);
@@ -191,6 +216,7 @@ export function Session(props: {
                   answer={owner ? answer : undefined}
                 />
               )}
+              {log.status !== "loading" && log.status !== "error" && waiting && <Startup label={waiting.label} since={since} />}
             </MessageScrollerContent>
           </MessageScrollerViewport>
           <MessageScrollerButton />

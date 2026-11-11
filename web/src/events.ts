@@ -303,6 +303,71 @@ export function timeline(rows: readonly EventRow[]): Timeline {
   return { items, openTurn };
 }
 
+/** What a starting session waits on before its turn: its machine (the player's VM, until it
+ * attaches), its workspace (made, cloned or restored), or the turn to start for what's queued. */
+export type Phase = "machine" | "workspace" | "turn";
+
+export interface Startup {
+  phase: Phase;
+  label: string;
+  /** Since when, as the log says, in milliseconds since the Unix epoch; for `machine`, it doesn't. */
+  since?: number;
+}
+
+/** What the session waits on, as its log `rows` say, for the player of `epoch` that holds it
+ * (none, the session's idle: it waits on nothing); `repo`, what its workspace is cloned from. */
+export function startup(rows: readonly EventRow[], epoch: number | null, repo?: string): Startup | null {
+  if (epoch === null) return null;
+  let attached: number | undefined;
+  let workspace: number | undefined;
+  let checkpoint = false;
+  let open = false;
+  const queued = new Map<string, number>();
+  for (const row of rows) {
+    const e = parse(row);
+    const at = millis(row.ts);
+    switch (e.kind) {
+      case "player_attached":
+        // only the holder's: an earlier player's workspace isn't this one's
+        attached = e.data.epoch === epoch ? at : undefined;
+        workspace = undefined;
+        break;
+      case "workspace_ready":
+      case "workspace_restored":
+        workspace = at;
+        break;
+      case "checkpoint":
+        checkpoint = true;
+        break;
+      case "user_message":
+      case "session_update":
+        queued.set(row.id, at);
+        break;
+      case "turn_started":
+        open = true;
+        queued.delete(e.data.input);
+        break;
+      case "steered":
+        queued.delete(e.data.input);
+        break;
+      case "turn_ended":
+        open = false;
+        break;
+    }
+  }
+  if (attached === undefined) return { phase: "machine", label: "Starting a machine…" };
+  if (workspace === undefined) {
+    const label = checkpoint
+      ? "Restoring the workspace from its checkpoint…"
+      : repo
+        ? `Cloning ${repo}…`
+        : "Preparing the workspace…";
+    return { phase: "workspace", label, since: attached };
+  }
+  if (open || queued.size === 0) return null;
+  return { phase: "turn", label: "Starting the turn…", since: Math.max(workspace, Math.min(...queued.values())) };
+}
+
 function taken(users: Map<string, { queued: boolean }>, input: string) {
   const u = users.get(input);
   if (u) u.queued = false;

@@ -2,7 +2,7 @@
 // text as Markdown, its thinking and tool calls as a trace, turns and the player's doings as
 // markers. Entries arriving after the first render come in with a short animation.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion } from "motion/react";
 import {
   BanIcon,
@@ -121,6 +121,35 @@ export function Timeline(props: {
         </MessageScrollerItem>
       )}
     </>
+  );
+}
+
+/** What a starting session waits on (`events.startup`), with how long it has. */
+export function Startup(props: { label: string; since?: number }) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const tick = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(tick);
+  }, []);
+  const secs = props.since === undefined ? undefined : Math.max(0, Math.floor((now - props.since) / 1000));
+  return (
+    <MessageScrollerItem key="startup">
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.15 }}>
+        <Trace>
+          <TraceLine status="running">
+            <TraceIcon>
+              <Spinner />
+            </TraceIcon>
+            <TraceTitle>{props.label}</TraceTitle>
+            {secs !== undefined && (
+              <TraceDescription className="tabular-nums">
+                {Math.floor(secs / 60)}:{String(secs % 60).padStart(2, "0")}
+              </TraceDescription>
+            )}
+          </TraceLine>
+        </Trace>
+      </motion.div>
+    </MessageScrollerItem>
   );
 }
 

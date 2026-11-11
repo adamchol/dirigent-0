@@ -150,6 +150,12 @@ function Declared() {
 /** `oidc` auth: whoever signed in with Google. */
 function SignedIn(props: { clientId: string }) {
   const google = useGoogle(props.clientId);
+  if (google.checking)
+    return (
+      <Centered>
+        <Spinner className="size-5 text-muted-foreground" />
+      </Centered>
+    );
   if (!google.who)
     return (
       <Centered>
@@ -352,6 +358,9 @@ function SessionTitle({ info, selected }: { info?: SessionInfo; selected: string
 }
 
 /** What's known of the session open: chlive's connection, its player, the turn, the model. */
+/** What a starting session waits on, in the status bar. */
+const STARTING = { machine: "Starting", workspace: "Workspace", turn: "Starting turn" } as const;
+
 function StatusBar({ info, status }: { info?: SessionInfo; status: LiveStatus | null }) {
   const live = !status
     ? null
@@ -379,6 +388,7 @@ function StatusBar({ info, status }: { info?: SessionInfo; status: LiveStatus | 
           <span>Idle</span>
         ))}
       {status?.running && <span className="text-primary-text">Working</span>}
+      {status?.startup && !status.running && <span className="text-primary-text">{STARTING[status.startup]}</span>}
       <span className="flex-1" />
       {info && (
         <span className="hidden sm:inline">
