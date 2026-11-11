@@ -63,6 +63,8 @@
             buildInputs = old.buildInputs ++ [ pkgs.openssl ];
           });
           dirigent = pkgs.callPackage ./nix/packages/dirigent.nix { };
+          # the CLI alone, for its users (`nix run github:adamchol/dirigent-0#cli -- login …`)
+          cli = pkgs.callPackage ./nix/packages/cli.nix { };
           # chlive's TS client, as the web UI takes it (web/chlive-client): its src/, and wasm/, its
           # WebAssembly core
           chliveClient = pkgs.runCommand "chlive-client" { } ''
@@ -105,7 +107,12 @@
           formatter = pkgs.nixfmt;
 
           packages = {
-            inherit dirigent web chart;
+            inherit
+              dirigent
+              cli
+              web
+              chart
+              ;
             default = dirigent;
             # the dev shell's `push-images`, without the shell (CI's)
             push-images = pkgs.writeShellApplication {
