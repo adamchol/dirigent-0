@@ -37,6 +37,7 @@ import {
   type DeltaRow,
   type EventRow,
   type Phase,
+  type Shown,
 } from "./events.ts";
 import { linked } from "./Link.tsx";
 import { useTitles } from "./Rename.tsx";
@@ -70,11 +71,13 @@ export function Session(props: {
   /** The user, and the ChatGPT plan they linked; and how they link it again. */
   me: api.Me | null;
   connect: () => void;
+  /** How much of the log the chat shows (the user's setting). */
+  shown: Shown;
 }) {
   // only its owner writes to it; chlive shows anyone else without access an empty log
   const owner = props.info?.role === "owner";
   const log = useLiveQuery<EventRow & Record<string, unknown>>(LOG_QUERY, { params: { session: props.id } });
-  const { items, openTurn } = useMemo(() => timeline(log.rows), [log.rows]);
+  const { items, openTurn } = useMemo(() => timeline(log.rows, props.shown), [log.rows, props.shown]);
   const context = useMemo(() => contextSize(log.rows), [log.rows]);
   // the user's own messages, shown before chlive has them
   const sending = useMemo(() => new Set([...(log.pending ?? [])].map((r) => r.id)), [log.pending]);
@@ -120,16 +123,29 @@ export function Session(props: {
         kind,
         data: JSON.stringify(data),
       });
+      return true;
     } catch (e) {
       toast.error("Not sent", { description: (e as Error).message });
+      return false;
+    }
+  }
+
+  // a message is for a turn: an idle session is started for it, as a dirigent's send_message does
+  async function send(text: string) {
+    if (!(await write("user_message", { text })) || props.info?.player) return;
+    try {
+      await api.start(props.who, props.id);
+    } catch (e) {
+      toast.error("Not started", { description: (e as Error).message });
     }
   }
 
   // a dirigent's request for a secret: provided through control, then answered in the log
   const [providing, setProviding] = useState<Request | null>(null);
   const titles = useTitles();
-  const answered = (r: Request, provided: boolean) =>
-    write("secret_answered", { session: r.session, name: r.name, provided, call: r.key });
+  const answered = async (r: Request, provided: boolean) => {
+    await write("secret_answered", { session: r.session, name: r.name, provided, call: r.key });
+  };
   const answer = (r: Request, provided: boolean) => (provided ? setProviding(r) : answered(r, false));
 
   return (
@@ -226,7 +242,7 @@ export function Session(props: {
       <Composer
         closed={!owner ? "Only the session's owner writes to it" : props.info?.archived ? "Archived: unarchive it to write to it" : null}
         running={running}
-        send={(text) => write("user_message", { text })}
+        send={send}
         interrupt={() => openTurn && write("user_interrupt", { turn: openTurn })}
       />
       <ProvideDialog

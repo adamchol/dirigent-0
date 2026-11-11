@@ -131,18 +131,31 @@ export function parse(row: EventRow): Event {
   return { kind: row.kind, data: row.data ? JSON.parse(row.data) : undefined } as Event;
 }
 
-/** The log's rows, in order, as a timeline. */
-export function timeline(rows: readonly EventRow[]): Timeline {
+/** How much of the log the chat shows (the user's setting): the `conversation` alone (messages,
+ * replies, tools, turns, errors); its `activity` too, the player's own doings; or `all` its events,
+ * each with its JSON. */
+export type Shown = "conversation" | "activity" | "all";
+
+/** Events shown as their own items, not notes: under `all`, each gets a note of its own too. */
+const ITEMS = new Set(["user_message", "session_update", "turn_started", "steered", "user_interrupt", "assistant_message", "tool_result", "turn_ended"]);
+
+/** The log's rows, in order, as a timeline, `shown` as much of it as the user wants. */
+export function timeline(rows: readonly EventRow[], shown: Shown = "activity"): Timeline {
   const items: Item[] = [];
   const users = new Map<string, { queued: boolean }>();
   const tools = new Map<string, Extract<Item, { t: "tool" }>>();
   const requests = new Map<string, Extract<Item, { t: "request" }>>();
   let openTurn: string | undefined;
   let usage = NO_USAGE;
-  const note = (row: EventRow, tone: "dim" | "error", text: string, detail?: string) =>
+  const note = (row: EventRow, tone: "dim" | "error", text: string, detail?: string) => {
+    if (tone === "dim" && shown === "conversation") return;
+    if (shown === "all") detail = [detail, raw(row)].filter(Boolean).join("\n\n");
     items.push({ t: "note", key: row.id, kind: row.kind, tone, text, detail });
+  };
 
   for (const row of rows) {
+    if (shown === "all" && ITEMS.has(row.kind))
+      items.push({ t: "note", key: `${row.id}:event`, kind: row.kind, tone: "dim", text: `${row.kind} · ${subject(row.author)}`, detail: raw(row) });
     let e: Event;
     try {
       e = parse(row);
@@ -521,4 +534,15 @@ export function contextSize(rows: readonly EventRow[]): number {
     }
   }
   return 0;
+}
+
+/** A row as `all` shows it: when, by whom, and its data as indented JSON. */
+function raw(row: EventRow): string {
+  let data = row.data;
+  try {
+    data = row.data ? JSON.stringify(JSON.parse(row.data), null, 2) : "";
+  } catch {
+    // shown as it came
+  }
+  return [`${row.kind} at ${String(row.ts)} by ${row.author}`, data].filter(Boolean).join("\n");
 }

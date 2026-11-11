@@ -240,3 +240,39 @@ test("a session with a checkpoint restores its workspace, and an earlier player'
   // nothing queued once it's restored: waiting for a message, not starting
   expect(startup([...back, row("r", "workspace_restored", { snapshot: "k" })], 2)).toBeNull();
 });
+
+test("the chat shows the conversation alone, its activity too, or all its events", () => {
+  const rows = [
+    row("p", "player_attached", { epoch: 1 }),
+    row("m", "user_message", { text: "hi" }, "user:dev"),
+    row("t", "turn_started", { input: "m" }),
+    row("a", "assistant_message", { content: [{ type: "text", text: "hello" }], stop_reason: { reason: "end_turn" }, usage: usage(1, 1) }),
+    row("e", "turn_ended", { reason: "completed" }),
+    row("k", "checkpoint", { turn: "t", snapshot: "abcdef0123456789" }),
+    row("f", "checkpoint_failed", { error: "no S3" }),
+  ];
+  const kinds = (shown: Parameters<typeof timeline>[1]) => timeline(rows, shown).items.map((i) => (i.t === "note" ? `note:${i.kind}` : i.t));
+  // errors stay in the conversation; the player's doings don't
+  expect(kinds("conversation")).toEqual(["user", "text", "turn", "note:checkpoint_failed"]);
+  expect(kinds("activity")).toEqual(["note:player_attached", "user", "text", "turn", "note:checkpoint", "note:checkpoint_failed"]);
+  expect(kinds(undefined)).toEqual(kinds("activity"));
+  // every event, each with its JSON
+  const all = timeline(rows, "all").items;
+  expect(all.map((i) => (i.t === "note" ? `note:${i.kind}` : i.t))).toEqual([
+    "note:player_attached",
+    "note:user_message",
+    "user",
+    "note:turn_started",
+    "note:assistant_message",
+    "text",
+    "note:turn_ended",
+    "turn",
+    "note:checkpoint",
+    "note:checkpoint_failed",
+  ]);
+  const started = all.find((i) => i.t === "note" && i.kind === "turn_started");
+  expect(started).toMatchObject({ text: "turn_started · player:p" });
+  expect(started?.t === "note" && started.detail).toContain('"input": "m"');
+  const cp = all.find((i) => i.t === "note" && i.kind === "checkpoint");
+  expect(cp?.t === "note" && cp.detail).toContain("checkpoint at 2026-11-03 12:00:00.000 by player:p");
+});

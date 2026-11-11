@@ -14,6 +14,7 @@ mod prune;
 mod runner;
 mod seal;
 mod secrets;
+mod settings;
 mod signin;
 mod token;
 
@@ -390,6 +391,7 @@ fn router(control: &'static Control) -> Router {
         .route("/links/github/start", post(start_github))
         .route("/links/github/callback", get(github_callback))
         .route("/github/access", get(github_access))
+        .route("/settings", get(get_settings).put(put_settings))
         .route("/session", post(open_sign_in).delete(close_sign_in))
         .route("/session/token", post(sign_in_token))
         .route("/token", post(chlive_token))
@@ -700,6 +702,37 @@ async fn github_access(
         "why": why,
         "app": github.has_app(),
     })))
+}
+
+/// The caller's settings, defaults for those they haven't set.
+async fn get_settings(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+) -> Result<Json<settings::Settings>, Failed> {
+    let kept = control
+        .store
+        .settings(&caller)
+        .await
+        .map_err(|e| failed("reading the settings", e))?;
+    Ok(Json(kept.map(settings::Settings::kept).unwrap_or_default()))
+}
+
+/// The caller's settings are these now (all of them: those left out are back to their
+/// defaults); what's unknown or wrong is refused.
+async fn put_settings(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    body: axum::body::Bytes,
+) -> Result<Json<settings::Settings>, Failed> {
+    let given: settings::Settings = serde_json::from_slice(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("not settings: {e}")))?;
+    let value = serde_json::to_value(&given).expect("settings are JSON");
+    control
+        .store
+        .put_settings(&caller, &value)
+        .await
+        .map_err(|e| failed("keeping the settings", e))?;
+    Ok(Json(given))
 }
 
 /// In `declared` auth (dev), a chlive credential for the caller, standing in for the OpenID
@@ -1946,18 +1979,37 @@ mod e2e {
         keys: Option<(KeyArgs, Seal)>,
         runner: impl FnOnce(&Ctl) -> &'static dyn Runner,
     ) -> Option<Ctl> {
-        let github = GithubArgs {
+        let github = no_github();
+        start_all(
+            oidc,
+            ttl,
+            reserved_only,
+            chatgpt,
+            keys,
+            github,
+            STARTUP,
+            runner,
+        )
+        .await
+    }
+
+    /// GitHub where there is none, with no App.
+    fn no_github() -> GithubArgs {
+        GithubArgs {
             github_api: "http://127.0.0.1:1".into(),
             github_web: "http://127.0.0.1:1".into(),
             github_app_slug: None,
             github_app_client_id: None,
             github_app_client_secret: None,
             github_app_key: None,
-        };
-        start_all(oidc, ttl, reserved_only, chatgpt, keys, github, runner).await
+        }
     }
 
-    /// The same, with `github` for GitHub.
+    /// A started player's time to take its lease, where the runner only notes it.
+    const STARTUP: Duration = Duration::from_secs(1);
+
+    /// The same, with `github` for GitHub, and `startup` for a started player to take its lease.
+    #[allow(clippy::too_many_arguments)]
     async fn start_all(
         oidc: Option<Arc<auth::Oidc>>,
         ttl: Duration,
@@ -1965,6 +2017,7 @@ mod e2e {
         chatgpt: Option<ChatGptArgs>,
         keys: Option<(KeyArgs, Seal)>,
         github: GithubArgs,
+        startup: Duration,
         runner: impl FnOnce(&Ctl) -> &'static dyn Runner,
     ) -> Option<Ctl> {
         std::env::var_os("DIRIGENT_E2E")?;
@@ -2016,7 +2069,7 @@ mod e2e {
             github,
             Some(runner),
             pruner,
-            Duration::from_secs(1),
+            startup,
             reserved_only,
             Duration::from_secs(3600),
         );
@@ -3030,10 +3083,12 @@ mod e2e {
     }
 
     /// A control running mock players (`target/debug/player`, which `e2e` builds) in `root`, on
-    /// the stack's chlive; its address.
+    /// the stack's chlive; its address. A real player takes a while to take its lease
+    /// (connecting to kopia alone may take seconds), so it has longer.
     async fn start_local(root: &std::path::Path) -> Option<Ctl> {
         let root = root.to_path_buf();
-        start_with(|ctl| {
+        let (ttl, startup) = (Duration::from_secs(600), Duration::from_secs(15));
+        start_all(None, ttl, false, None, None, no_github(), startup, |ctl| {
             Box::leak(Box::new(Local {
                 id: format!("local:{}", root.display()),
                 root: root.clone(),
@@ -3544,6 +3599,46 @@ mod e2e {
         on_t.close().await;
     }
 
+    #[tokio::test]
+    async fn e2e_settings_are_each_users_own_defaulted_and_checked() {
+        let Some(base) = start_recording(recorder(false)).await else {
+            return;
+        };
+        let (user, other) = (new_user(), new_user());
+        let (status, got) = get_json(&base, &user, "/settings").await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(got, serde_json::json!({ "events": "activity" }));
+        let put = |who: &str, body: serde_json::Value| {
+            let (base, who) = (&base, who.to_string());
+            async move {
+                let put = reqwest::Method::PUT;
+                send_json(base, &who, put, "/settings", body).await
+            }
+        };
+        let (status, saved) = put(&user, serde_json::json!({ "events": "all" })).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{saved}");
+        assert_eq!(get_json(&base, &user, "/settings").await.1["events"], "all");
+        assert_eq!(
+            get_json(&base, &other, "/settings").await.1["events"],
+            "activity"
+        );
+        for bad in [
+            serde_json::json!({ "events": "some" }),
+            serde_json::json!({ "theme": "dark" }),
+            serde_json::json!([1]),
+        ] {
+            let (status, why) = put(&user, bad).await;
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{why}");
+        }
+        assert_eq!(get_json(&base, &user, "/settings").await.1["events"], "all");
+        // all of them each time: left out, back to its default
+        put(&user, serde_json::json!({})).await;
+        assert_eq!(
+            get_json(&base, &user, "/settings").await.1["events"],
+            "activity"
+        );
+    }
+
     /// A control that keeps secrets, with the fake GitHub's App.
     async fn start_github() -> Option<(Ctl, github::fake::GitHub, tempfile::TempDir)> {
         std::env::var_os("DIRIGENT_E2E")?;
@@ -3558,7 +3653,7 @@ mod e2e {
         let runner = recorder(false);
         let ttl = Duration::from_secs(600);
         let github = gh.args(dir.path());
-        let ctl = start_all(None, ttl, false, None, keys, github, |_| runner).await?;
+        let ctl = start_all(None, ttl, false, None, keys, github, STARTUP, |_| runner).await?;
         Some((ctl, gh, dir))
     }
 

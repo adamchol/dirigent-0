@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LiveClient, defaultUrl } from "@chlive/client";
 import { LiveClientProvider } from "@chlive/client/react";
 import { AnimatePresence, motion } from "motion/react";
-import { ChevronsUpDownIcon, GitPullRequestIcon, KeyRoundIcon, LinkIcon, LockKeyholeIcon, LogOutIcon, MenuIcon, MonitorIcon, MoonIcon, PlusIcon, SunIcon, UserRoundPenIcon, WaypointsIcon } from "lucide-react";
+import { ChevronsUpDownIcon, GitPullRequestIcon, KeyRoundIcon, LinkIcon, LockKeyholeIcon, LogOutIcon, MenuIcon, MonitorIcon, MoonIcon, PlusIcon, SettingsIcon, SunIcon, UserRoundPenIcon, WaypointsIcon } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -42,6 +42,7 @@ import { SyncDialog } from "./Sync.tsx";
 import { AnthropicKeyDialog } from "./Keys.tsx";
 import { connectGithub, GithubDialog, useGithubReturn } from "./GitHub.tsx";
 import { SecretsDialog } from "./Secrets.tsx";
+import { SettingsDialog, useSettings } from "./Settings.tsx";
 import { DeleteDialog, NewSession, SessionMenu, SessionsSidebar, useSessions } from "./Sessions.tsx";
 import { tokens } from "./Timeline.tsx";
 
@@ -195,6 +196,8 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
   // the name the secrets dialog starts with (GITHUB_TOKEN, asked for a private repository)
   const [secretName, setSecretName] = useState<string | undefined>();
   const [githubOpen, setGithubOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const { settings, change: changeSettings } = useSettings(props.who);
   // counted up as the user's access to GitHub may have changed
   const [access, setAccess] = useState(0);
   const accessChanged = useCallback(() => setAccess((n) => n + 1), []);
@@ -241,6 +244,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
           keys={() => setKeying(true)}
           secrets={() => setSecretsOf("")}
           github={() => setGithubOpen(true)}
+          settings={() => setSettingsOpen(true)}
         />
       }
       className={className}
@@ -304,6 +308,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
                     report={report}
                     me={me}
                     connect={() => setLinking(true)}
+                    shown={settings.events}
                   />
                 )}
               </motion.div>
@@ -349,6 +354,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
       <ChatGptDialog who={props.who} declared={!!props.become} open={linking} setOpen={setLinking} />
       <SyncDialog id={syncing} who={props.who} declared={!!props.become} close={() => setSyncing(null)} />
       <AnthropicKeyDialog open={keying} who={props.who} me={me} changed={refreshMe} close={() => setKeying(false)} />
+      <SettingsDialog open={settingsOpen} settings={settings} change={changeSettings} close={() => setSettingsOpen(false)} />
       <GithubDialog
         open={githubOpen}
         who={props.who}
@@ -464,6 +470,7 @@ function Account(props: {
   keys: () => void;
   secrets: () => void;
   github: () => void;
+  settings: () => void;
 }) {
   const { theme, setTheme } = useTheme();
   const [draft, setDraft] = useState(props.who.user);
@@ -517,6 +524,9 @@ function Account(props: {
           </DropdownMenuItem>
           <DropdownMenuItem onClick={props.github}>
             <GitPullRequestIcon /> GitHub
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={props.settings}>
+            <SettingsIcon /> Settings
           </DropdownMenuItem>
         </DropdownMenuGroup>
         <DropdownMenuSeparator />

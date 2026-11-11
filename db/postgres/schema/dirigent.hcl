@@ -291,6 +291,21 @@ table "dirigent.github_installations" {
   primary_key { columns = [column.subject, column.installation_id] }
 }
 
+# Each user's settings (control's `settings.rs` says which there are, and their defaults).
+table "dirigent.user_settings" {
+  column "subject" { type = text }
+  column "settings" {
+    type = jsonb
+    null = false
+  }
+  column "updated" {
+    type    = timestamptz
+    null    = false
+    default = sql("now()")
+  }
+  primary_key { columns = [column.subject] }
+}
+
 publication "dirigent_chlive" {
   tables = [table.dirigent.session_access, table.dirigent.insert_kinds]
 }
@@ -300,7 +315,7 @@ grant {
   on = [
     table.dirigent.sessions, table.dirigent.session_access, table.dirigent.chatgpt_links,
     table.dirigent.api_keys, table.dirigent.user_secrets, table.dirigent.session_secrets,
-    table.dirigent.web_sessions, table.dirigent.github_installations,
+    table.dirigent.web_sessions, table.dirigent.github_installations, table.dirigent.user_settings,
   ]
   to         = [role.dirigent_control]
 }

@@ -2,7 +2,7 @@
 // says: in control's `declared` auth the user chosen at the top (the `dirigent-user` header), in
 // its `oidc` auth whoever signed in with Google (their ID token).
 
-import type { Named, Source } from "./events.ts";
+import type { Named, Shown, Source } from "./events.ts";
 
 export type Effort = "low" | "medium" | "high" | "max";
 export type Part = "coder" | "dirigent";
@@ -241,4 +241,19 @@ export async function githubAccess(who: Who, url: string): Promise<Access> {
 /** Whether `url` is a repository on github.com (as control parses them). */
 export function onGithub(url: string): boolean {
   return /^(https?:\/\/(www\.)?github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)[\w.-]+\/[\w.-]+?(\.git)?\/?$/.test(url.trim());
+}
+
+/** `who`'s settings, as control keeps them (`control/src/settings.rs`). */
+export type Settings = {
+  /** How much of a session's log the chat shows. */
+  events: Shown;
+};
+
+export async function settings(who: Who): Promise<Settings> {
+  return (await call(who, "GET", "/settings")).json();
+}
+
+/** Keep `s` as `who`'s settings, all of them: control's answer. */
+export async function saveSettings(who: Who, s: Settings): Promise<Settings> {
+  return (await call(who, "PUT", "/settings", s)).json();
 }

@@ -675,6 +675,38 @@ impl Store {
         Ok(row.map(|r| r.get(0)))
     }
 
+    /// `subject`'s settings as kept, if they saved any.
+    pub async fn settings(&self, subject: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        let row = self
+            .db
+            .lock()
+            .await
+            .query_opt(
+                "SELECT settings FROM dirigent.user_settings WHERE subject = $1",
+                &[&subject],
+            )
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    /// `subject`'s settings are these now.
+    pub async fn put_settings(
+        &self,
+        subject: &str,
+        settings: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO dirigent.user_settings (subject, settings) VALUES ($1, $2) \
+                 ON CONFLICT (subject) DO UPDATE SET settings = excluded.settings, updated = now()",
+                &[&subject, settings],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// `subject`'s ChatGPT link, if they linked one.
     pub async fn link(&self, subject: &str) -> anyhow::Result<Option<Link>> {
         let row = self
