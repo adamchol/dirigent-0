@@ -2,8 +2,8 @@ apiVersion: v2
 name: dirigent
 description: Headless coding agents (players) in KubeVirt VMs, directed through a control plane, over chlive
 type: application
-version: 0.1.1
-appVersion: 0.1.1
+version: 0.1.2
+appVersion: 0.1.2
 # continuous-backup's chart: Kafka Connect with the ClickHouse sink, its connectors, and the pause
 # server. Vendored into charts/ by the flake (`nix build .#chart`) until it's published.
 dependencies:
