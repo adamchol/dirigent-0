@@ -37,7 +37,7 @@ export interface Usage {
 export type Source = { git: { url: string; ref?: string } };
 
 export type Event =
-  | { kind: "player_attached"; data: { epoch: number } }
+  | { kind: "player_attached"; data: { epoch: number; version?: string } }
   | { kind: "player_detached"; data: { epoch: number } }
   | { kind: "player_failed"; data: { epoch: number; error: string } }
   | { kind: "workspace_ready"; data: { source?: Source; head?: string; recreated?: boolean } }
@@ -254,7 +254,11 @@ export function timeline(rows: readonly EventRow[]): Timeline {
         note(row, "error", `compaction failed: ${e.data.message}`);
         break;
       case "player_attached":
-        note(row, "dim", `${subject(row.author)} attached (epoch ${e.data.epoch})`);
+        note(
+          row,
+          "dim",
+          `${subject(row.author)} attached (epoch ${e.data.epoch}${e.data.version ? `, ${e.data.version}` : ""})`,
+        );
         break;
       case "player_detached":
         note(row, "dim", `${subject(row.author)} detached (epoch ${e.data.epoch})`);

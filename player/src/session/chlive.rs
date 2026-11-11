@@ -79,7 +79,10 @@ impl ChliveSession {
         let row = EventRow::new(
             &self.id,
             id.clone(),
-            &Event::PlayerAttached { epoch: self.epoch },
+            &Event::PlayerAttached {
+                epoch: self.epoch,
+                version: Some(crate::VERSION.into()),
+            },
         );
         let started = Instant::now();
         loop {
@@ -492,7 +495,7 @@ mod e2e {
     fn attached(rows: &[EventRow]) -> Vec<i64> {
         rows.iter()
             .filter_map(|r| match r.event().unwrap() {
-                Event::PlayerAttached { epoch } => Some(epoch),
+                Event::PlayerAttached { epoch, .. } => Some(epoch),
                 _ => None,
             })
             .collect()
@@ -884,7 +887,16 @@ mod e2e {
             .unwrap();
         let opts = ClientOptions::new(&stack.chlive).credentials(player_token(lease.tokens()));
         let player = LiveClient::new(opts);
-        let attached = |s: &str| EventRow::new(s, new_id(), &Event::PlayerAttached { epoch: 1 });
+        let attached = |s: &str| {
+            EventRow::new(
+                s,
+                new_id(),
+                &Event::PlayerAttached {
+                    epoch: 1,
+                    version: None,
+                },
+            )
+        };
         let started = Instant::now();
         // until chlive has the lease's grant (over CDC)
         while player.insert(EVENTS, [attached(&session)]).await.is_err() {

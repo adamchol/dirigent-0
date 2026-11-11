@@ -3,6 +3,8 @@ mod checkpoints;
 mod compact;
 mod dirigent;
 mod history;
+#[cfg(test)]
+mod logs;
 mod mirror;
 mod process;
 mod provider;
@@ -36,6 +38,13 @@ use crate::session::Session;
 use crate::tools::Registry;
 use dirigent_protocol::control::{Part, Provider as ModelProvider, SessionSpec};
 use dirigent_protocol::Event;
+
+/// This player's version, as the build tells it (nix: `<the chart's appVersion>+<commit>`);
+/// `dev` from cargo.
+pub const VERSION: &str = match option_env!("DIRIGENT_VERSION") {
+    Some(v) => v,
+    None => "dev",
+};
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 /// The dirigent's, whole: its workspace isn't its work.

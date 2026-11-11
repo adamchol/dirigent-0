@@ -41,7 +41,7 @@ import { RenameDialog, useTitles } from "./Rename.tsx";
 import { SyncDialog } from "./Sync.tsx";
 import { AnthropicKeyDialog } from "./Keys.tsx";
 import { SecretsDialog } from "./Secrets.tsx";
-import { NewSession, SessionMenu, SessionsSidebar, useSessions } from "./Sessions.tsx";
+import { DeleteDialog, NewSession, SessionMenu, SessionsSidebar, useSessions } from "./Sessions.tsx";
 import { tokens } from "./Timeline.tsx";
 
 export function App() {
@@ -180,6 +180,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
   const [browsing, setBrowsing] = useState(false);
   const [linking, setLinking] = useState(false);
   const [renaming, setRenaming] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
   const [syncing, setSyncing] = useState<string | null>(null);
   const [keying, setKeying] = useState(false);
   // the user's secrets for all sessions (`""`), or a session's (its id)
@@ -210,6 +211,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
       who={props.who}
       create={() => setCreating(true)}
       rename={setRenaming}
+      remove={setDeleting}
       openLocally={setSyncing}
       secrets={setSecretsOf}
       account={
@@ -251,6 +253,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
                 who={props.who}
                 changed={sessions.refresh}
                 rename={() => setRenaming(selected)}
+                remove={() => setDeleting(selected)}
                 openLocally={() => setSyncing(selected)}
                 secrets={() => setSecretsOf(selected)}
               />
@@ -311,6 +314,15 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
         info={sessions.list.find((s) => s.id === renaming)}
         client={client}
         close={() => setRenaming(null)}
+      />
+      <DeleteDialog
+        info={sessions.list.find((s) => s.id === deleting)}
+        who={props.who}
+        deleted={(id) => {
+          if (id === selected) select("");
+          sessions.refresh();
+        }}
+        close={() => setDeleting(null)}
       />
       <ChatGptDialog who={props.who} declared={!!props.become} open={linking} setOpen={setLinking} />
       <SyncDialog id={syncing} who={props.who} declared={!!props.become} close={() => setSyncing(null)} />

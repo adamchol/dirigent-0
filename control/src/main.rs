@@ -9,6 +9,7 @@ mod auth;
 mod bootstrap;
 mod chatgpt;
 mod leases;
+mod prune;
 mod runner;
 mod seal;
 mod secrets;
@@ -39,7 +40,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::chatgpt::{ChatGpt, ChatGptArgs, LinkInfo, Model, Started as LinkStarted};
-use crate::leases::{Acquire, Put, Reserve, Scope, Store};
+use crate::leases::{Acquire, Archive, Delete, Put, Reserve, Scope, Store};
+use crate::prune::{PruneArgs, Pruner};
 use crate::runner::{Kube, Local, Runner};
 use crate::seal::Seal;
 use crate::secrets::{KeyArgs, Keys};
@@ -133,6 +135,9 @@ struct Cli {
     #[command(flatten)]
     keys: KeyArgs,
 
+    #[command(flatten)]
+    prune: PruneArgs,
+
     /// The key control signs credentials with: Ed25519, PKCS#8 PEM (`control keygen`).
     #[arg(long, env = "DIRIGENT_SIGNING_KEY", required = true)]
     signing_key: Option<PathBuf>,
@@ -185,6 +190,8 @@ struct Control {
     /// What changed of leases' credentials, which their holders send again at once.
     changed: broadcast::Sender<Changed>,
     runner: Option<&'static dyn Runner>,
+    /// What deletes sessions; none without ClickHouse (`--clickhouse-url`).
+    pruner: Option<&'static Pruner>,
     startup: Duration,
     /// Whether only the players it started get leases (`--reserved-only`).
     reserved_only: bool,
@@ -258,16 +265,22 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
+    let pruner: Option<&'static Pruner> = Pruner::new(&cli.prune).map(|p| &*Box::leak(Box::new(p)));
     let control = control(
         store,
         Auth { signer, oidc },
         chatgpt,
         keys,
         runner,
+        pruner,
         Duration::from_secs(cli.startup),
         cli.reserved_only,
     );
     tokio::spawn(sweep(control));
+    if let Some(pruner) = pruner {
+        tokio::spawn(prune::prune(&control.store, runner, pruner));
+        tokio::spawn(prune::maintain(pruner));
+    }
     if let Some(kube) = kube {
         tokio::spawn(kube.clear(&control.store, control.startup, Duration::from_secs(30)));
     }
@@ -279,6 +292,7 @@ async fn main() -> anyhow::Result<()> {
         grace = cli.grace,
         runner = runner.map(|r| r.id()),
         auth = ?cli.auth,
+        deletes = pruner.is_some(),
         detached,
         "control started"
     );
@@ -290,12 +304,14 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn control(
     store: Store,
     auth: Auth,
     chatgpt: Option<ChatGpt>,
     keys: Keys,
     runner: Option<&'static dyn Runner>,
+    pruner: Option<&'static Pruner>,
     startup: Duration,
     reserved_only: bool,
 ) -> &'static Control {
@@ -306,6 +322,7 @@ fn control(
         keys,
         changed: broadcast::channel(64).0,
         runner,
+        pruner,
         startup,
         reserved_only,
         attached: Default::default(),
@@ -316,9 +333,14 @@ fn control(
 fn router(control: &'static Control) -> Router {
     Router::new()
         .route("/sessions", get(list_sessions))
-        .route("/sessions/{id}", get(get_session).put(put_session))
+        .route(
+            "/sessions/{id}",
+            get(get_session).put(put_session).delete(delete_session),
+        )
         .route("/sessions/{id}/start", post(start_session))
         .route("/sessions/{id}/stop", post(stop_session))
+        .route("/sessions/{id}/archive", post(archive_session))
+        .route("/sessions/{id}/unarchive", post(unarchive_session))
         .route(
             "/sessions/{id}/viewers/{subject}",
             axum::routing::put(add_viewer).delete(remove_viewer),
@@ -526,6 +548,8 @@ enum Started {
     /// It's active already.
     Active,
     Unknown,
+    /// It's archived: no player takes it until it's unarchived.
+    Archived,
     /// There's no runner to start players with.
     NoRunner,
 }
@@ -545,6 +569,7 @@ async fn start(control: &'static Control, session: Uuid) -> anyhow::Result<Start
         Reserve::Reserved(epoch) => epoch,
         Reserve::Held => return Ok(Started::Active),
         Reserve::Unknown => return Ok(Started::Unknown),
+        Reserve::Archived => return Ok(Started::Archived),
     };
     if let Err(e) = runner.start(session, &player, epoch).await {
         control.store.drop_lease(session).await?;
@@ -671,6 +696,7 @@ fn started(id: Uuid, r: anyhow::Result<Started>) -> Result<(), Failed> {
         }
         Ok(Started::Active) => Ok(()),
         Ok(Started::Unknown) => Err(not_found()),
+        Ok(Started::Archived) => Err((StatusCode::CONFLICT, "the session is archived".into())),
         Ok(Started::NoRunner) => Err((
             StatusCode::NOT_IMPLEMENTED,
             "control runs no players (no --players)".into(),
@@ -747,6 +773,77 @@ async fn stop_session(
         }
         Ok(false) => Ok(StatusCode::NO_CONTENT),
         Err(e) => Err(failed(&format!("stopping the session {id}"), e)),
+    }
+}
+
+/// Delete the session, the caller's and archived: no one has access from now on, and control
+/// removes what it left (`prune`).
+async fn delete_session(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, Failed> {
+    owned(control, id, &caller).await?;
+    if control.pruner.is_none() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "control can't delete sessions (no --clickhouse-url)".into(),
+        ));
+    }
+    match control.store.delete(id).await {
+        Ok(Delete::Marked) => {
+            info!(session = %id, "session deleting");
+            Ok(StatusCode::ACCEPTED)
+        }
+        Ok(Delete::NotArchived) => Err((
+            StatusCode::CONFLICT,
+            "only an archived session is deleted: archive it first".into(),
+        )),
+        Ok(Delete::Unknown) => Err(not_found()),
+        Err(e) => Err(failed(&format!("deleting the session {id}"), e)),
+    }
+}
+
+/// Archive the session, the caller's: it's listed as archived, and no player takes it until
+/// it's unarchived. One a player holds is stopped first.
+async fn archive_session(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, Failed> {
+    archived(control, id, &caller, true).await
+}
+
+async fn unarchive_session(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, Failed> {
+    archived(control, id, &caller, false).await
+}
+
+async fn archived(
+    control: &'static Control,
+    id: Uuid,
+    caller: &str,
+    on: bool,
+) -> Result<StatusCode, Failed> {
+    owned(control, id, caller).await?;
+    match control.store.archive(id, on).await {
+        Ok(Archive::Done) => {
+            if on {
+                info!(session = %id, "session archived");
+            } else {
+                info!(session = %id, "session unarchived");
+            }
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(Archive::Active) => Err((
+            StatusCode::CONFLICT,
+            "a player holds the session: stop it first".into(),
+        )),
+        Ok(Archive::Unknown) => Err(not_found()),
+        Err(e) => Err(failed(&format!("archiving the session {id}"), e)),
     }
 }
 
@@ -1005,6 +1102,9 @@ impl Players for Lessor {
                 ))
             }
             Ok(Acquire::Unknown) => return Err(Status::not_found("no such session")),
+            Ok(Acquire::Archived) => {
+                return Err(Status::failed_precondition("the session is archived"))
+            }
             Ok(Acquire::Lost) => {
                 info!(session = %session, subject, "lease lost");
                 return Err(Status::aborted("the lease is gone"));
@@ -1474,6 +1574,10 @@ mod e2e {
                 .push((session, player.into(), epoch));
             Ok(())
         }
+
+        async fn forget(&self, _: Uuid) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     impl Recorder {
@@ -1537,16 +1641,34 @@ mod e2e {
             http,
             grpc: grpc_addr,
         };
+        let runner = runner(&ctl);
+        // deleting, with the stack's ClickHouse (the `e2e` script's), events settled at once
+        let pruner: Option<&'static Pruner> = Pruner::new(&PruneArgs {
+            clickhouse_url: std::env::var("DIRIGENT_CLICKHOUSE_URL").ok(),
+            clickhouse_user: "dirigent_control".into(),
+            clickhouse_password: "dirigent_control".into(),
+            kopia_token: None,
+            kopia_token_secret: None,
+            kopia_state: None,
+        })
+        .map(|mut p| {
+            p.settled = Duration::ZERO;
+            &*Box::leak(Box::new(p))
+        });
         let control = control(
             store,
             Auth { signer, oidc },
             chatgpt,
             keys,
-            Some(runner(&ctl)),
+            Some(runner),
+            pruner,
             Duration::from_secs(1),
             reserved_only,
         );
         tokio::spawn(sweep(control));
+        if let Some(pruner) = pruner {
+            tokio::spawn(prune::prune(&control.store, Some(runner), pruner));
+        }
         tokio::spawn(async move { axum::serve(listener, router(control)).await });
         tokio::spawn(players(control).serve_with_incoming(TcpListenerStream::new(grpc)));
         Some(ctl)
@@ -1968,6 +2090,150 @@ mod e2e {
         assert_eq!(info(&base, s).await.player, None);
         let mut a = connect(&base).await;
         assert_eq!(acquire(&mut a, s, "a", Some(1)).await, LOST);
+    }
+
+    #[tokio::test]
+    async fn e2e_an_archived_session_takes_no_player_until_unarchived() {
+        let runner = recorder(false);
+        let Some(base) = start_recording(runner).await else {
+            return;
+        };
+        let s = Uuid::new_v4();
+        put(&base, s).await;
+        let mut a = connect(&base).await;
+        assert_eq!(acquire(&mut a, s, "a", None).await, acquired(1));
+        let (archive, unarchive) = (
+            format!("/sessions/{s}/archive"),
+            format!("/sessions/{s}/unarchive"),
+        );
+        let start = format!("/sessions/{s}/start");
+        assert_eq!(
+            post(&base, &archive, None).await,
+            reqwest::StatusCode::CONFLICT
+        );
+        a.close().await;
+        info_until(&base, s, |i| i.player.is_none()).await;
+        assert_eq!(
+            post(&base, &archive, None).await,
+            reqwest::StatusCode::NO_CONTENT
+        );
+        assert!(info(&base, s).await.archived.is_some());
+        assert_eq!(
+            post(&base, &start, None).await,
+            reqwest::StatusCode::CONFLICT
+        );
+        let mut b = connect(&base).await;
+        assert_eq!(acquire(&mut b, s, "b", None).await, HELD);
+        assert!(runner.of(s).is_empty());
+        let as_b = post_as(B, &base, &unarchive, None).await;
+        assert_eq!(as_b, reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            post(&base, &unarchive, None).await,
+            reqwest::StatusCode::NO_CONTENT
+        );
+        assert_eq!(info(&base, s).await.archived, None);
+        assert_eq!(acquire(&mut b, s, "b", None).await, acquired(2));
+    }
+
+    /// A row of `session`'s log, put straight into the stack's ClickHouse (as the sink would).
+    async fn event_row(session: Uuid) {
+        let url = std::env::var("DIRIGENT_CLICKHOUSE_URL").unwrap();
+        let sql = format!(
+            "INSERT INTO dirigent.session_events (session_id, offset, partition, ts, id, author, \
+             kind, data) VALUES ('{session}', 0, 0, now64(3), '{}', 'user:a', 'user_message', \
+             '{{\"text\":\"hi\"}}')",
+            Uuid::new_v4()
+        );
+        let res = reqwest::Client::new()
+            .post(url)
+            .body(sql)
+            .send()
+            .await
+            .unwrap();
+        assert!(res.status().is_success(), "{}", res.text().await.unwrap());
+    }
+
+    /// How many rows `session` has in ClickHouse, and whether Postgres has it still.
+    async fn left_of(session: Uuid) -> (u64, bool) {
+        let url = std::env::var("DIRIGENT_CLICKHOUSE_URL").unwrap();
+        let sql =
+            format!("SELECT count() FROM dirigent.session_events WHERE session_id = '{session}'");
+        let res = reqwest::Client::new()
+            .post(url)
+            .body(sql)
+            .send()
+            .await
+            .unwrap();
+        let rows = res.text().await.unwrap().trim().parse().unwrap();
+        let pg = std::env::var("DIRIGENT_CONTROL_POSTGRES").unwrap();
+        let (db, conn) = tokio_postgres::connect(&pg, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let row = db
+            .query_opt("SELECT 1 FROM dirigent.sessions WHERE id = $1", &[&session])
+            .await
+            .unwrap();
+        (rows, row.is_some())
+    }
+
+    #[tokio::test]
+    async fn e2e_a_deleted_session_goes_with_its_events() {
+        let Some(base) = start_recording(recorder(false)).await else {
+            return;
+        };
+        let s = Uuid::new_v4();
+        put(&base, s).await;
+        let viewer = call(
+            A,
+            reqwest::Method::PUT,
+            &base,
+            &format!("/sessions/{s}/viewers/{B}"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(viewer.status(), reqwest::StatusCode::NO_CONTENT);
+        event_row(s).await;
+        let path = format!("/sessions/{s}");
+        let delete = |user| call(user, reqwest::Method::DELETE, &base, &path).send();
+        assert_eq!(
+            delete(A).await.unwrap().status(),
+            reqwest::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post(&base, &format!("/sessions/{s}/archive"), None).await,
+            reqwest::StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            delete(B).await.unwrap().status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            delete(A).await.unwrap().status(),
+            reqwest::StatusCode::ACCEPTED
+        );
+        // one that comes after its marking goes too
+        event_row(s).await;
+        for user in [A, B] {
+            assert!(!list(&base, user)
+                .await
+                .iter()
+                .any(|i| i.id == s.to_string()));
+        }
+        assert_eq!(
+            delete(A).await.unwrap().status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let left = left_of(s).await;
+            if left == (0, false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "left: {left:?}");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     #[tokio::test]

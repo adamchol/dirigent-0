@@ -28,8 +28,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       # a release's tag, v1.2.3, is its chart's version and appVersion (Chart.yaml): the chart in
-      # git at the tag then pulls the images published for it
-      - name: Check the chart's version
+      # git at the tag then pulls the images published for it. It brings logs its player wrote
+      # (player/logs/1.2.3, the dev shell's save-log), which the players after it must load.
+      - name: Check the release
         if: github.ref_type == 'tag'
         run: |
           want=${GITHUB_REF_NAME#v}
@@ -38,6 +39,8 @@ jobs:
             [ "$got" = "$want" ] \
               || { echo "::error file=chart/dirigent/Chart.yaml::$key is $got, the tag $GITHUB_REF_NAME wants $want"; exit 1; }
           done
+          compgen -G "player/logs/$want/*.jsonl" >/dev/null \
+            || { echo "::error::no logs in player/logs/$want: save some its player wrote (save-log)"; exit 1; }
       - uses: nixbuild/nix-quick-install-action@v35
         with:
           nix_conf: |

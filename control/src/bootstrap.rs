@@ -15,13 +15,15 @@ use kube::api::{Api, Patch, PatchParams, PostParams};
 use rand::RngCore;
 use tracing::info;
 
-/// ClickHouse's users for chlive and the ingestion, which the migrations make.
-const CLICKHOUSE: [&str; 5] = [
+/// ClickHouse's users for chlive, the ingestion and control, which the `migrate` init container
+/// makes (chart/dirigent/templates/_migrate.tpl).
+const CLICKHOUSE: [&str; 6] = [
     "chlive_ro",
     "chlive_snap",
     "dirigent_sink",
     "dirigent_pause",
     "dirigent_recovery",
+    "dirigent_control",
 ];
 
 /// A Secret as wanted: its name, its type, and a value for each key, used for the keys it lacks.

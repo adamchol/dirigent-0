@@ -13,3 +13,8 @@ GRANT SELECT ON system.tables TO chlive_ro;
 CREATE USER OR REPLACE chlive_snap IDENTIFIED WITH plaintext_password BY 'chlive_snap';
 GRANT dirigent_chlive_snapshot TO chlive_snap;
 GRANT SELECT ON system.tables TO chlive_snap;
+
+-- control's deletions of sessions' events (`--clickhouse-user`).
+CREATE USER OR REPLACE dirigent_control IDENTIFIED WITH plaintext_password BY 'dirigent_control';
+-- a lightweight DELETE updates the rows' _row_exists mask (ClickHouse 25.x checks for both)
+GRANT ALTER DELETE, ALTER UPDATE(_row_exists), SELECT ON dirigent.session_events TO dirigent_control;

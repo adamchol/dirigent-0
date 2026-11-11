@@ -123,7 +123,10 @@ mod tests {
                 text: "hi".into(),
                 via: None,
             },
-            Event::PlayerAttached { epoch: 3 },
+            Event::PlayerAttached {
+                epoch: 3,
+                version: Some("0.1.3+abc1234".into()),
+            },
             Event::UserInterrupt { turn: "t1".into() },
             Event::TurnStarted { input: "m1".into() },
             Event::Steered { input: "m2".into() },

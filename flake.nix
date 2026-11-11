@@ -62,7 +62,12 @@
             src = inputs.chlive;
             buildInputs = old.buildInputs ++ [ pkgs.openssl ];
           });
-          dirigent = pkgs.callPackage ./nix/packages/dirigent.nix { };
+          # the player tells its version (in its `player_attached`): the release it follows, and the
+          # commit it was built from
+          dirigent = pkgs.callPackage ./nix/packages/dirigent.nix {
+            version = chartVersion "appVersion";
+            rev = inputs.self.shortRev or inputs.self.dirtyShortRev or "dirty";
+          };
           # the CLI alone, for its users (`nix run github:adamchol/dirigent-0#cli -- login …`)
           cli = pkgs.callPackage ./nix/packages/cli.nix { };
           # chlive's TS client, as the web UI takes it (web/chlive-client): its src/, and wasm/, its

@@ -46,6 +46,8 @@ pub enum Acquire {
     Unknown,
     /// The lease it resumes is gone.
     Lost,
+    /// The session is archived.
+    Archived,
 }
 
 /// What reserving a session's lease for a player control starts did.
@@ -55,6 +57,26 @@ pub enum Reserve {
     Reserved(i64),
     /// A player holds it already.
     Held,
+    Unknown,
+    Archived,
+}
+
+/// What deleting a session did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delete {
+    /// It's marked: control removes what it left.
+    Marked,
+    /// It's archived first.
+    NotArchived,
+    Unknown,
+}
+
+/// What archiving a session (or unarchiving it) did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Archive {
+    Done,
+    /// A player holds it, which must stop first.
+    Active,
     Unknown,
 }
 
@@ -211,7 +233,8 @@ impl Store {
         let tx = db.transaction().await?;
         let Some(row) = tx
             .query_opt(
-                "SELECT epoch, spec FROM dirigent.sessions WHERE id = $1 FOR UPDATE",
+                "SELECT epoch, spec, archived IS NOT NULL FROM dirigent.sessions \
+                 WHERE id = $1 FOR UPDATE",
                 &[&session],
             )
             .await?
@@ -221,6 +244,10 @@ impl Store {
                 None => Acquire::Unknown,
             });
         };
+        // an archived session has no lease to resume
+        if row.get::<_, bool>(2) {
+            return Ok(Acquire::Archived);
+        }
         let epoch: i64 = row.get(0);
         let spec: SessionSpec = serde_json::from_value(row.get(1))?;
         let owner: String = tx
@@ -352,12 +379,14 @@ impl Store {
         let tx = db.transaction().await?;
         let found = tx
             .query_opt(
-                "SELECT 1 FROM dirigent.sessions WHERE id = $1 FOR UPDATE",
+                "SELECT archived IS NOT NULL FROM dirigent.sessions WHERE id = $1 FOR UPDATE",
                 &[&session],
             )
             .await?;
-        if found.is_none() {
-            return Ok(Reserve::Unknown);
+        match found.map(|r| r.get::<_, bool>(0)) {
+            None => return Ok(Reserve::Unknown),
+            Some(true) => return Ok(Reserve::Archived),
+            Some(false) => {}
         }
         let held = tx
             .query_opt(
@@ -422,6 +451,110 @@ impl Store {
             )
             .await?;
         Ok(n == 1)
+    }
+
+    /// Archive the session `id` (`on`), unless a player holds it, or unarchive it. An archived
+    /// one keeps when it was archived, and has no lease: an expired one goes with archiving.
+    pub async fn archive(&self, id: Uuid, on: bool) -> anyhow::Result<Archive> {
+        let mut db = self.db.lock().await;
+        let tx = db.transaction().await?;
+        let found = tx
+            .query_opt(
+                "SELECT 1 FROM dirigent.sessions WHERE id = $1 FOR UPDATE",
+                &[&id],
+            )
+            .await?;
+        if found.is_none() {
+            return Ok(Archive::Unknown);
+        }
+        if on {
+            let held = tx
+                .query_opt(
+                    "SELECT expires_at IS NULL OR expires_at > now() \
+                     FROM dirigent.session_access WHERE session_id = $1 AND role = 'player'",
+                    &[&id],
+                )
+                .await?;
+            match held.map(|r| r.get::<_, bool>(0)) {
+                Some(true) => return Ok(Archive::Active),
+                Some(false) => {
+                    tx.execute(
+                        "DELETE FROM dirigent.session_access \
+                         WHERE session_id = $1 AND role = 'player'",
+                        &[&id],
+                    )
+                    .await?;
+                }
+                None => {}
+            }
+        }
+        tx.execute(
+            "UPDATE dirigent.sessions \
+             SET archived = CASE WHEN $2 THEN coalesce(archived, now()) END WHERE id = $1",
+            &[&id, &on],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Archive::Done)
+    }
+
+    /// Delete the session `id`, archived: it's marked, and no one has access any more (chlive's
+    /// grants go with the rows); [`Store::deleting`] lists it until [`Store::deleted`].
+    pub async fn delete(&self, id: Uuid) -> anyhow::Result<Delete> {
+        let mut db = self.db.lock().await;
+        let tx = db.transaction().await?;
+        let found = tx
+            .query_opt(
+                "SELECT archived IS NOT NULL FROM dirigent.sessions WHERE id = $1 FOR UPDATE",
+                &[&id],
+            )
+            .await?;
+        match found.map(|r| r.get::<_, bool>(0)) {
+            None => return Ok(Delete::Unknown),
+            Some(false) => return Ok(Delete::NotArchived),
+            Some(true) => {}
+        }
+        tx.execute(
+            "UPDATE dirigent.sessions SET deleting = coalesce(deleting, now()) WHERE id = $1",
+            &[&id],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM dirigent.session_access WHERE session_id = $1",
+            &[&id],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Delete::Marked)
+    }
+
+    /// The sessions being deleted, the oldest first: each one's id, and whether it was marked
+    /// more than `settled` ago.
+    pub async fn deleting(&self, settled: Duration) -> anyhow::Result<Vec<(Uuid, bool)>> {
+        let rows = self
+            .db
+            .lock()
+            .await
+            .query(
+                "SELECT id, deleting < now() - make_interval(secs => $1) FROM dirigent.sessions \
+                 WHERE deleting IS NOT NULL ORDER BY deleting",
+                &[&settled.as_secs_f64()],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    /// The session `id`, being deleted, is gone: its row goes last (its secrets with it).
+    pub async fn deleted(&self, id: Uuid) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .await
+            .execute(
+                "DELETE FROM dirigent.sessions WHERE id = $1 AND deleting IS NOT NULL",
+                &[&id],
+            )
+            .await?;
+        Ok(())
     }
 
     /// `subject`'s ChatGPT link, if they linked one.
@@ -698,7 +831,8 @@ const SESSIONS: &str = "SELECT s.id, s.spec, s.epoch, p.subject, p.expires_at IS
      ARRAY(SELECT name FROM (SELECT name FROM dirigent.session_secrets ss \
              WHERE ss.session_id = s.id \
            UNION SELECT name FROM dirigent.user_secrets us WHERE us.subject = o.subject) n \
-           ORDER BY name) \
+           ORDER BY name), \
+     (extract(epoch FROM s.archived) * 1000)::bigint \
      FROM dirigent.sessions s \
      JOIN dirigent.session_access me \
        ON me.session_id = s.id AND me.subject = $1 AND me.role IN ('owner', 'viewer') \
@@ -721,6 +855,7 @@ fn session_info(row: &Row) -> anyhow::Result<SessionInfo> {
         role: role(row.get(7)),
         created: row.get(8),
         secrets: row.get(9),
+        archived: row.get(10),
     })
 }
 

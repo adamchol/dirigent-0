@@ -198,7 +198,7 @@ export function Session(props: {
       </MessageScrollerProvider>
 
       <Composer
-        disabled={!owner}
+        closed={!owner ? "Only the session's owner writes to it" : props.info?.archived ? "Archived: unarchive it to write to it" : null}
         running={running}
         send={(text) => write("user_message", { text })}
         interrupt={() => openTurn && write("user_interrupt", { turn: openTurn })}
@@ -231,17 +231,18 @@ function Loading() {
   );
 }
 
-function Composer(props: { disabled: boolean; running: boolean; send: (text: string) => void; interrupt: () => void }) {
+/** The message box; `closed`, why it takes none. */
+function Composer(props: { closed: string | null; running: boolean; send: (text: string) => void; interrupt: () => void }) {
   const [draft, setDraft] = useState("");
   const box = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
-    if (!props.disabled) box.current?.focus();
-  }, [props.disabled]);
+    if (!props.closed) box.current?.focus();
+  }, [props.closed]);
 
   function submit(e?: React.FormEvent) {
     e?.preventDefault();
     const text = draft.trim();
-    if (!text || props.disabled) return;
+    if (!text || props.closed) return;
     setDraft("");
     props.send(text);
   }
@@ -256,11 +257,11 @@ function Composer(props: { disabled: boolean; running: boolean; send: (text: str
           id="message"
           ref={box}
           value={draft}
-          disabled={props.disabled}
+          disabled={props.closed !== null}
           rows={2}
           className="max-h-48 min-h-14 py-2.5 text-[14px] text-strong field-sizing-content"
           placeholder={
-            props.disabled ? "Only the session's owner writes to it" : props.running ? "Steer the running turn…" : "Message the session"
+            props.closed ?? (props.running ? "Steer the running turn…" : "Message the session")
           }
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
@@ -269,7 +270,7 @@ function Composer(props: { disabled: boolean; running: boolean; send: (text: str
         />
         <InputGroupAddon align="inline-end" className="gap-1.5 self-end pb-2">
           <AnimatePresence initial={false}>
-            {props.running && !props.disabled && (
+            {props.running && !props.closed && (
               <motion.div key="interrupt" initial={{ opacity: 0, scale: 0.85 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.85 }}>
                 <Tooltip>
                   <TooltipTrigger
@@ -283,7 +284,7 @@ function Composer(props: { disabled: boolean; running: boolean; send: (text: str
             )}
           </AnimatePresence>
           <motion.div whileTap={{ scale: 0.94 }}>
-            <InputGroupButton type="submit" variant="default" size="sm" className="h-7 px-3 font-medium" disabled={props.disabled || !draft.trim()}>
+            <InputGroupButton type="submit" variant="default" size="sm" className="h-7 px-3 font-medium" disabled={props.closed !== null || !draft.trim()}>
               Send ⏎
             </InputGroupButton>
           </motion.div>

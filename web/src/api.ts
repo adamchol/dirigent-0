@@ -36,6 +36,9 @@ export interface SessionInfo {
   created: number;
   /** The names of the secrets its tools get (its own, and its owner's for all their sessions). */
   secrets?: string[];
+  /** Since when it's archived (no player takes it until it's unarchived), in milliseconds since
+   * the Unix epoch; none, it isn't. */
+  archived?: number | null;
 }
 
 /** How control knows its callers (`GET /auth`). */
@@ -133,6 +136,16 @@ export async function start(who: Who, id: string) {
 /** `now`: cancel the running turn instead of letting it finish. */
 export async function stop(who: Who, id: string, now: boolean) {
   await call(who, "POST", `/sessions/${id}/stop`, { now });
+}
+
+/** Delete the session (archived): control removes it, and what it left, for good. */
+export async function deleteSession(who: Who, id: string) {
+  await call(who, "DELETE", `/sessions/${id}`);
+}
+
+/** Archive the session (`on`; it must be idle), or unarchive it. */
+export async function archive(who: Who, id: string, on: boolean) {
+  await call(who, "POST", `/sessions/${id}/${on ? "archive" : "unarchive"}`);
 }
 
 export async function addViewer(who: Who, id: string, viewer: string) {

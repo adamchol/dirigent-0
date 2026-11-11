@@ -36,9 +36,16 @@ let
   };
 in
 {
+  # with kopia, for the checkpoints of the sessions it deletes, and their repository's maintenance
   control = image "control" {
-    contents = [ pkgs.cacert ];
-    config.Entrypoint = [ (lib.getExe' dirigent "control") ];
+    contents = [
+      pkgs.cacert
+      pkgs.kopia
+    ];
+    config = {
+      Entrypoint = [ (lib.getExe' dirigent "control") ];
+      Env = [ "PATH=/bin" ];
+    };
   };
 
   # the UI's Bun server (web/src/server.ts): the app, and its proxies to control and chlive

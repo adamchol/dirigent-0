@@ -125,11 +125,7 @@ impl Agent {
         log: Vec<(String, Event)>,
         mut detach: Detach,
     ) -> anyhow::Result<()> {
-        let mut fold = Fold::default();
-        let handled: Vec<(String, Event)> = log
-            .iter()
-            .filter_map(|(id, ev)| Some((id.clone(), fold.apply(id, ev)?)))
-            .collect();
+        let (handled, fold) = replay(&log);
         let tools = serde_json::to_string(self.tools.specs()).map_or(0, |s| s.len());
         let (tx, mut outcomes) = mpsc::unbounded_channel::<Event>();
         let (named, mut names) = mpsc::unbounded_channel::<Named>();
@@ -255,10 +251,21 @@ async fn told_to_detach(when: &mut watch::Receiver<Option<bool>>, seen: Option<b
     }
 }
 
+/// A loaded log as the player goes on from it: the events its fold handles, in order, and the
+/// fold, with the messages the log leaves queued and the turn it leaves open.
+pub fn replay(log: &[(String, Event)]) -> (Vec<(String, Event)>, Fold) {
+    let mut fold = Fold::default();
+    let handled = log
+        .iter()
+        .filter_map(|(id, ev)| Some((id.clone(), fold.apply(id, ev)?)))
+        .collect();
+    (handled, fold)
+}
+
 /// The events that close a turn the handled `events` leave open: an aborted result for each
 /// tool call still waiting for one, then `TurnEnded { Aborted }` naming `interrupt`, the
 /// interrupt the log has for it. Empty when no turn is open.
-fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -> Vec<Event> {
+pub fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -> Vec<Event> {
     let mut open = false;
     let mut waiting: Vec<(String, String)> = Vec::new();
     for (_, ev) in events {
@@ -1178,7 +1185,7 @@ mod tests {
             // titles come when their call does: their own tests look for them
             .filter(|e| !matches!(e, Event::ModelDelta { .. } | Event::Titled { .. }))
             .map(|e| match e {
-                Event::PlayerAttached { epoch } => format!("attached:{epoch}"),
+                Event::PlayerAttached { epoch, .. } => format!("attached:{epoch}"),
                 Event::PlayerDetached { epoch } => format!("detached:{epoch}"),
                 Event::WorkspaceReady { .. } => "workspace".into(),
                 Event::PlayerFailed { error, .. } => format!("failed:{error}"),

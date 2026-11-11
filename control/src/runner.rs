@@ -26,6 +26,9 @@ pub trait Runner: Send + Sync {
 
     /// Start `player` (an id) on `session`, where the lease for its `epoch` waits for it.
     async fn start(&self, session: Uuid, player: &str, epoch: i64) -> anyhow::Result<()>;
+
+    /// The session `session` is deleted: remove what its players left here (none holds it).
+    async fn forget(&self, session: Uuid) -> anyhow::Result<()>;
 }
 
 /// The environment a player gets: what it needs, and none of control's own (its Postgres).
@@ -104,6 +107,16 @@ impl Runner for Local {
             }
         });
         Ok(())
+    }
+
+    async fn forget(&self, session: Uuid) -> anyhow::Result<()> {
+        let dir = self.root.join(session.to_string());
+        match std::fs::remove_dir_all(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("removing {}", dir.display()))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -223,6 +236,22 @@ impl Runner for Kube {
             Err(e) => return Err(e).with_context(|| format!("making the VM {name}")),
         }
         info!(session = %session, player, epoch, vmi = name, "player started");
+        Ok(())
+    }
+
+    async fn forget(&self, session: Uuid) -> anyhow::Result<()> {
+        let its = ListParams::default().labels(&format!(
+            "{LABEL_RUNNER}={},{LABEL_SESSION}={session}",
+            self.name
+        ));
+        for vmi in self.vmis.list(&its).await? {
+            let name = vmi.metadata.name.unwrap_or_default();
+            match self.vmis.delete(&name, &DeleteParams::default()).await {
+                Ok(_) => info!(session = %session, vmi = name, "deleted a deleted session's VM"),
+                Err(kube::Error::Api(e)) if e.code == 404 => {}
+                Err(e) => return Err(e).with_context(|| format!("deleting the VM {name}")),
+            }
+        }
         Ok(())
     }
 }

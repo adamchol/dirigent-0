@@ -5,7 +5,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useLiveQuery } from "@chlive/client/react";
 import { AnimatePresence, motion } from "motion/react";
 import {
+  ArchiveIcon,
+  ArchiveRestoreIcon,
   BotIcon,
+  ChevronRightIcon,
   CodeIcon,
   CopyIcon,
   EllipsisIcon,
@@ -17,6 +20,7 @@ import {
   PlayIcon,
   PlusIcon,
   SquareIcon,
+  Trash2Icon,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -119,8 +123,69 @@ function act(what: string, f: () => Promise<void>, changed: () => void) {
   };
 }
 
+/** Archiving the session, or unarchiving it, and deleting it once it's archived (`remove`): its
+ * owner's, while it's idle. */
+function ArchiveItems(props: { info: SessionInfo; who: api.Who; changed: () => void; remove: () => void }) {
+  const on = !props.info.archived;
+  return (
+    <>
+      <DropdownMenuItem
+        onClick={act(on ? "Not archived" : "Not unarchived", () => api.archive(props.who, props.info.id, on), props.changed)}
+      >
+        {on ? <ArchiveIcon /> : <ArchiveRestoreIcon />} {on ? "Archive" : "Unarchive"}
+      </DropdownMenuItem>
+      {!on && (
+        <DropdownMenuItem variant="destructive" onClick={props.remove}>
+          <Trash2Icon /> Delete…
+        </DropdownMenuItem>
+      )}
+    </>
+  );
+}
+
+/** The dialog deleting the session `info` (archived), once there is one to delete; `deleted`,
+ * once control took it. */
+export function DeleteDialog(props: { info?: SessionInfo; who: api.Who; deleted: (id: string) => void; close: () => void }) {
+  const titles = useTitles();
+  const [busy, setBusy] = useState(false);
+  const info = props.info;
+
+  async function remove() {
+    if (!info) return;
+    setBusy(true);
+    try {
+      await api.deleteSession(props.who, info.id);
+      props.deleted(info.id);
+      props.close();
+    } catch (e) {
+      toast.error("Not deleted", { description: (e as Error).message });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog open={info !== undefined} onOpenChange={(o) => !o && props.close()}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Delete “{info ? api.title(info, titles.get(info.id)) : ""}”?</DialogTitle>
+          <DialogDescription>
+            Its conversation, its checkpoints and its secrets are deleted for good. This can't be undone.
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <DialogClose render={<Button type="button" variant="outline" />}>Cancel</DialogClose>
+          <Button type="button" variant="destructive" disabled={busy} onClick={remove}>
+            {busy ? <Spinner /> : <Trash2Icon />} Delete
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 /** A session's less used things, in a menu: its id, and stopping it (letting the turn finish, or
- * now) for its owner; and starting it, in sight while it's idle. */
+ * now) or archiving it for its owner; and starting it, in sight while it's idle and not archived. */
 export function SessionMenu(props: {
   id: string;
   info?: SessionInfo;
@@ -129,13 +194,14 @@ export function SessionMenu(props: {
   rename: () => void;
   openLocally: () => void;
   secrets: () => void;
+  remove: () => void;
 }) {
   const { info, who, changed } = props;
   const owner = info?.role === "owner";
   const idle = info !== undefined && api.state(info) === "idle";
   return (
     <>
-      {owner && idle && (
+      {owner && idle && !info?.archived && (
         <Button size="sm" onClick={act("Not started", () => api.start(who, props.id), changed)}>
           <PlayIcon /> Start
         </Button>
@@ -167,6 +233,7 @@ export function SessionMenu(props: {
             <DropdownMenuItem onClick={() => navigator.clipboard.writeText(props.id).then(() => toast.success("Session ID copied"))}>
               <CopyIcon /> Copy ID
             </DropdownMenuItem>
+            {owner && info && idle && <ArchiveItems info={info} who={who} changed={changed} remove={props.remove} />}
           </DropdownMenuGroup>
           {owner && !idle && (
             <>
@@ -216,6 +283,7 @@ export function SessionsSidebar(props: {
   rename: (id: string) => void;
   openLocally: (id: string) => void;
   secrets: (id: string) => void;
+  remove: (id: string) => void;
   account: React.ReactNode;
   className?: string;
 }) {
@@ -226,8 +294,10 @@ export function SessionsSidebar(props: {
   const shown = sorted.filter((s) =>
     [api.title(s, titles.get(s.id)), api.place(s)].some((t) => t.toLowerCase().includes(wanted)),
   );
-  const mine = shown.filter((s) => s.role === "owner");
-  const shared = shown.filter((s) => s.role !== "owner");
+  const mine = shown.filter((s) => s.role === "owner" && !s.archived);
+  const shared = shown.filter((s) => s.role !== "owner" && !s.archived);
+  const archived = shown.filter((s) => s.archived);
+  const [openArchived, setOpenArchived] = useState(false);
   return (
     <nav aria-label="Sessions" className={cn("flex w-58 shrink-0 flex-col gap-2 bg-panel p-2", props.className)}>
       <label htmlFor="filter" className="sr-only">
@@ -255,6 +325,20 @@ export function SessionsSidebar(props: {
             <SessionItems list={shared} titles={titles} {...props} />
           </>
         )}
+        {archived.length > 0 && (
+          <>
+            <button
+              type="button"
+              aria-expanded={openArchived}
+              onClick={() => setOpenArchived(!openArchived)}
+              className="mt-3 mb-1 flex items-center gap-1 px-2 text-left text-[11px] text-dim hover:text-foreground"
+            >
+              <ChevronRightIcon className={cn("size-3 transition-transform", openArchived && "rotate-90")} />
+              Archived ({archived.length})
+            </button>
+            {openArchived && <SessionItems list={archived} titles={titles} {...props} />}
+          </>
+        )}
         <button
           type="button"
           onClick={props.create}
@@ -274,6 +358,7 @@ function SessionItems(props: {
   rename: (id: string) => void;
   openLocally: (id: string) => void;
   secrets: (id: string) => void;
+  remove: (id: string) => void;
   selected: string;
   select: (id: string) => void;
   who: api.Who;
@@ -328,7 +413,7 @@ function SessionItems(props: {
                 </DropdownMenuTrigger>
                 <DropdownMenuContent side="right" align="start" className="w-48">
                   <DropdownMenuGroup>
-                    {owner && st === "idle" && (
+                    {owner && st === "idle" && !s.archived && (
                       <DropdownMenuItem onClick={act("Not started", () => api.start(props.who, s.id), props.sessions.refresh)}>
                         <PlayIcon /> Start
                       </DropdownMenuItem>
@@ -364,6 +449,9 @@ function SessionItems(props: {
                   <DropdownMenuItem onClick={() => navigator.clipboard.writeText(s.id).then(() => toast.success("Session ID copied"))}>
                     <CopyIcon /> Copy ID
                   </DropdownMenuItem>
+                  {owner && st === "idle" && (
+                    <ArchiveItems info={s} who={props.who} changed={props.sessions.refresh} remove={() => props.remove(s.id)} />
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             </motion.li>

@@ -135,7 +135,9 @@ networkPolicy:
 # continuous-backup's chart (Kafka Connect with the ClickHouse sink, and the pause server), with
 # dirigent's pipeline. Disabled, it's yours: give pauseServerUrl, and run the session_events
 # pipeline (topic and table session_events, database dirigent, with the InsertField transform
-# below).
+# below). A deleted session's events are deleted from ClickHouse (by control, as
+# `dirigent_control`), but the topic keeps their messages until its retention (the pipeline's
+# retentionMs, 90 days by default); chlive's snapshots keep them until chlive replaces them.
 ingestion:
   enabled: true
   pauseServerUrl: ""

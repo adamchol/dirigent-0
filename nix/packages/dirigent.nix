@@ -1,12 +1,16 @@
-# dirigent's Rust binaries: `control`, `player` and the CLI, `dirigent`. The tests need the
-# running stack (`dnvr up`, then `e2e`), so none run here.
+# dirigent's Rust binaries: `control`, `player` and the CLI, `dirigent`; the player tells its
+# version, `<version>+<rev>`. Most tests need the running stack (`dnvr up`, then `e2e`): only
+# the player's loading of the logs older players wrote (player/logs) runs here, so no image is
+# built with a player that can't go on with old sessions.
 {
   lib,
   rustPlatform,
+  version,
+  rev,
 }:
 rustPlatform.buildRustPackage {
   pname = "dirigent";
-  version = "0.1.0";
+  inherit version;
   src = lib.fileset.toSource {
     root = ../..;
     fileset = lib.fileset.unions [
@@ -24,6 +28,11 @@ rustPlatform.buildRustPackage {
     lockFile = ../../Cargo.lock;
     allowBuiltinFetchGit = true;
   };
-  doCheck = false;
+  env.DIRIGENT_VERSION = "${version}+${rev}";
+  cargoTestFlags = [
+    "-p"
+    "dirigent-player"
+  ];
+  checkFlags = [ "old_logs" ];
   meta.mainProgram = "control";
 }

@@ -1,5 +1,5 @@
 {{- /* The schema migrations (openmig.toml, db/), as Postgres' superuser and ClickHouse's admin,
-then ClickHouse's users for chlive and the ingestion (what scripts/clickhouse-dev-access.sql
+then ClickHouse's users for chlive, the ingestion and control (what scripts/clickhouse-dev-access.sql
 does in dev): before control starts, every time (they're no-ops when done). */}}
 {{- define "dirigent.migrate" }}
         - name: migrate
@@ -31,6 +31,9 @@ does in dev): before control starts, every time (they're no-ops when done). */}}
               sql "CREATE USER OR REPLACE dirigent_recovery $on IDENTIFIED WITH sha256_password BY '$RECOVERY'"
               sql "GRANT $on SELECT, INSERT, CREATE TABLE ON dirigent.* TO dirigent_recovery"
               sql "GRANT $on SELECT ON system.tables TO dirigent_recovery"
+              sql "CREATE USER OR REPLACE dirigent_control $on IDENTIFIED WITH sha256_password BY '$CONTROL'"
+              # a lightweight DELETE updates the rows' _row_exists mask (ClickHouse 25.x checks for both)
+              sql "GRANT $on ALTER DELETE, ALTER UPDATE(_row_exists), SELECT ON dirigent.session_events TO dirigent_control"
               echo "migrated; ClickHouse's users made"
           env:
             - name: PG_PASSWORD
@@ -47,7 +50,7 @@ does in dev): before control starts, every time (they're no-ops when done). */}}
               valueFrom: { secretKeyRef: { name: {{ .Values.clickhouse.adminSecret }}, key: username } }
             - name: CH_PASSWORD
               valueFrom: { secretKeyRef: { name: {{ .Values.clickhouse.adminSecret }}, key: password } }
-            {{- range $env, $user := dict "CHLIVE_RO" "chlive_ro" "CHLIVE_SNAP" "chlive_snap" "SINK" "dirigent_sink" "PAUSE" "dirigent_pause" "RECOVERY" "dirigent_recovery" }}
+            {{- range $env, $user := dict "CHLIVE_RO" "chlive_ro" "CHLIVE_SNAP" "chlive_snap" "SINK" "dirigent_sink" "PAUSE" "dirigent_pause" "RECOVERY" "dirigent_recovery" "CONTROL" "dirigent_control" }}
             - name: {{ $env }}
               valueFrom: { secretKeyRef: { name: dirigent-clickhouse, key: {{ $user }} } }
             {{- end }}

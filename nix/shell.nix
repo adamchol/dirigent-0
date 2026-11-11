@@ -146,6 +146,9 @@ in
         # for the players
         CHLIVE_URL = "dnvr://chlive/url";
         DIRIGENT_KOPIA_TOKEN = "dnvr://kopia-repo/token";
+        # where it deletes deleted sessions' events (scripts/clickhouse-dev-access.sql's user)
+        CH_HTTP_URL = "dnvr://clickhouse/httpUrl";
+        CH_ACCESS = "dnvr://migrate-clickhouse/ready";
       };
       command = ''
         cd "$DNVR_ROOT"
@@ -160,6 +163,8 @@ in
           --postgres "''${PG_URL/:\/\/*@/://dirigent_control@}" \
           --signing-key .dnvr/control-key/key.pem --link-key .dnvr/control-key/link.key \
           --players .dnvr/sessions --player target/debug/player \
+          --clickhouse-url "$CH_HTTP_URL" --clickhouse-password dirigent_control \
+          --kopia-state .dnvr/control-kopia \
           -- ''${DIRIGENT_PLAYER_ARGS---mock}
       '';
     };
@@ -312,6 +317,18 @@ in
         fi
         curl -fsS -X POST "$DIRIGENT_CONTROL_HTTP/sessions/''${1:?a session id}/stop" "''${caller[@]}" \
           -H 'content-type: application/json' -d "{\"now\": $now}"
+      '';
+    };
+    save-log = {
+      description = "Keep a session's log as one the player must go on loading: save-log <uuid> <name> writes player/logs/<the chart's appVersion>/<name>.jsonl (its rows but the deltas, as ClickHouse gives them)";
+      text = ''
+        version=$(sed -n 's/^appVersion: //p' "$DNVR_ROOT/chart/dirigent/Chart.yaml")
+        dir="$DNVR_ROOT/player/logs/$version"
+        mkdir -p "$dir"
+        ch --param_session="''${1:?a session id}" -q "select session_id, offset, partition, ts, id, \
+          author, kind, data from dirigent.session_events where session_id = {session:UUID} \
+          and kind != 'model_delta' order by offset format JSONEachRow" >"$dir/''${2:?a name}.jsonl"
+        echo "$dir/$2.jsonl: $(wc -l <"$dir/$2.jsonl") rows"
       '';
     };
     web-check = {

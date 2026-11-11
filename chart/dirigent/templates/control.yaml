@@ -38,6 +38,12 @@ rules:
       - dirigent-garage
       {{- end }}
     verbs: [get, patch]
+  # the checkpoints' repository (its hook Job makes it), which control deletes deleted sessions'
+  # snapshots from and maintains
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [dirigent-kopia]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -154,6 +160,15 @@ spec:
               value: /etc/dirigent/player/vm.json
             - name: DIRIGENT_KUBE_NAME
               value: {{ .Release.Name }}
+            # where deleted sessions' events are deleted, as `dirigent_control`
+            - name: DIRIGENT_CLICKHOUSE_URL
+              value: "{{ if .Values.clickhouse.secure }}https{{ else }}http{{ end }}://{{ .Values.clickhouse.host }}:{{ .Values.clickhouse.port }}"
+            - name: DIRIGENT_CLICKHOUSE_PASSWORD
+              valueFrom: { secretKeyRef: { name: dirigent-clickhouse, key: dirigent_control } }
+            - name: DIRIGENT_KOPIA_TOKEN_SECRET
+              value: dirigent-kopia
+            - name: DIRIGENT_KOPIA_STATE
+              value: /var/lib/dirigent/kopia
           ports:
             - { name: http, containerPort: 8090 }
             - { name: grpc, containerPort: 8091 }
@@ -164,8 +179,12 @@ spec:
           volumeMounts:
             - { name: keys, mountPath: /etc/dirigent/keys, readOnly: true }
             - { name: player, mountPath: /etc/dirigent/player, readOnly: true }
+            - { name: kopia, mountPath: /var/lib/dirigent/kopia }
       volumes:
         - name: keys
           emptyDir: { medium: Memory, sizeLimit: 1Mi }
         - name: player
           configMap: { name: dirigent-player }
+        # control's kopia config and cache
+        - name: kopia
+          emptyDir: {}

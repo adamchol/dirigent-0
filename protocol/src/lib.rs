@@ -108,8 +108,12 @@ pub enum TurnEndReason {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Event {
     /// From the player, before it reads the log: it holds the session's lease, as the `epoch`th
-    /// player to (see `control`).
-    PlayerAttached { epoch: i64 },
+    /// player to (see `control`); `version`, the player's (none from those before it was told).
+    PlayerAttached {
+        epoch: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+    },
     /// From the player, last: the session was stopped and it gives the lease back, as the
     /// `epoch`th player.
     PlayerDetached { epoch: i64 },
@@ -357,7 +361,10 @@ mod tests {
         let s = String::new;
         let usage = Usage::default();
         let events = [
-            Event::PlayerAttached { epoch: 1 },
+            Event::PlayerAttached {
+                epoch: 1,
+                version: None,
+            },
             Event::PlayerDetached { epoch: 1 },
             Event::PlayerFailed {
                 epoch: 1,

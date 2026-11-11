@@ -41,6 +41,17 @@ table "dirigent.sessions" {
     null    = false
     default = sql("now()")
   }
+  # Since when it's archived (its owner put it away: no player takes it until it's unarchived).
+  column "archived" {
+    type = timestamptz
+    null = true
+  }
+  # Since when it's being deleted (its owner deleted it, archived: no one has access, and control
+  # removes what it left, this row last).
+  column "deleting" {
+    type = timestamptz
+    null = true
+  }
   primary_key { columns = [column.id] }
 }
 
