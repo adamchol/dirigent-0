@@ -11,6 +11,9 @@ use dirigent_protocol::{Event, TurnEndReason};
 pub const ABORT_MARKER: &str =
     "The user interrupted the previous turn. Tools that were running may have partially executed.";
 
+/// The result of a tool call whose turn ended without running it.
+pub const NOT_RUN: &str = "Not run: the turn ended before this tool call ran";
+
 const SUMMARY_PREAMBLE: &str = "This session was compacted: the summary below replaces the conversation before it. What follows the summary is kept as it was.";
 
 /// For estimating tokens from text.
@@ -322,6 +325,19 @@ impl History {
                 Entry::TurnEnded { aborted } => {
                     in_turn = false;
                     calling = false;
+                    // a call the turn ended without running (a provider said it was done), which
+                    // the next call can't send without a result
+                    for id in &calls {
+                        if !results.iter().any(
+                            |b| matches!(b, ContentBlock::ToolResult { call_id, .. } if call_id == id),
+                        ) {
+                            results.push(ContentBlock::ToolResult {
+                                call_id: id.clone(),
+                                content: NOT_RUN.into(),
+                                is_error: true,
+                            });
+                        }
+                    }
                     texts.append(&mut held);
                     if *aborted {
                         texts.push(ABORT_MARKER.into());
@@ -631,6 +647,29 @@ mod tests {
             ]
         );
         assert_eq!(msgs[4], Message::user("next"));
+    }
+
+    #[test]
+    fn a_call_its_turn_ended_without_gets_a_result() {
+        // a provider said the reply was done; the call never ran
+        let msgs = messages(&[
+            user("look around"),
+            assistant(vec![call("c1")], StopReason::EndTurn),
+            ended(TurnEndReason::Completed),
+            user("go ahead"),
+        ]);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(
+            msgs[2].content,
+            vec![
+                ContentBlock::ToolResult {
+                    call_id: "c1".into(),
+                    content: NOT_RUN.into(),
+                    is_error: true
+                },
+                text("go ahead"),
+            ]
+        );
     }
 
     #[test]

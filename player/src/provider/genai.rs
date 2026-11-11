@@ -81,6 +81,9 @@ impl GenaiProvider {
         let mut st = MapState::default();
         let stream = res.stream.flat_map(move |item| {
             let out: Vec<Result<Delta, ProviderError>> = match item {
+                Ok(ChatStreamEvent::End(end)) if st.ended_empty(&end) => {
+                    vec![Err(ProviderError::Stream(EMPTY_END.into()))]
+                }
                 Ok(ev) => st.map(ev).into_iter().map(Ok).collect(),
                 Err(e) => vec![Err(classify_error(e))],
             };
@@ -313,7 +316,20 @@ pub struct MapState {
     streamed_signatures: bool,
 }
 
+/// A stream that ended with nothing: no stop reason, usage or content. genai ends a Responses
+/// stream so when the server's event isn't one it knows (an `error` one: a refused request), or
+/// the connection closes early; either way not a reply.
+const EMPTY_END: &str = "the model's response ended without a reply";
+
 impl MapState {
+    /// Whether `end` ends a stream that had nothing (see [`EMPTY_END`]).
+    pub fn ended_empty(&self, end: &StreamEnd) -> bool {
+        self.next_index == 0
+            && end.captured_stop_reason.is_none()
+            && end.captured_usage.is_none()
+            && end.captured_content.as_ref().is_none_or(|c| c.is_empty())
+    }
+
     pub fn map(&mut self, ev: ChatStreamEvent) -> Vec<Delta> {
         let mut out = Vec::new();
         match ev {
@@ -474,8 +490,9 @@ impl MapState {
             out.push(Delta::Usage(to_usage(usage)));
         }
         let stop = match end.captured_stop_reason {
+            // OpenAI's Responses API says `completed` of a reply of function calls too
+            Some(GStop::Completed(_)) | None if !self.tool_index.is_empty() => StopReason::ToolUse,
             Some(s) => to_stop_reason(s),
-            None if !self.tool_index.is_empty() => StopReason::ToolUse,
             None => StopReason::EndTurn,
         };
         out.push(Delta::Stop(stop));
@@ -911,6 +928,51 @@ mod tests {
             .filter(|d| matches!(d, Delta::BlockStop { .. }))
             .collect();
         assert_eq!(stops.len(), 2);
+    }
+
+    #[test]
+    fn a_completed_reply_with_tool_calls_is_tool_use() {
+        // OpenAI's Responses API: `response.completed`'s status, for function calls too
+        let mut st = MapState::default();
+        let mut deltas = st.map(ChatStreamEvent::ToolCallChunk(ToolChunk {
+            tool_call: ToolCall {
+                call_id: "c1".into(),
+                fn_name: "Bash".into(),
+                fn_arguments: Value::String("{\"command\": \"pwd\"}".into()),
+                thought_signatures: None,
+            },
+        }));
+        deltas.extend(st.map(end(Some(GStop::Completed("completed".into())), None)));
+        let mut acc = Accumulator::default();
+        deltas.into_iter().for_each(|d| acc.push(d));
+        assert_eq!(acc.finish().stop_reason, StopReason::ToolUse);
+
+        let mut st = MapState::default();
+        let mut deltas = st.map(ChatStreamEvent::Chunk(chunk("hi")));
+        deltas.extend(st.map(end(Some(GStop::Completed("completed".into())), None)));
+        let mut acc = Accumulator::default();
+        deltas.into_iter().for_each(|d| acc.push(d));
+        assert_eq!(acc.finish().stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn a_stream_that_ended_with_nothing_is_not_a_reply() {
+        let st = MapState::default();
+        let ChatStreamEvent::End(empty) = end(None, None) else {
+            unreachable!()
+        };
+        assert!(st.ended_empty(&empty));
+        let ChatStreamEvent::End(stopped) = end(Some(GStop::Completed("completed".into())), None)
+        else {
+            unreachable!()
+        };
+        assert!(!st.ended_empty(&stopped));
+        let mut st = MapState::default();
+        st.map(ChatStreamEvent::Chunk(chunk("hi")));
+        let ChatStreamEvent::End(e) = end(None, None) else {
+            unreachable!()
+        };
+        assert!(!st.ended_empty(&e));
     }
 
     #[test]
