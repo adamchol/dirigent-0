@@ -273,6 +273,24 @@ table "dirigent.web_sessions" {
   primary_key { columns = [column.id] }
 }
 
+# The GitHub App installations each user may use for their sessions' repositories: those GitHub
+# said their GitHub account reaches when they connected it (control's `github.rs`). Each repo
+# gets a token of its own from the installation on its owner's account.
+table "dirigent.github_installations" {
+  column "subject" { type = text }
+  column "installation_id" { type = bigint }
+  column "account" {
+    type = text
+    null = false
+  }
+  column "linked" {
+    type    = timestamptz
+    null    = false
+    default = sql("now()")
+  }
+  primary_key { columns = [column.subject, column.installation_id] }
+}
+
 publication "dirigent_chlive" {
   tables = [table.dirigent.session_access, table.dirigent.insert_kinds]
 }
@@ -282,7 +300,7 @@ grant {
   on = [
     table.dirigent.sessions, table.dirigent.session_access, table.dirigent.chatgpt_links,
     table.dirigent.api_keys, table.dirigent.user_secrets, table.dirigent.session_secrets,
-    table.dirigent.web_sessions,
+    table.dirigent.web_sessions, table.dirigent.github_installations,
   ]
   to         = [role.dirigent_control]
 }

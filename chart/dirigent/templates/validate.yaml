@@ -13,6 +13,11 @@
 {{- if and .Values.auth.google.cli.clientId (not .Values.auth.google.cli.clientSecret) }}
 {{- fail "auth.google.cli.clientSecret is required with its clientId" }}
 {{- end }}
+{{- with .Values.github.app }}
+{{- if and .slug (or (empty .clientId) (empty .secret)) }}
+{{- fail "github.app.clientId and github.app.secret are required with its slug" }}
+{{- end }}
+{{- end }}
 {{- $_ := required "clickhouse.adminSecret" .Values.clickhouse.adminSecret }}
 {{- $_ := required "kafka.bootstrapServers" .Values.kafka.bootstrapServers }}
 {{- if le (int .Values.player.stopGrace) (int .Values.player.checkpointMargin) }}

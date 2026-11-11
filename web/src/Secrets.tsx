@@ -15,6 +15,9 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import * as api from "./api.ts";
 import type { SessionInfo, Who } from "./api.ts";
 import type { Item } from "./events.ts";
+import { TOKEN_PAGE } from "./GitHub.tsx";
+
+const GITHUB_TOKEN = "GITHUB_TOKEN";
 
 export type Request = Extract<Item, { t: "request" }>;
 
@@ -105,7 +108,7 @@ export function ProvideDialog(props: {
 
 /** The secrets of `session` (its own; its owner's for all sessions shown too), or, without one,
  * the user's for all their sessions: added, replaced and removed by name. */
-export function SecretsDialog(props: { open: boolean; who: Who; session?: SessionInfo; close: () => void }) {
+export function SecretsDialog(props: { open: boolean; who: Who; session?: SessionInfo; name?: string; close: () => void }) {
   const id = props.session?.id;
   const [names, setNames] = useState<string[] | null>(null);
   const [name, setName] = useState("");
@@ -117,10 +120,10 @@ export function SecretsDialog(props: { open: boolean; who: Who; session?: Sessio
   useEffect(() => {
     if (!props.open) return;
     setNames(null);
-    setName("");
+    setName(props.name ?? "");
     setValue("");
     load();
-  }, [props.open, load]);
+  }, [props.open, load, props.name]);
   // a session's, from all its owner's sessions: what control lists that isn't its own
   const inherited = (props.session?.secrets ?? []).filter((n) => !names?.includes(n));
   const valid = api.secretName(name);
@@ -207,6 +210,15 @@ export function SecretsDialog(props: { open: boolean; who: Who; session?: Sessio
               onChange={(e) => setValue(e.target.value)}
             />
           </div>
+          {name === GITHUB_TOKEN && (
+            <p className="text-[12px] text-muted-foreground">
+              git and <code className="font-mono">gh</code> use it for GitHub in the sessions: a{" "}
+              <a className="text-primary-text hover:underline" href={TOKEN_PAGE} target="_blank" rel="noreferrer">
+                fine-grained token
+              </a>{" "}
+              with Contents read and write on the repositories.
+            </p>
+          )}
           <DialogFooter>
             <DialogClose render={<Button type="button" variant="outline" />}>Done</DialogClose>
             <Button type="submit" disabled={busy || !valid || !value}>

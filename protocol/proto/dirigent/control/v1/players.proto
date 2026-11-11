@@ -129,7 +129,8 @@ enum Effort {
   EFFORT_MAX = 4;
 }
 
-// A public repository, cloned at `ref` (a branch or tag; absent, its default branch).
+// A repository, cloned at `ref` (a branch or tag; absent, its default branch): with the
+// session's GITHUB_TOKEN, a private one on GitHub too.
 message GitSource {
   string url = 1;
   optional string ref = 2;

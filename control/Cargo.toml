@@ -23,8 +23,9 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # credentials (src/token.rs, src/auth.rs): Ed25519 JWTs of control's, and an OpenID provider's ID
-# tokens, verified with its JWKS (rust_crypto: pure Rust, as chlive)
-jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+# tokens, verified with its JWKS (rust_crypto: pure Rust, as chlive); the GitHub App's RSA key
+# (src/github.rs), from its PEM
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 sha2 = "0.10"
 base64 = "0.22"

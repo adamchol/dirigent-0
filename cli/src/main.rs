@@ -69,7 +69,8 @@ enum Command {
     /// Unlink an account: dirigent revokes its grant (or forgets the key).
     Unlink { account: Account },
     /// The secrets your sessions' tools get, by name: for all your sessions, or one's
-    /// (`--session`), which wins. Values are never shown again.
+    /// (`--session`), which wins. Values are never shown again. `GITHUB_TOKEN` is git's for
+    /// GitHub too: a session on a private repository clones it with it.
     Secret {
         #[command(subcommand)]
         command: SecretCommand,

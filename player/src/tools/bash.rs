@@ -64,13 +64,14 @@ impl Tool for Bash {
 
         let mut cmd = Command::new("bash");
         // the player's environment only as far as a shell needs it, and the session's secrets
+        // (and git's use of its GitHub token)
         cmd.env_clear();
         for (key, value) in std::env::vars_os() {
             if passed_on(&key.to_string_lossy()) {
                 cmd.env(key, value);
             }
         }
-        cmd.envs(ctx.secrets.current());
+        cmd.envs(ctx.secrets.env());
         cmd.arg("-c")
             .arg(&command)
             .current_dir(ctx.workdir)
@@ -241,6 +242,7 @@ mod tests {
         assert!(
             names.iter().all(|n| passed_on(n)
                 || n == "GITHUB_TOKEN"
+                || n.starts_with("GIT_CONFIG_")
                 || n == "PWD"
                 || n == "SHLVL"
                 || n == "_"
@@ -248,6 +250,7 @@ mod tests {
             "{names:?}"
         );
         assert!(names.contains(&"GITHUB_TOKEN".to_string()));
+        assert!(names.contains(&"GIT_CONFIG_COUNT".to_string()));
         let out = bash(&ctx, json!({ "command": "printf %s \"$GITHUB_TOKEN\"" })).await;
         assert_eq!(out.content, "ghp_first");
         // one given meanwhile reaches the next command

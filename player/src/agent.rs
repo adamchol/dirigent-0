@@ -195,10 +195,15 @@ impl Agent {
                 Some(ev) = outcomes.recv() => run.handle(ev).await,
                 Some(named) = names.recv() => run.named(named).await,
                 Some(now) = secrets.changed(&seen) => {
+                    // only new names are news: a value renewed (a GitHub App's token, hourly)
+                    // isn't, and redacting goes by the values there are now anyway
                     let names: Vec<String> = now.keys().cloned().collect();
-                    info!(?names, "the session's secrets changed");
+                    let renamed = !seen.keys().eq(now.keys());
                     seen = now;
-                    run.session.publish(&Event::SecretsChanged { names }).await;
+                    if renamed {
+                        info!(?names, "the session's secrets changed");
+                        run.session.publish(&Event::SecretsChanged { names }).await;
+                    }
                 }
                 now = told_to_detach(&mut detach.when, detaching), if detaching != Some(true) => {
                     info!(now, "detaching");
@@ -1603,9 +1608,15 @@ mod tests {
         let file = std::fs::read_to_string(h.workdir.join("token.txt")).unwrap();
         assert_eq!(file, "ghp_first_value", "the tool had the value");
 
+        // its value renewed: not recorded
+        tx.send_replace(crate::secrets::tokens(&[(
+            "GITHUB_TOKEN",
+            "ghp_renewed_value",
+        )]));
+        tokio::time::sleep(Duration::from_millis(50)).await;
         // another meanwhile: recorded by name
         tx.send_replace(crate::secrets::tokens(&[
-            ("GITHUB_TOKEN", "ghp_first_value"),
+            ("GITHUB_TOKEN", "ghp_renewed_value"),
             ("NPM_TOKEN", "npm_value_1"),
         ]));
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1625,6 +1636,11 @@ mod tests {
         );
         assert!(
             kinds.contains(&"secrets:GITHUB_TOKEN,NPM_TOKEN".to_string()),
+            "{kinds:?}"
+        );
+        assert_eq!(
+            kinds.iter().filter(|k| k.starts_with("secrets:")).count(),
+            1,
             "{kinds:?}"
         );
         let wire = serde_json::to_string(&*published.lock().unwrap()).unwrap();

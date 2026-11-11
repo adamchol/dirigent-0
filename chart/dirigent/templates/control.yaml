@@ -169,6 +169,19 @@ spec:
               value: dirigent-kopia
             - name: DIRIGENT_KOPIA_STATE
               value: /var/lib/dirigent/kopia
+            {{- with .Values.github.app }}
+            {{- if .slug }}
+            # the GitHub App's, for private repositories
+            - name: DIRIGENT_GITHUB_APP_SLUG
+              value: {{ .slug | quote }}
+            - name: DIRIGENT_GITHUB_APP_CLIENT_ID
+              value: {{ .clientId | quote }}
+            - name: DIRIGENT_GITHUB_APP_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: {{ .secret }}, key: clientSecret } }
+            - name: DIRIGENT_GITHUB_APP_KEY
+              value: /etc/dirigent/github/privateKey
+            {{- end }}
+            {{- end }}
           ports:
             - { name: http, containerPort: 8090 }
             - { name: grpc, containerPort: 8091 }
@@ -180,6 +193,9 @@ spec:
             - { name: keys, mountPath: /etc/dirigent/keys, readOnly: true }
             - { name: player, mountPath: /etc/dirigent/player, readOnly: true }
             - { name: kopia, mountPath: /var/lib/dirigent/kopia }
+            {{- if .Values.github.app.slug }}
+            - { name: github, mountPath: /etc/dirigent/github, readOnly: true }
+            {{- end }}
       volumes:
         - name: keys
           emptyDir: { medium: Memory, sizeLimit: 1Mi }
@@ -188,3 +204,11 @@ spec:
         # control's kopia config and cache
         - name: kopia
           emptyDir: {}
+        {{- with .Values.github.app }}
+        {{- if .slug }}
+        - name: github
+          secret:
+            secretName: {{ .secret }}
+            items: [{ key: privateKey, path: privateKey }]
+        {{- end }}
+        {{- end }}

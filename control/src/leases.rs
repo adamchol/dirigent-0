@@ -612,6 +612,69 @@ impl Store {
         Ok(())
     }
 
+    /// `subject` may use these GitHub App installations (id, account), besides those they could
+    /// already.
+    pub async fn link_github(
+        &self,
+        subject: &str,
+        installations: &[(i64, String)],
+    ) -> anyhow::Result<()> {
+        let db = self.db.lock().await;
+        for (id, account) in installations {
+            db.execute(
+                "INSERT INTO dirigent.github_installations (subject, installation_id, account) \
+                 VALUES ($1, $2, $3) ON CONFLICT (subject, installation_id) \
+                 DO UPDATE SET account = excluded.account, linked = now()",
+                &[&subject, id, account],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The GitHub App installations `subject` may use: (id, account), by account.
+    pub async fn github_installations(&self, subject: &str) -> anyhow::Result<Vec<(i64, String)>> {
+        let rows = self
+            .db
+            .lock()
+            .await
+            .query(
+                "SELECT installation_id, account FROM dirigent.github_installations \
+                 WHERE subject = $1 ORDER BY account",
+                &[&subject],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    /// `subject` uses no GitHub App installations any more; whether they did.
+    pub async fn unlink_github(&self, subject: &str) -> anyhow::Result<bool> {
+        let n = self
+            .db
+            .lock()
+            .await
+            .execute(
+                "DELETE FROM dirigent.github_installations WHERE subject = $1",
+                &[&subject],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// `subject`'s secret `name` for all their sessions, sealed, if they gave one.
+    pub async fn user_secret(&self, subject: &str, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let row = self
+            .db
+            .lock()
+            .await
+            .query_opt(
+                "SELECT value FROM dirigent.user_secrets WHERE subject = $1 AND name = $2",
+                &[&subject, &name],
+            )
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
     /// `subject`'s ChatGPT link, if they linked one.
     pub async fn link(&self, subject: &str) -> anyhow::Result<Option<Link>> {
         let row = self

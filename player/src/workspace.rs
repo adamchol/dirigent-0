@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use crate::checkpoints::Checkpoints;
 use crate::mirror::Mirror;
 use crate::process::{command, run};
-use crate::secrets::Secrets;
+use crate::secrets::{git_credentials, Secrets, GITHUB_TOKEN};
 use crate::session::Session;
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -34,7 +34,7 @@ pub async fn open(
 ) -> anyhow::Result<(Vec<(String, Event)>, Option<Mirror>)> {
     let mut log = session.load().await?;
     let mut restored = false;
-    match prepare(workdir, source, &log, checkpoints).await {
+    match prepare(workdir, source, &log, checkpoints, &secrets).await {
         Ok(None) => {}
         Ok(Some(ev)) => {
             info!(?ev, "workspace in place");
@@ -65,12 +65,14 @@ pub async fn open(
 
 /// Make the workspace in `workdir` (which exists) from `source`, as `log` (the session's log so
 /// far) needs: the event to append, if any, or why it couldn't be made. Found gone, it's
-/// restored from the log's last checkpoint, given `checkpoints`; without, made again.
+/// restored from the log's last checkpoint, given `checkpoints`; without, made again. A git
+/// source is cloned with the session's GitHub token, if it has one (`secrets`).
 pub async fn prepare(
     workdir: &Path,
     source: Option<&Source>,
     log: &[(String, Event)],
     checkpoints: Option<&Checkpoints>,
+    secrets: &Secrets,
 ) -> Result<Option<Event>, String> {
     let ready = log
         .iter()
@@ -109,7 +111,7 @@ pub async fn prepare(
             workdir.display()
         )),
         (Some(source @ Source::Git { url, reference }), recreated, true) => {
-            clone(url, reference.as_deref(), workdir).await?;
+            clone(url, reference.as_deref(), workdir, secrets).await?;
             Ok(Some(Event::WorkspaceReady {
                 source: Some(source.clone()),
                 head: Some(head(workdir).await?),
@@ -119,10 +121,22 @@ pub async fn prepare(
     }
 }
 
-/// A partial clone: all of the history, with blobs fetched as they're needed. Public
-/// repositories only: git never asks for credentials.
-async fn clone(url: &str, reference: Option<&str>, workdir: &Path) -> Result<(), String> {
+/// A partial clone: all of the history, with blobs fetched as they're needed. On GitHub, with
+/// the session's `GITHUB_TOKEN` if it has one; git never asks for credentials otherwise.
+async fn clone(
+    url: &str,
+    reference: Option<&str>,
+    workdir: &Path,
+    secrets: &Secrets,
+) -> Result<(), String> {
+    let secrets = secrets.current();
     let mut cmd = git();
+    cmd.envs(
+        secrets
+            .get_key_value(GITHUB_TOKEN)
+            .map(|(k, v)| (k.clone(), v.clone())),
+    )
+    .envs(git_credentials(&secrets));
     cmd.args(["clone", "--quiet", "--filter=blob:none"]);
     if let Some(r) = reference {
         cmd.args(["--branch", r]);
@@ -131,7 +145,33 @@ async fn clone(url: &str, reference: Option<&str>, workdir: &Path) -> Result<(),
     run(cmd, CLONE_TIMEOUT)
         .await
         .map(drop)
-        .map_err(|e| format!("cloning {url}: {e}"))
+        .map_err(|e| clone_failed(url, secrets.contains_key(GITHUB_TOKEN), &e))
+}
+
+/// Why cloning `url` failed, from git's `error`: said plainly when it's GitHub refusing it, with
+/// what gives access (`token`: the session has a `GITHUB_TOKEN`).
+fn clone_failed(url: &str, token: bool, error: &str) -> String {
+    let refused = [
+        "could not read Username",
+        "Repository not found",
+        "Authentication failed",
+    ]
+    .iter()
+    .any(|s| error.contains(s));
+    match (refused, token) {
+        (false, _) => format!("cloning {url}: {error}"),
+        (true, false) => format!(
+            "{url} is private or doesn't exist: the session has no GitHub access to it. Add a \
+             GITHUB_TOKEN secret (a fine-grained token with Contents read and write on the \
+             repository), or connect GitHub if dirigent's GitHub App is set up, then start the \
+             session again"
+        ),
+        (true, true) => format!(
+            "GitHub refused the session's GITHUB_TOKEN for {url}: it may have expired, or not \
+             cover this repository (or the repository doesn't exist). Give the secret a token \
+             that can read it, then start the session again"
+        ),
+    }
 }
 
 async fn head(workdir: &Path) -> Result<String, String> {
@@ -204,7 +244,9 @@ pub(crate) mod tests {
             source: Some(got),
             head: Some(head),
             recreated: false,
-        }) = prepare(&work, Some(&source), &[], None).await.unwrap()
+        }) = prepare(&work, Some(&source), &[], None, &Secrets::none())
+            .await
+            .unwrap()
         else {
             panic!("not ready");
         };
@@ -216,7 +258,7 @@ pub(crate) mod tests {
         );
         // a later start finds it there
         assert_eq!(
-            prepare(&work, Some(&source), &ready(false), None).await,
+            prepare(&work, Some(&source), &ready(false), None, &Secrets::none()).await,
             Ok(None)
         );
     }
@@ -227,9 +269,15 @@ pub(crate) mod tests {
         let url = repo(tmp.path());
         let work = tmp.path().join("ws");
         std::fs::create_dir(&work).unwrap();
-        prepare(&work, Some(&git_source(&url, Some("dev"))), &[], None)
-            .await
-            .unwrap();
+        prepare(
+            &work,
+            Some(&git_source(&url, Some("dev"))),
+            &[],
+            None,
+            &Secrets::none(),
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read_to_string(work.join("file")).unwrap(), "dev\n");
     }
 
@@ -239,7 +287,14 @@ pub(crate) mod tests {
         let url = repo(tmp.path());
         let work = tmp.path().join("ws");
         std::fs::create_dir(&work).unwrap();
-        let got = prepare(&work, Some(&git_source(&url, None)), &ready(false), None).await;
+        let got = prepare(
+            &work,
+            Some(&git_source(&url, None)),
+            &ready(false),
+            None,
+            &Secrets::none(),
+        )
+        .await;
         assert!(
             matches!(
                 got,
@@ -258,7 +313,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("mine"), "x").unwrap();
         assert_eq!(
-            prepare(tmp.path(), None, &[], None).await,
+            prepare(tmp.path(), None, &[], None, &Secrets::none()).await,
             Ok(Some(Event::WorkspaceReady {
                 source: None,
                 head: None,
@@ -266,12 +321,12 @@ pub(crate) mod tests {
             }))
         );
         assert_eq!(
-            prepare(tmp.path(), None, &ready(false), None).await,
+            prepare(tmp.path(), None, &ready(false), None, &Secrets::none()).await,
             Ok(None)
         );
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
-            prepare(empty.path(), None, &ready(false), None).await,
+            prepare(empty.path(), None, &ready(false), None, &Secrets::none()).await,
             Ok(None)
         );
     }
@@ -283,9 +338,15 @@ pub(crate) mod tests {
         let work = tmp.path().join("ws");
         std::fs::create_dir(&work).unwrap();
         std::fs::write(work.join("mine"), "x").unwrap();
-        let err = prepare(&work, Some(&git_source(&url, None)), &[], None)
-            .await
-            .unwrap_err();
+        let err = prepare(
+            &work,
+            Some(&git_source(&url, None)),
+            &[],
+            None,
+            &Secrets::none(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("isn't empty"), "{err}");
     }
 
@@ -293,10 +354,39 @@ pub(crate) mod tests {
     async fn a_bad_url_fails_without_asking_for_credentials() {
         let tmp = tempfile::tempdir().unwrap();
         let url = format!("file://{}/nothing.git", tmp.path().display());
-        let err = prepare(tmp.path(), Some(&git_source(&url, None)), &[], None)
-            .await
-            .unwrap_err();
+        let err = prepare(
+            tmp.path(),
+            Some(&git_source(&url, None)),
+            &[],
+            None,
+            &Secrets::none(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.starts_with("cloning file://"), "{err}");
+    }
+
+    #[test]
+    fn github_refusing_a_clone_says_what_gives_access() {
+        let url = "https://github.com/o/private";
+        let prompt = "fatal: could not read Username for 'https://github.com': terminal prompts disabled (exit status: 128)";
+        let without = clone_failed(url, false, prompt);
+        assert!(
+            without.starts_with("https://github.com/o/private is private"),
+            "{without}"
+        );
+        assert!(without.contains("GITHUB_TOKEN secret"), "{without}");
+        let refused = "remote: Repository not found.\nfatal: repository 'https://github.com/o/private/' not found";
+        let with = clone_failed(url, true, refused);
+        assert!(
+            with.starts_with("GitHub refused the session's GITHUB_TOKEN"),
+            "{with}"
+        );
+        // anything else is git's own words
+        assert_eq!(
+            clone_failed(url, true, "fatal: unable to access: timeout"),
+            "cloning https://github.com/o/private: fatal: unable to access: timeout"
+        );
     }
 
     fn checkpointed(snapshot: &str) -> Vec<(String, Event)> {
@@ -326,7 +416,7 @@ pub(crate) mod tests {
         std::fs::create_dir(&work).unwrap();
         let log = checkpointed(&snapshot);
         assert_eq!(
-            prepare(&work, Some(&source), &log, Some(&cp)).await,
+            prepare(&work, Some(&source), &log, Some(&cp), &Secrets::none()).await,
             Ok(Some(Event::WorkspaceRestored {
                 snapshot: snapshot.clone()
             }))
@@ -334,14 +424,14 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read_to_string(work.join("notes")).unwrap(), "mine");
         // there, it's kept as it is
         assert_eq!(
-            prepare(&work, Some(&source), &log, Some(&cp)).await,
+            prepare(&work, Some(&source), &log, Some(&cp), &Secrets::none()).await,
             Ok(None)
         );
 
         // without checkpoints, it's made again from the source
         let other = tmp.path().join("other");
         std::fs::create_dir(&other).unwrap();
-        let got = prepare(&other, Some(&source), &log, None).await;
+        let got = prepare(&other, Some(&source), &log, None, &Secrets::none()).await;
         assert!(
             matches!(
                 got,

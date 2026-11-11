@@ -108,7 +108,8 @@ pub enum Effort {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
-    /// A public repository, cloned at `ref` (a branch or tag; `None`, its default branch).
+    /// A repository, cloned at `ref` (a branch or tag; `None`, its default branch): with the
+    /// session's `GITHUB_TOKEN`, a private one on GitHub too.
     Git {
         url: String,
         #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]

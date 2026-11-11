@@ -207,3 +207,38 @@ export async function removeSecret(who: Who, name: string, session?: string) {
 export function secretName(name: string): boolean {
   return /^[A-Z_][A-Z0-9_]{0,63}$/.test(name);
 }
+
+/** Whether control has a GitHub App, and the accounts whose installations of it `who` connected. */
+export type GithubLink = { app: boolean; accounts: string[] };
+
+export async function githubLink(who: Who): Promise<GithubLink> {
+  return (await call(who, "GET", "/links/github")).json();
+}
+
+/** Where `who`'s browser goes to connect GitHub: installing the App, or (`existing`) authorizing it
+ * for installations made already. GitHub sends it back to control, then here (`?github=…`). */
+export async function connectGithub(who: Who, existing: boolean): Promise<string> {
+  return (await call(who, "POST", "/links/github/start", { existing })).json().then((r) => r.url);
+}
+
+export async function unlinkGithub(who: Who) {
+  await call(who, "DELETE", "/links/github");
+}
+
+/** Whether `who`'s sessions can read a repository, and how: `repo` is null for one not on GitHub;
+ * `via` null for none, `why` saying what GitHub refused; `app`, whether there's an App to connect. */
+export type Access = {
+  repo: string | null;
+  via?: "public" | "token" | "app" | null;
+  why?: string | null;
+  app: boolean;
+};
+
+export async function githubAccess(who: Who, url: string): Promise<Access> {
+  return (await call(who, "GET", `/github/access?url=${encodeURIComponent(url)}`)).json();
+}
+
+/** Whether `url` is a repository on github.com (as control parses them). */
+export function onGithub(url: string): boolean {
+  return /^(https?:\/\/(www\.)?github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)[\w.-]+\/[\w.-]+?(\.git)?\/?$/.test(url.trim());
+}

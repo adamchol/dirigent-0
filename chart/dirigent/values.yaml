@@ -31,6 +31,27 @@ auth:
       clientId: ""
       clientSecret: ""
 
+# An optional GitHub App, for private repositories: users connect GitHub in the web's account
+# menu, and sessions on repositories its installations include get tokens of it, each for the
+# session's repository alone, renewed hourly. Without it, a user's own GITHUB_TOKEN secret
+# still gives their sessions access. To make one (github.com/settings/apps/new, or an
+# organization's):
+#   - Callback URL: https://<the web's host>/api/links/github/callback, with "Request user
+#     authorization (OAuth) during installation" on
+#   - Webhook: off
+#   - Repository permissions: Contents and Pull requests, read and write
+#   - Where it can be installed: your account only, or any
+# then generate a client secret and a private key, and keep them in a Secret:
+#   kubectl create secret generic dirigent-github-app --from-literal=clientSecret=… \
+#     --from-file=privateKey=<app>.private-key.pem
+github:
+  app:
+    # its name in github.com/apps/<slug>; empty: no App
+    slug: ""
+    clientId: ""
+    # the Secret with its `clientSecret` and `privateKey`
+    secret: ""
+
 # The chart's Postgres: a CloudNativePG Cluster, with control's and chlive's roles.
 postgres:
   instances: 1

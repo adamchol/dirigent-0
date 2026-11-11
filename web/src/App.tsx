@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LiveClient, defaultUrl } from "@chlive/client";
 import { LiveClientProvider } from "@chlive/client/react";
 import { AnimatePresence, motion } from "motion/react";
-import { ChevronsUpDownIcon, KeyRoundIcon, LinkIcon, LockKeyholeIcon, LogOutIcon, MenuIcon, MonitorIcon, MoonIcon, PlusIcon, SunIcon, UserRoundPenIcon, WaypointsIcon } from "lucide-react";
+import { ChevronsUpDownIcon, GitPullRequestIcon, KeyRoundIcon, LinkIcon, LockKeyholeIcon, LogOutIcon, MenuIcon, MonitorIcon, MoonIcon, PlusIcon, SunIcon, UserRoundPenIcon, WaypointsIcon } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -40,6 +40,7 @@ import { Session, Viewers, type LiveStatus } from "./Session.tsx";
 import { RenameDialog, useTitles } from "./Rename.tsx";
 import { SyncDialog } from "./Sync.tsx";
 import { AnthropicKeyDialog } from "./Keys.tsx";
+import { connectGithub, GithubDialog, useGithubReturn } from "./GitHub.tsx";
 import { SecretsDialog } from "./Secrets.tsx";
 import { DeleteDialog, NewSession, SessionMenu, SessionsSidebar, useSessions } from "./Sessions.tsx";
 import { tokens } from "./Timeline.tsx";
@@ -191,6 +192,17 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
   const [keying, setKeying] = useState(false);
   // the user's secrets for all sessions (`""`), or a session's (its id)
   const [secretsOf, setSecretsOf] = useState<string | null>(null);
+  // the name the secrets dialog starts with (GITHUB_TOKEN, asked for a private repository)
+  const [secretName, setSecretName] = useState<string | undefined>();
+  const [githubOpen, setGithubOpen] = useState(false);
+  // counted up as the user's access to GitHub may have changed
+  const [access, setAccess] = useState(0);
+  const accessChanged = useCallback(() => setAccess((n) => n + 1), []);
+  useGithubReturn(accessChanged);
+  const addToken = () => {
+    setSecretName("GITHUB_TOKEN");
+    setSecretsOf("");
+  };
   const [status, setStatus] = useState<LiveStatus | null>(null);
   const client = useClient(props.who);
   const sessions = useSessions(props.who);
@@ -228,6 +240,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
           link={() => setLinking(true)}
           keys={() => setKeying(true)}
           secrets={() => setSecretsOf("")}
+          github={() => setGithubOpen(true)}
         />
       }
       className={className}
@@ -311,6 +324,9 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
         who={props.who}
         me={me}
         connect={() => setLinking(true)}
+        addToken={addToken}
+        connectGithub={() => connectGithub(props.who)}
+        again={access}
         made={(id) => {
           select(id);
           sessions.refresh();
@@ -333,12 +349,24 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
       <ChatGptDialog who={props.who} declared={!!props.become} open={linking} setOpen={setLinking} />
       <SyncDialog id={syncing} who={props.who} declared={!!props.become} close={() => setSyncing(null)} />
       <AnthropicKeyDialog open={keying} who={props.who} me={me} changed={refreshMe} close={() => setKeying(false)} />
+      <GithubDialog
+        open={githubOpen}
+        who={props.who}
+        addToken={() => {
+          setGithubOpen(false);
+          addToken();
+        }}
+        close={() => setGithubOpen(false)}
+      />
       <SecretsDialog
         open={secretsOf !== null}
         who={props.who}
         session={secretsOf ? sessions.list.find((s) => s.id === secretsOf) : undefined}
+        name={secretName}
         close={() => {
           setSecretsOf(null);
+          setSecretName(undefined);
+          accessChanged();
           sessions.refresh();
         }}
       />
@@ -435,6 +463,7 @@ function Account(props: {
   link: () => void;
   keys: () => void;
   secrets: () => void;
+  github: () => void;
 }) {
   const { theme, setTheme } = useTheme();
   const [draft, setDraft] = useState(props.who.user);
@@ -485,6 +514,9 @@ function Account(props: {
           </DropdownMenuItem>
           <DropdownMenuItem onClick={props.secrets}>
             <LockKeyholeIcon /> Secrets
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={props.github}>
+            <GitPullRequestIcon /> GitHub
           </DropdownMenuItem>
         </DropdownMenuGroup>
         <DropdownMenuSeparator />

@@ -8,6 +8,7 @@
 mod auth;
 mod bootstrap;
 mod chatgpt;
+mod github;
 mod leases;
 mod prune;
 mod runner;
@@ -31,7 +32,7 @@ use axum::{Json, Router};
 use clap::Parser;
 use dirigent_protocol::control::pb::players_server::{Players, PlayersServer};
 use dirigent_protocol::control::{
-    pb, player_subject, Part, Provider, Role, SessionInfo, SessionSpec,
+    pb, player_subject, Part, Provider, Role, SessionInfo, SessionSpec, Source,
 };
 use serde::Deserialize;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
@@ -41,6 +42,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::chatgpt::{ChatGpt, ChatGptArgs, LinkInfo, Model, Started as LinkStarted};
+use crate::github::{Github, GithubArgs, Repo, GITHUB_TOKEN};
 use crate::leases::{Acquire, Archive, Delete, Put, Reserve, Scope, Store};
 use crate::prune::{PruneArgs, Pruner};
 use crate::runner::{Kube, Local, Runner};
@@ -139,6 +141,9 @@ struct Cli {
     #[command(flatten)]
     prune: PruneArgs,
 
+    #[command(flatten)]
+    github: GithubArgs,
+
     /// The key control signs credentials with: Ed25519, PKCS#8 PEM (`control keygen`).
     #[arg(long, env = "DIRIGENT_SIGNING_KEY", required = true)]
     signing_key: Option<PathBuf>,
@@ -192,6 +197,8 @@ struct Control {
     chatgpt: Option<ChatGpt>,
     /// Users' API keys and secrets.
     keys: Keys,
+    /// GitHub, for sessions on its repositories (and its App's tokens for them, if it has one).
+    github: Github,
     /// What changed of leases' credentials, which their holders send again at once.
     changed: broadcast::Sender<Changed>,
     runner: Option<&'static dyn Runner>,
@@ -244,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
         .map(Seal::load)
         .transpose()?;
     let keys = Keys::new(&cli.keys, seal)?;
+    let github = Github::new(&cli.github)?;
     let oidc = match cli.auth {
         AuthMode::Declared => None,
         AuthMode::Oidc => Some(auth::Oidc::start(&cli.oidc).await?),
@@ -278,6 +286,7 @@ async fn main() -> anyhow::Result<()> {
         Auth { signer, oidc },
         chatgpt,
         keys,
+        github,
         runner,
         pruner,
         Duration::from_secs(cli.startup),
@@ -318,6 +327,7 @@ fn control(
     auth: Auth,
     chatgpt: Option<ChatGpt>,
     keys: Keys,
+    github: Github,
     runner: Option<&'static dyn Runner>,
     pruner: Option<&'static Pruner>,
     startup: Duration,
@@ -329,6 +339,7 @@ fn control(
         auth,
         chatgpt,
         keys,
+        github,
         changed: broadcast::channel(64).0,
         runner,
         pruner,
@@ -375,6 +386,10 @@ fn router(control: &'static Control) -> Router {
         .route("/links/chatgpt/start", post(start_link))
         .route("/links/chatgpt/finish", post(finish_link))
         .route("/links/chatgpt/models", get(chatgpt_models))
+        .route("/links/github", get(github_link).delete(unlink_github))
+        .route("/links/github/start", post(start_github))
+        .route("/links/github/callback", get(github_callback))
+        .route("/github/access", get(github_access))
         .route("/session", post(open_sign_in).delete(close_sign_in))
         .route("/session/token", post(sign_in_token))
         .route("/token", post(chlive_token))
@@ -502,6 +517,189 @@ async fn chatgpt_models(
         .await
         .map(Json)
         .map_err(|why| (StatusCode::BAD_GATEWAY, why))
+}
+
+/// Whether there's a GitHub App, and the accounts the caller connected its installations on:
+/// `{"app", "accounts"}`.
+async fn github_link(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+) -> Result<Json<serde_json::Value>, Failed> {
+    let installations = control
+        .store
+        .github_installations(&caller)
+        .await
+        .map_err(|e| failed("reading the GitHub installations", e))?;
+    let accounts: Vec<String> = installations.into_iter().map(|(_, a)| a).collect();
+    Ok(Json(serde_json::json!({
+        "app": control.github.has_app(),
+        "accounts": accounts,
+    })))
+}
+
+async fn unlink_github(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+) -> Result<StatusCode, Failed> {
+    match control.store.unlink_github(&caller).await {
+        Ok(true) => {
+            let _ = control.changed.send(Changed::Owner(caller));
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(false) => Err((StatusCode::NOT_FOUND, "no GitHub connected".into())),
+        Err(e) => Err(failed("forgetting the GitHub installations", e)),
+    }
+}
+
+#[derive(Deserialize)]
+struct StartGithub {
+    /// Authorizing the App for installations made already, rather than installing it.
+    #[serde(default)]
+    existing: bool,
+}
+
+/// Where the caller's browser goes to connect GitHub: `{"url"}`, GitHub's, which sends it back
+/// to `/links/github/callback`; with the cookie that ties it to this browser.
+async fn start_github(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Json(body): Json<StartGithub>,
+) -> Result<axum::response::Response, Failed> {
+    use axum::response::IntoResponse;
+    let nonce = github::nonce();
+    let audience = github::link_audience(&nonce);
+    let state = control.auth.signer.sign(&caller, &[&audience], None);
+    let url = control.github.connect_url(&state, body.existing).ok_or((
+        StatusCode::NOT_FOUND,
+        "this control has no GitHub App".into(),
+    ))?;
+    let cookie = [(axum::http::header::SET_COOKIE, github::set_cookie(&nonce))];
+    Ok((cookie, Json(serde_json::json!({ "url": url }))).into_response())
+}
+
+/// What GitHub sends the browser back with.
+#[derive(Deserialize)]
+struct GithubBack {
+    code: Option<String>,
+    state: Option<String>,
+}
+
+/// GitHub sends the browser here once the App is installed or authorized: the installations
+/// the GitHub user reaches become the caller's (who `state` says, as this browser's cookie
+/// confirms: a navigation from GitHub's site has no sign-in cookie), and the browser goes on to
+/// the web, `?github=connected` or `?github_error=<why>`.
+async fn github_callback(
+    State(control): State<&'static Control>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(back): axum::extract::Query<GithubBack>,
+) -> axum::response::Response {
+    use axum::response::{IntoResponse, Redirect};
+    let linked = async {
+        let nonce = github::from_cookies(cookies(&headers))
+            .ok_or("this browser didn't start connecting GitHub (or took over ten minutes)")?;
+        let claims = back
+            .state
+            .as_deref()
+            .and_then(|s| {
+                let audience = github::link_audience(nonce);
+                control.auth.signer.verify(s, &audience).ok()
+            })
+            .ok_or("connecting GitHub took over ten minutes, or wasn't started here")?;
+        let code = back.code.as_deref().ok_or(
+            "GitHub sent no authorization: if an organization's owner has to approve the \
+             App, connect again once they have",
+        )?;
+        let found = control.github.installations(code).await?;
+        control
+            .store
+            .link_github(&claims.sub, &found)
+            .await
+            .map_err(|e| format!("keeping the GitHub installations: {e:#}"))?;
+        info!(
+            subject = claims.sub,
+            installations = found.len(),
+            "GitHub connected"
+        );
+        let _ = control.changed.send(Changed::Owner(claims.sub));
+        Ok::<_, String>(())
+    }
+    .await;
+    let to = match linked {
+        Ok(()) => "/?github=connected".to_string(),
+        Err(why) => {
+            warn!("connecting GitHub: {why}");
+            let mut url = reqwest::Url::parse("http://web/").expect("a URL");
+            url.query_pairs_mut().append_pair("github_error", &why);
+            format!("/?{}", url.query().unwrap_or_default())
+        }
+    };
+    let cookie = [(axum::http::header::SET_COOKIE, github::clear_cookie())];
+    (cookie, Redirect::to(&to)).into_response()
+}
+
+#[derive(Deserialize)]
+struct AccessQuery {
+    url: String,
+}
+
+/// Whether the caller's sessions can read the repository at `url`, and how: `{"repo": "o/r"
+/// (none: not on GitHub), "via": "public" | "token" | "app" | none, "why", "app"}`, `why`
+/// saying what GitHub refused, and `app` whether there's a GitHub App to connect.
+async fn github_access(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    axum::extract::Query(q): axum::extract::Query<AccessQuery>,
+) -> Result<Json<serde_json::Value>, Failed> {
+    let github = &control.github;
+    let Some(repo) = Repo::parse(&q.url) else {
+        return Ok(Json(
+            serde_json::json!({ "repo": null, "app": github.has_app() }),
+        ));
+    };
+    let mut why: Option<String> = None;
+    let via = 'via: {
+        match github.readable(&repo, None).await {
+            Ok(true) => break 'via Some("public"),
+            Ok(false) => {}
+            Err(e) => warn!(
+                repo = repo.full_name(),
+                "asking GitHub about a repository: {e:#}"
+            ),
+        }
+        let token = match &control.keys.seal {
+            Some(seal) => match control.store.user_secret(&caller, GITHUB_TOKEN).await {
+                Ok(Some(sealed)) => seal.open(&sealed).ok(),
+                Ok(None) => None,
+                Err(e) => return Err(failed("reading the GITHUB_TOKEN secret", e)),
+            },
+            None => None,
+        };
+        if let Some(token) = token {
+            match github.readable(&repo, Some(&token)).await {
+                Ok(true) => break 'via Some("token"),
+                Ok(false) => {
+                    why = Some(format!(
+                        "GitHub refuses your GITHUB_TOKEN for {}: it may have expired, or not \
+                         cover the repository",
+                        repo.full_name()
+                    ))
+                }
+                Err(e) => warn!(repo = repo.full_name(), "asking GitHub with a token: {e:#}"),
+            }
+        }
+        match github.token(&control.store, &caller, &repo).await {
+            Ok(Some(_)) => break 'via Some("app"),
+            Ok(None) => {}
+            Err(e) => why = Some(e),
+        }
+        None
+    };
+    Ok(Json(serde_json::json!({
+        "repo": repo.full_name(),
+        "via": via,
+        "why": why,
+        "app": github.has_app(),
+    })))
 }
 
 /// In `declared` auth (dev), a chlive credential for the caller, standing in for the OpenID
@@ -1242,6 +1440,10 @@ impl Players for Lessor {
             // a dirigent acts as its owner
             delegate: spec.part == Part::Dirigent,
             provider: spec.provider,
+            repo: match &spec.source {
+                Some(Source::Git { url, .. }) => Repo::parse(url),
+                None => None,
+            },
             conn,
         };
         let acquired = pb::ToPlayer {
@@ -1260,7 +1462,8 @@ impl Players for Lessor {
 /// The player's credentials: as its subject, and, a dirigent's, as its owner too; a
 /// ChatGPT-plan session's, an access token of its owner's plan (`rejected`: not the one handed
 /// out last, which OpenAI refused); an Anthropic session's, its owner's API key or the
-/// install's; and the session's secrets.
+/// install's; and the session's secrets, a GitHub repository's `GITHUB_TOKEN` from the App
+/// unless it has its own.
 async fn tokens(control: &Control, held: &Held, rejected: bool) -> pb::Tokens {
     let signer = &control.auth.signer;
     let subject = held.subject.as_str();
@@ -1285,13 +1488,22 @@ async fn tokens(control: &Control, held: &Held, rejected: bool) -> pb::Tokens {
             Err(why) => (None, Some(why)),
         },
     };
-    let secrets = match session_secrets(control, held.session).await {
+    let mut secrets = match session_secrets(control, held.session).await {
         Ok(secrets) => secrets,
         Err(e) => {
             error!(session = %held.session, "reading the session's secrets: {e:#}");
             Default::default()
         }
     };
+    if let (Some(repo), false) = (&held.repo, secrets.contains_key(GITHUB_TOKEN)) {
+        match control.github.token(&control.store, owner, repo).await {
+            Ok(Some(token)) => {
+                secrets.insert(GITHUB_TOKEN.into(), token);
+            }
+            Ok(None) => {}
+            Err(why) => warn!(session = %held.session, owner, "no GitHub App token: {why}"),
+        }
+    }
     pb::Tokens {
         player: signer.sign(subject, &[CHLIVE], None),
         owner: held
@@ -1357,6 +1569,9 @@ struct Held {
     /// Whether it acts as its owner: a dirigent does.
     delegate: bool,
     provider: Provider,
+    /// Its repository, if it's on GitHub: the App's token for it is its `GITHUB_TOKEN`, unless it
+    /// has one.
+    repo: Option<Repo>,
     /// Which connection.
     conn: u64,
 }
@@ -1731,6 +1946,27 @@ mod e2e {
         keys: Option<(KeyArgs, Seal)>,
         runner: impl FnOnce(&Ctl) -> &'static dyn Runner,
     ) -> Option<Ctl> {
+        let github = GithubArgs {
+            github_api: "http://127.0.0.1:1".into(),
+            github_web: "http://127.0.0.1:1".into(),
+            github_app_slug: None,
+            github_app_client_id: None,
+            github_app_client_secret: None,
+            github_app_key: None,
+        };
+        start_all(oidc, ttl, reserved_only, chatgpt, keys, github, runner).await
+    }
+
+    /// The same, with `github` for GitHub.
+    async fn start_all(
+        oidc: Option<Arc<auth::Oidc>>,
+        ttl: Duration,
+        reserved_only: bool,
+        chatgpt: Option<ChatGptArgs>,
+        keys: Option<(KeyArgs, Seal)>,
+        github: GithubArgs,
+        runner: impl FnOnce(&Ctl) -> &'static dyn Runner,
+    ) -> Option<Ctl> {
         std::env::var_os("DIRIGENT_E2E")?;
         let key = std::env::var("DIRIGENT_SIGNING_KEY")
             .expect("DIRIGENT_SIGNING_KEY (the `e2e` script sets it)");
@@ -1746,6 +1982,7 @@ mod e2e {
             }
         };
         let chatgpt = chatgpt.map(|args| ChatGpt::new(&args, signer.kid()).unwrap().unwrap());
+        let github = Github::new(&github).unwrap();
         let url = std::env::var("DIRIGENT_CONTROL_POSTGRES")
             .expect("DIRIGENT_CONTROL_POSTGRES (the `e2e` script sets it)");
         let store = Store::connect(&url, Duration::from_secs(1)).await.unwrap();
@@ -1776,6 +2013,7 @@ mod e2e {
             Auth { signer, oidc },
             chatgpt,
             keys,
+            github,
             Some(runner),
             pruner,
             Duration::from_secs(1),
@@ -3304,6 +3542,216 @@ mod e2e {
         assert_eq!(all, serde_json::json!(["EXTRA", "GITHUB_TOKEN"]));
         on_s.close().await;
         on_t.close().await;
+    }
+
+    /// A control that keeps secrets, with the fake GitHub's App.
+    async fn start_github() -> Option<(Ctl, github::fake::GitHub, tempfile::TempDir)> {
+        std::env::var_os("DIRIGENT_E2E")?;
+        let gh = github::fake::GitHub::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("link.key");
+        seal::keygen(&key).unwrap();
+        let args = KeyArgs {
+            anthropic_api: "http://127.0.0.1:1".into(),
+        };
+        let keys = Some((args, Seal::load(&key).unwrap()));
+        let runner = recorder(false);
+        let ttl = Duration::from_secs(600);
+        let github = gh.args(dir.path());
+        let ctl = start_all(None, ttl, false, None, keys, github, |_| runner).await?;
+        Some((ctl, gh, dir))
+    }
+
+    /// `user` starts connecting GitHub: the `state` GitHub is sent with, and the cookie.
+    async fn start_connecting(base: &Ctl, user: &str) -> (String, String) {
+        let res = call(user, reqwest::Method::POST, base, "/links/github/start")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+        let cookie = res.headers()["set-cookie"].to_str().unwrap();
+        assert!(
+            cookie.contains("HttpOnly; Secure; SameSite=Lax"),
+            "{cookie}"
+        );
+        let cookie = cookie.split(';').next().unwrap().to_string();
+        let body: serde_json::Value = res.json().await.unwrap();
+        let url = reqwest::Url::parse(body["url"].as_str().unwrap()).unwrap();
+        assert!(url
+            .path()
+            .ends_with("/apps/dirigent-test/installations/new"));
+        let state = url.query_pairs().find(|(k, _)| k == "state").unwrap().1;
+        (state.into_owned(), cookie)
+    }
+
+    /// GitHub sends a browser with `cookie` back with `code` and `state`: where it's sent on.
+    async fn come_back(base: &Ctl, cookie: Option<&str>, code: &str, state: &str) -> String {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut url = reqwest::Url::parse(&format!("http://{base}/links/github/callback")).unwrap();
+        url.query_pairs_mut()
+            .append_pair("code", code)
+            .append_pair("state", state)
+            .append_pair("setup_action", "install");
+        let mut req = client.get(url);
+        if let Some(cookie) = cookie {
+            req = req.header("cookie", cookie);
+        }
+        let res = req.send().await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::SEE_OTHER);
+        res.headers()["location"].to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn e2e_github_access_is_public_a_token_or_the_app_whose_tokens_sessions_get() {
+        let Some((base, gh, _dir)) = start_github().await else {
+            return;
+        };
+        let (user, other) = (new_user(), new_user());
+        let login = format!("gh{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let access = |repo: String| {
+            let (base, user) = (&base, user.clone());
+            async move {
+                let url = format!("https://github.com/{repo}");
+                let path = format!("/github/access?url={}", url.replace('/', "%2F"));
+                get_json(base, &user, &path).await.1
+            }
+        };
+        let (private, other_repo) = (format!("{login}/private"), format!("{login}/other"));
+
+        // nothing connected: public ones only
+        assert_eq!(access(format!("{login}/public")).await["via"], "public");
+        let got = access(private.clone()).await;
+        assert_eq!(
+            (&got["via"], &got["app"]),
+            (&serde_json::Value::Null, &true.into())
+        );
+        assert_eq!(
+            get_json(
+                &base,
+                &user,
+                "/github/access?url=https%3A%2F%2Fgitlab.com%2Fa%2Fb"
+            )
+            .await
+            .1["repo"],
+            serde_json::Value::Null
+        );
+
+        // the user's GITHUB_TOKEN: refused, then taken
+        let token = |value: &str| {
+            let (base, user) = (&base, user.clone());
+            let body = serde_json::json!({ "value": value });
+            async move {
+                let put = reqwest::Method::PUT;
+                send_json(base, &user, put, "/secrets/GITHUB_TOKEN", body)
+                    .await
+                    .0
+            }
+        };
+        assert_eq!(token("ghp_bad_one").await, reqwest::StatusCode::NO_CONTENT);
+        let got = access(private.clone()).await;
+        assert!(
+            got["why"]
+                .as_str()
+                .unwrap()
+                .contains("refuses your GITHUB_TOKEN"),
+            "{got}"
+        );
+        token("ghp_good").await;
+        assert_eq!(access(private.clone()).await["via"], "token");
+        let gone = delete(&base, &user, "/secrets/GITHUB_TOKEN").await;
+        assert_eq!(gone, reqwest::StatusCode::NO_CONTENT);
+
+        // connecting: only the browser that started it, with a state of its own, links
+        let (state, cookie) = start_connecting(&base, &user).await;
+        let (others_state, others_cookie) = start_connecting(&base, &other).await;
+        let code = format!("code-{login}");
+        for (cookie, state) in [
+            (None, state.as_str()),
+            (Some(others_cookie.as_str()), state.as_str()),
+            (Some(cookie.as_str()), others_state.as_str()),
+            (Some(cookie.as_str()), "not-a-state"),
+        ] {
+            let to = come_back(&base, cookie, &code, state).await;
+            assert!(to.starts_with("/?github_error="), "{to}");
+        }
+        let to = come_back(&base, Some(&cookie), "wrong", &state).await;
+        assert!(to.contains("incorrect"), "{to}");
+        let (_, linked) = get_json(&base, &user, "/links/github").await;
+        assert_eq!(linked, serde_json::json!({ "app": true, "accounts": [] }));
+        assert_eq!(
+            come_back(&base, Some(&cookie), &code, &state).await,
+            "/?github=connected"
+        );
+        let (_, linked) = get_json(&base, &user, "/links/github").await;
+        assert_eq!(
+            linked,
+            serde_json::json!({ "app": true, "accounts": [login] })
+        );
+        let (_, theirs) = get_json(&base, &other, "/links/github").await;
+        assert_eq!(theirs["accounts"], serde_json::json!([]));
+
+        // the App reaches the repositories its installation includes
+        assert_eq!(access(private.clone()).await["via"], "app");
+        let got = access(other_repo.clone()).await;
+        assert!(
+            got["why"].as_str().unwrap().contains("doesn't include"),
+            "{got}"
+        );
+
+        // a session on one gets a token of the App for it, minted once while it lasts; one
+        // with a GITHUB_TOKEN of its own keeps that
+        let minted = gh.minted.load(Ordering::SeqCst);
+        let on = |repo: &str| serde_json::json!({ "source": { "git": { "url": format!("https://github.com/{repo}.git") } } });
+        let (s, t, u) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        put_json(&base, s, &user, on(&private)).await;
+        put_json(&base, t, &user, on(&private)).await;
+        put_json(&base, u, &user, on(&private)).await;
+        let own = serde_json::json!({ "value": "ghp_sessions_own" });
+        let put = reqwest::Method::PUT;
+        send_json(
+            &base,
+            &user,
+            put,
+            &format!("/sessions/{u}/secrets/GITHUB_TOKEN"),
+            own,
+        )
+        .await;
+        let mut held = Vec::new();
+        for session in [s, t, u] {
+            let mut conn = connect(&base).await;
+            acquire(&mut conn, session, &Uuid::new_v4().to_string(), None).await;
+            held.push(conn);
+        }
+        let token_of = |conn: &Conn| {
+            conn.tokens
+                .clone()
+                .unwrap()
+                .secrets
+                .get("GITHUB_TOKEN")
+                .cloned()
+        };
+        let app = token_of(&held[0]).unwrap();
+        assert!(app.starts_with("ghs_installation7_"), "{app}");
+        assert_eq!(token_of(&held[1]), Some(app));
+        assert_eq!(token_of(&held[2]).as_deref(), Some("ghp_sessions_own"));
+        // the one minted for the access check above, still good
+        assert_eq!(gh.minted.load(Ordering::SeqCst), minted);
+
+        // disconnected: no more
+        assert_eq!(
+            delete(&base, &user, "/links/github").await,
+            reqwest::StatusCode::NO_CONTENT
+        );
+        let got = next_tokens(&mut held[0]).await;
+        assert_eq!(got.secrets.get("GITHUB_TOKEN"), None);
+        assert_eq!(access(private).await["via"], serde_json::Value::Null);
+        for conn in held {
+            conn.close().await;
+        }
     }
 
     /// A ChatGpt of its own on the stack's Postgres, as a control just started would be: its

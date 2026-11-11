@@ -54,6 +54,14 @@ impl Secrets {
         }
     }
 
+    /// The environment of the processes tools start: the secrets, and, with a `GITHUB_TOKEN`
+    /// among them, git's use of it ([`git_credentials`]).
+    pub fn env(&self) -> Vec<(String, String)> {
+        let secrets = self.current();
+        let git = git_credentials(&secrets);
+        secrets.into_iter().chain(git).collect()
+    }
+
     /// `text` with every secret's value in it replaced by `[secret:NAME]`.
     pub fn redact(&self, text: &str) -> String {
         redact(text, &self.current())
@@ -86,6 +94,32 @@ pub fn redactions(secrets: &BTreeMap<String, String>) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The secret git uses for GitHub, and `gh` too.
+pub const GITHUB_TOKEN: &str = "GITHUB_TOKEN";
+
+/// With a `GITHUB_TOKEN` in `secrets`, the variables that make git use it for github.com: a
+/// credential helper that reads it from the environment each time git asks (so it's never
+/// written down, nor in a remote's URL), and `git@github.com:` URLs fetched over HTTPS with it.
+/// Without, none.
+pub fn git_credentials(secrets: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    if !secrets.contains_key(GITHUB_TOKEN) {
+        return Vec::new();
+    }
+    let helper = format!(
+        "!f() {{ test \"$1\" = get && echo username=x-access-token && echo \"password=${GITHUB_TOKEN}\"; }}; f"
+    );
+    [
+        ("GIT_CONFIG_COUNT", "2"),
+        ("GIT_CONFIG_KEY_0", "credential.https://github.com.helper"),
+        ("GIT_CONFIG_VALUE_0", &helper),
+        ("GIT_CONFIG_KEY_1", "url.https://github.com/.insteadOf"),
+        ("GIT_CONFIG_VALUE_1", "git@github.com:"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
 #[cfg(test)]
 pub fn tokens(secrets: &[(&str, &str)]) -> pb::Tokens {
     pb::Tokens {
@@ -116,6 +150,47 @@ mod tests {
             "a [secret:LONGER] b [secret:TOKEN] c abc"
         );
         assert_eq!(redactions(&secrets).len(), 2);
+    }
+
+    #[test]
+    fn git_asks_the_environment_for_a_github_token_and_nothing_else() {
+        let (_, secrets) = Secrets::channel(&[("OTHER", "whatever")]);
+        assert_eq!(secrets.env().len(), 1);
+        let (_, secrets) = Secrets::channel(&[(GITHUB_TOKEN, "ghp_the_token")]);
+        let fill = |host: &str| {
+            let mut child = std::process::Command::new("git")
+                .args(["credential", "fill"])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .envs(secrets.env())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            let mut stdin = child.stdin.take().unwrap();
+            write!(stdin, "protocol=https\nhost={host}\n\n").unwrap();
+            drop(stdin);
+            let out = child.wait_with_output().unwrap();
+            (out.status.success(), String::from_utf8(out.stdout).unwrap())
+        };
+        let (ok, out) = fill("github.com");
+        assert!(ok);
+        assert!(
+            out.contains("username=x-access-token\npassword=ghp_the_token\n"),
+            "{out}"
+        );
+        // another host's credentials aren't given, so git can't ask without a terminal
+        assert!(!fill("gitlab.com").0);
+        // nor is the token in the configuration itself
+        assert!(!secrets
+            .env()
+            .iter()
+            .any(|(k, v)| k != GITHUB_TOKEN && v.contains("ghp_")));
     }
 
     #[tokio::test]

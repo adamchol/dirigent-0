@@ -54,6 +54,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import * as api from "./api.ts";
 import type { Effort, Me, Model, Part, Provider, SessionInfo } from "./api.ts";
+import { RepoAccess } from "./GitHub.tsx";
 import { linked } from "./Link.tsx";
 import { useTitles } from "./Rename.tsx";
 import type { Named } from "./events.ts";
@@ -485,6 +486,11 @@ export function NewSession(props: {
   who: api.Who;
   me: Me | null;
   connect: () => void;
+  /** For a private repository: give a GITHUB_TOKEN, or connect GitHub's App. */
+  addToken: () => void;
+  connectGithub: () => void;
+  /** Changed when access may have: the repository's is checked again. */
+  again?: number;
   made: (id: string) => void;
 }) {
   const [part, setPart] = useState<Part>("coder");
@@ -586,7 +592,13 @@ export function NewSession(props: {
                         </InputGroupAddon>
                         <InputGroupInput id="git" placeholder="https://github.com/…" value={git} onChange={(e) => setGit(e.target.value)} />
                       </InputGroup>
-                      <FieldDescription>Empty: a workspace with no files.</FieldDescription>
+                      <FieldDescription>
+                        {api.onGithub(git) ? (
+                          <RepoAccess who={who} url={git} addToken={props.addToken} connect={props.connectGithub} again={props.again} />
+                        ) : (
+                          "Empty: a workspace with no files."
+                        )}
+                      </FieldDescription>
                     </Field>
                     <Field>
                       <FieldLabel htmlFor="ref">Ref</FieldLabel>
