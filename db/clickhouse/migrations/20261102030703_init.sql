@@ -1,9 +1,9 @@
 -- openmig:generated
 
 -- Create role "dirigent_chlive_read"
-CREATE ROLE IF NOT EXISTS `dirigent_chlive_read` IN `local_directory`;
+CREATE ROLE IF NOT EXISTS `dirigent_chlive_read`;
 -- Create role "dirigent_chlive_snapshot"
-CREATE ROLE IF NOT EXISTS `dirigent_chlive_snapshot` IN `local_directory`;
+CREATE ROLE IF NOT EXISTS `dirigent_chlive_snapshot`;
 -- Create database "chlive_snapshots"
 CREATE DATABASE IF NOT EXISTS `chlive_snapshots` ENGINE = Atomic;
 -- Create database "dirigent"

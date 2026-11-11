@@ -140,11 +140,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1793587148,
-        "narHash": "sha256-ETmXBMtkMO+S59iJKtWV85rRRelz9eznmoMcZ1NV9nM=",
+        "lastModified": 1794354832,
+        "narHash": "sha256-T4dz+obxXinU3WroJEm4dXTXKEwwcbABhVrFAq/jVwg=",
         "owner": "adamchol",
         "repo": "openmig",
-        "rev": "6e59cb11d85b25d6663de54aad4d0bb88f491a2c",
+        "rev": "aae256ae640676ddb4fb241f9c072b931c531124",
         "type": "github"
       },
       "original": {
