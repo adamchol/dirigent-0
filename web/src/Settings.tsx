@@ -1,5 +1,5 @@
 // The user's settings, which control keeps (so they follow them to any browser): for now, how
-// much of a session's log the chat shows.
+// much of a session's log the chat shows. And, told not set, the system sessions' machines run.
 
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -9,7 +9,7 @@ import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, Di
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import * as api from "./api.ts";
-import type { Settings, Who } from "./api.ts";
+import type { PlayerSystem, Settings, Who } from "./api.ts";
 import type { Shown } from "./events.ts";
 
 /** What's shown until control answers, and if it can't. */
@@ -38,14 +38,39 @@ export function useSettings(who: Who): { settings: Settings; change: (s: Partial
   return { settings, change };
 }
 
+/** Which system new sessions' machines run, as the cluster has it. */
+function machines(s: PlayerSystem): string {
+  if (!s.configured) return "The stock system.";
+  switch (s.state) {
+    case "ready":
+      return "The cluster's own system.";
+    case "building":
+      return "The stock system, while the cluster's own is built.";
+    case "broken":
+      return "The stock system: sessions' machines didn't come up with the cluster's own.";
+    default:
+      return "The stock system: the cluster's own failed to build.";
+  }
+}
+
 const SHOWN: { value: Shown; label: string; description: string }[] = [
   { value: "conversation", label: "Conversation", description: "Messages, replies, tools, turns and errors." },
   { value: "activity", label: "Activity", description: "The player's doings too: attaching, the workspace, checkpoints, titles." },
   { value: "all", label: "All events", description: "Every event in the log, each with its JSON (but the streamed deltas and workspace files)." },
 ];
 
-export function SettingsDialog(props: { open: boolean; settings: Settings; change: (s: Partial<Settings>) => void; close: () => void }) {
+export function SettingsDialog(props: {
+  open: boolean;
+  who: Who;
+  settings: Settings;
+  change: (s: Partial<Settings>) => void;
+  close: () => void;
+}) {
   const shown = SHOWN.find((s) => s.value === props.settings.events) ?? SHOWN[1]!;
+  const [system, setSystem] = useState<PlayerSystem | null>(null);
+  useEffect(() => {
+    if (props.open) api.playerSystem(props.who).then(setSystem, () => setSystem(null));
+  }, [props.open, props.who]);
   return (
     <Dialog open={props.open} onOpenChange={(o) => !o && props.close()}>
       <DialogContent className="sm:max-w-md">
@@ -69,6 +94,12 @@ export function SettingsDialog(props: { open: boolean; settings: Settings; chang
           </ToggleGroup>
           <FieldDescription>{shown.description}</FieldDescription>
         </Field>
+        {system && (
+          <Field>
+            <FieldLabel>New sessions' machines run</FieldLabel>
+            <FieldDescription>{machines(system)}</FieldDescription>
+          </Field>
+        )}
         <DialogFooter>
           <DialogClose render={<Button type="button" variant="outline" />}>Done</DialogClose>
         </DialogFooter>

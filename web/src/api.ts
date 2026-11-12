@@ -257,3 +257,16 @@ export async function settings(who: Who): Promise<Settings> {
 export async function saveSettings(who: Who, s: Settings): Promise<Settings> {
   return (await call(who, "PUT", "/settings", s)).json();
 }
+
+/** The system the players' VMs run: the image's stock one, unless the cluster has a configuration of
+ * its own (the chart's `player.nixos`), built ahead of time. */
+export type PlayerSystem = {
+  configured: boolean;
+  state?: "building" | "ready" | "failed" | "broken";
+  store_path?: string;
+  error?: string;
+};
+
+export async function playerSystem(who: Who): Promise<PlayerSystem> {
+  return (await call(who, "GET", "/system")).json();
+}

@@ -122,7 +122,7 @@ pub(crate) mod tests {
             "--add-dot-ignore",
             ".gitignore",
             "--max-file-size",
-            "1000",
+            "0",
         ]);
         let status = kopia(&["repository", "status", "-t", "-s"]);
         status
@@ -165,14 +165,16 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn ignored_and_big_files_are_left_out() {
+    async fn ignored_files_are_left_out_and_big_ones_kept() {
         let tmp = tempfile::tempdir().unwrap();
         let cp = checkpoints(tmp.path()).await;
         let ws = tmp.path().join("ws");
         std::fs::create_dir_all(ws.join("target")).unwrap();
         std::fs::write(ws.join(".gitignore"), "target/\n").unwrap();
         std::fs::write(ws.join("target/out"), "built").unwrap();
-        std::fs::write(ws.join("big"), vec![0u8; 5000]).unwrap();
+        // past what the log carries: only a checkpoint brings it back
+        let big = std::fs::File::create(ws.join("big")).unwrap();
+        big.set_len(dirigent_sync::MAX_FILE_SIZE + 1).unwrap();
         std::fs::write(ws.join("kept"), "x").unwrap();
         let snapshot = cp.snapshot(&ws, "t").await.unwrap();
         let to = tmp.path().join("to");
@@ -180,7 +182,10 @@ pub(crate) mod tests {
         cp.restore(&snapshot, &to).await.unwrap();
         assert!(to.join("kept").exists());
         assert!(!to.join("target/out").exists());
-        assert!(!to.join("big").exists());
+        assert_eq!(
+            std::fs::metadata(to.join("big")).unwrap().len(),
+            dirigent_sync::MAX_FILE_SIZE + 1
+        );
     }
 
     #[tokio::test]

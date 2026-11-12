@@ -1,60 +1,169 @@
 {{- /* The players' VM template (control's --kube-template): control names and labels each VM,
-and adds the player's own lines to the environment in the `dirigent` volume (nix/player-vm.nix
+and adds the player's own lines to the environment in the `dirigent` volume (nix/vm/base.nix
 has the guest's side). Evicted or deleted, a VM is shut down, and its player gets the grace
-period to finish its turn, checkpoint and hand the session over: it isn't migrated. */}}
+period to finish its turn, checkpoint and hand the session over: it isn't migrated. With a
+configuration of the cluster's own (player.nixos.files), its ConfigMap, and the template of the
+VM control builds its system in (--kube-build-template): the same image, in build mode. */}}
 {{- $env := list
   "DIRIGENT_CONTROL_URL=http://dirigent-control:8091"
   "DIRIGENT_CONTROL_HTTP=http://dirigent-control:8090"
   "CHLIVE_URL=ws://dirigent-chlive:8080/live"
   (printf "DIRIGENT_STOP_GRACE=%d" (sub (int .Values.player.stopGrace) (int .Values.player.checkpointMargin)))
+  (printf "DIRIGENT_NIX_CACHE='%s'" (include "dirigent.nixCache" .))
 }}
 {{- if .Values.player.mock }}
 {{- $env = append $env "MOCK=true" }}
 {{- end }}
+{{- if .Values.nix.shared.enabled }}
+{{- $env = append $env (printf "DIRIGENT_NIX_PROMOTE=%s" .Values.nix.shared.promote) }}
+{{- end }}
 {{- range $k, $v := .Values.player.env }}
 {{- $env = append $env (printf "%s=%s" $k (toString $v)) }}
 {{- end }}
-{{- /* the kopia repository's token; API keys and sessions' secrets come on the lease */}}
-{{- $secrets := list "dirigent-kopia" }}
-{{- $vm := dict
-  "apiVersion" "kubevirt.io/v1"
-  "kind" "VirtualMachineInstance"
-  "metadata" (dict "labels" (dict
-    "app.kubernetes.io/name" "dirigent"
-    "app.kubernetes.io/instance" .Release.Name
-    "app.kubernetes.io/component" "player"))
+{{- /* the kopia repository's token, and the S3 key the Nix cache is read with; API keys and
+sessions' secrets come on the lease */}}
+{{- $secrets := list "dirigent-kopia" (include "dirigent.s3Secret" .) }}
+{{- $labels := dict
+  "app.kubernetes.io/name" "dirigent"
+  "app.kubernetes.io/instance" .Release.Name
+  "app.kubernetes.io/component" "player"
 }}
+{{- $root := dict "name" "root" "containerDisk" (dict "image" (include "dirigent.image" (list . "player-vm")) "imagePullPolicy" .Values.images.pullPolicy) }}
+{{- /* KubeVirt takes one, for the VM's image */}}
+{{- with .Values.images.pullSecrets }}
+{{- $_ := set $root.containerDisk "imagePullSecret" (first .) }}
+{{- end }}
 {{- $disks := list
   (dict "name" "root" "disk" (dict "bus" "virtio"))
   (dict "name" "dirigent" "disk" (dict "bus" "virtio"))
   (dict "name" "work" "serial" "dirigent-work" "disk" (dict "bus" "virtio"))
 }}
 {{- $volumes := list
-  (dict "name" "root" "containerDisk" (dict "image" (include "dirigent.image" (list . "player-vm")) "imagePullPolicy" .Values.images.pullPolicy))
+  $root
   (dict "name" "dirigent" "cloudInitNoCloud" (dict "userData" (join "\n" $env)))
   (dict "name" "work" "emptyDisk" (dict "capacity" .Values.player.workspaceSize))
 }}
-{{- /* KubeVirt takes one, for the VM's image */}}
-{{- with .Values.images.pullSecrets }}
-{{- $_ := set (index $volumes 0).containerDisk "imagePullSecret" (first .) }}
-{{- end }}
 {{- range $i, $s := $secrets }}
 {{- $disks = append $disks (dict "name" (printf "secret%d" $i) "serial" (printf "dirigent-secret%d" $i) "disk" (dict "bus" "virtio")) }}
 {{- $volumes = append $volumes (dict "name" (printf "secret%d" $i) "secret" (dict "secretName" $s)) }}
 {{- end }}
-{{- $_ := set $vm "spec" (dict
-  "terminationGracePeriodSeconds" (int .Values.player.stopGrace)
-  "evictionStrategy" "None"
-  "nodeSelector" .Values.player.nodeSelector
-  "domain" (dict
-    "cpu" (dict "cores" (int .Values.player.cpu))
-    "memory" (dict "guest" .Values.player.memory)
-    "devices" (dict
-      "disks" $disks
-      "interfaces" (list (dict "name" "default" "masquerade" (dict)))))
-  "networks" (list (dict "name" "default" "pod" (dict)))
-  "volumes" $volumes)
+{{- /* the shared Nix store's volume, over virtiofs (its tag, the filesystem's name) */}}
+{{- $filesystems := list }}
+{{- if .Values.nix.shared.enabled }}
+{{- $filesystems = list (dict "name" "dirigent-nix" "virtiofs" (dict)) }}
+{{- $volumes = append $volumes (dict "name" "dirigent-nix" "persistentVolumeClaim" (dict "claimName" "dirigent-nix-store")) }}
+{{- end }}
+{{- $vm := dict
+  "apiVersion" "kubevirt.io/v1"
+  "kind" "VirtualMachineInstance"
+  "metadata" (dict "labels" $labels)
+  "spec" (dict
+    "terminationGracePeriodSeconds" (int .Values.player.stopGrace)
+    "evictionStrategy" "None"
+    "nodeSelector" .Values.player.nodeSelector
+    "domain" (dict
+      "cpu" (dict "cores" (int .Values.player.cpu))
+      "memory" (dict "guest" .Values.player.memory)
+      "devices" (dict
+        "disks" $disks
+        "interfaces" (list (dict "name" "default" "masquerade" (dict)))))
+    "networks" (list (dict "name" "default" "pod" (dict)))
+    "volumes" $volumes)
 }}
+{{- with $filesystems }}
+{{- $_ := set $vm.spec.domain.devices "filesystems" . }}
+{{- end }}
+{{- $data := dict "vm.json" (toJson $vm) }}
+{{- with .Values.player.nixos.files }}
+{{- /* the build's: what it's told to do, the S3 key and the cache's signing key, and the
+configuration's files (the ConfigMap's disk) */}}
+{{- $buildEnv := list
+  "DIRIGENT_CONTROL_HTTP=http://dirigent-control:8090"
+  (printf "DIRIGENT_NIX_CACHE='%s'" (include "dirigent.nixCache" $))
+  "DIRIGENT_MODE=build"
+}}
+{{- $buildDisks := list
+  (dict "name" "root" "disk" (dict "bus" "virtio"))
+  (dict "name" "dirigent" "disk" (dict "bus" "virtio"))
+  (dict "name" "work" "serial" "dirigent-work" "disk" (dict "bus" "virtio"))
+  (dict "name" "nixos" "serial" "dirigent-nixos" "disk" (dict "bus" "virtio"))
+}}
+{{- $buildVolumes := list
+  $root
+  (dict "name" "dirigent" "cloudInitNoCloud" (dict "userData" (join "\n" $buildEnv)))
+  (dict "name" "work" "emptyDisk" (dict "capacity" "1Gi"))
+  (dict "name" "nixos" "configMap" (dict "name" "dirigent-player-nixos"))
+}}
+{{- range $i, $s := list (include "dirigent.s3Secret" $) "dirigent-nix-signing" }}
+{{- $buildDisks = append $buildDisks (dict "name" (printf "secret%d" $i) "serial" (printf "dirigent-secret%d" $i) "disk" (dict "bus" "virtio")) }}
+{{- $buildVolumes = append $buildVolumes (dict "name" (printf "secret%d" $i) "secret" (dict "secretName" $s)) }}
+{{- end }}
+{{- $build := dict
+  "apiVersion" "kubevirt.io/v1"
+  "kind" "VirtualMachineInstance"
+  "metadata" (dict "labels" $labels)
+  "spec" (dict
+    "terminationGracePeriodSeconds" 30
+    "evictionStrategy" "None"
+    "nodeSelector" $.Values.player.nodeSelector
+    "domain" (dict
+      "cpu" (dict "cores" (int $.Values.player.nixos.build.cpu))
+      "memory" (dict "guest" $.Values.player.nixos.build.memory)
+      "devices" (dict
+        "disks" $buildDisks
+        "interfaces" (list (dict "name" "default" "masquerade" (dict)))))
+    "networks" (list (dict "name" "default" "pod" (dict)))
+    "volumes" $buildVolumes)
+}}
+{{- $_ := set $data "build.json" (toJson $build) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dirigent-player-nixos
+  labels:
+    {{- include "dirigent.labels" $ | nindent 4 }}
+data:
+  {{- toYaml . | nindent 2 }}
+---
+{{- end }}
+{{- if .Values.nix.shared.enabled }}
+{{- /* What writes a generation of the shared Nix store (control adds GENERATION and PREVIOUS):
+the last one's paths, hard linked (its database copied), and those in gen-<n>.todo, from
+upstream (`signed`) or the players' cache (`unsigned`); a path that can't be had is left out.
+It only copies, so it builds nothing and needs no privilege. */}}
+{{- $writer := dict
+  "apiVersion" "batch/v1"
+  "kind" "Job"
+  "metadata" (dict "labels" (dict
+    "app.kubernetes.io/name" "dirigent"
+    "app.kubernetes.io/instance" .Release.Name
+    "app.kubernetes.io/component" "nix-writer"))
+  "spec" (dict
+    "backoffLimit" 2
+    "activeDeadlineSeconds" 7200
+    "template" (dict
+      "metadata" (dict "labels" (dict
+        "app.kubernetes.io/name" "dirigent"
+        "app.kubernetes.io/instance" .Release.Name
+        "app.kubernetes.io/component" "nix-writer"))
+      "spec" (dict
+        "restartPolicy" "Never"
+        "imagePullSecrets" .Values.images.pullSecrets
+        "containers" (list (dict
+          "name" "writer"
+          "image" (include "dirigent.image" (list . "tools"))
+          "imagePullPolicy" .Values.images.pullPolicy
+          "command" (list "bash" "-euo" "pipefail" "-c")
+          "args" (list (.Files.Get "files/nix-writer.sh"))
+          "env" (list
+            (dict "name" "NIX_CACHE" "value" (include "dirigent.nixCache" .))
+            (dict "name" "S3_ACCESS_KEY" "valueFrom" (dict "secretKeyRef" (dict "name" (include "dirigent.s3Secret" .) "key" "accessKey")))
+            (dict "name" "S3_SECRET_KEY" "valueFrom" (dict "secretKeyRef" (dict "name" (include "dirigent.s3Secret" .) "key" "secretKey"))))
+          "volumeMounts" (list (dict "name" "store" "mountPath" "/store"))))
+        "volumes" (list (dict "name" "store" "persistentVolumeClaim" (dict "claimName" "dirigent-nix-store"))))))
+}}
+{{- $_ := set $data "writer.json" (toJson $writer) }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -62,4 +171,6 @@ metadata:
   labels:
     {{- include "dirigent.labels" . | nindent 4 }}
 data:
-  vm.json: {{ toJson $vm | quote }}
+  {{- range $k, $v := $data }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}

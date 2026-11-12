@@ -354,7 +354,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
       <ChatGptDialog who={props.who} declared={!!props.become} open={linking} setOpen={setLinking} />
       <SyncDialog id={syncing} who={props.who} declared={!!props.become} close={() => setSyncing(null)} />
       <AnthropicKeyDialog open={keying} who={props.who} me={me} changed={refreshMe} close={() => setKeying(false)} />
-      <SettingsDialog open={settingsOpen} settings={settings} change={changeSettings} close={() => setSettingsOpen(false)} />
+      <SettingsDialog open={settingsOpen} who={props.who} settings={settings} change={changeSettings} close={() => setSettingsOpen(false)} />
       <GithubDialog
         open={githubOpen}
         who={props.who}

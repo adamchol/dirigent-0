@@ -327,18 +327,30 @@ impl Kopia {
 
 /// The token in the Secret `name`, in control's namespace.
 async fn secret_token(name: &str) -> anyhow::Result<String> {
-    use k8s_openapi::api::core::v1::Secret;
     let client = kube::Client::try_default().await?;
-    let secrets: kube::Api<Secret> = kube::Api::default_namespaced(client);
+    secret_value(
+        &kube::Api::default_namespaced(client),
+        name,
+        "DIRIGENT_KOPIA_TOKEN",
+    )
+    .await
+}
+
+/// The Secret `name`'s `key`.
+pub async fn secret_value(
+    secrets: &kube::Api<k8s_openapi::api::core::v1::Secret>,
+    name: &str,
+    key: &str,
+) -> anyhow::Result<String> {
     let secret = secrets
         .get(name)
         .await
         .with_context(|| format!("reading the Secret {name}"))?;
-    let token = secret
+    let value = secret
         .data
-        .and_then(|d| d.get("DIRIGENT_KOPIA_TOKEN").cloned())
-        .with_context(|| format!("the Secret {name} has no DIRIGENT_KOPIA_TOKEN"))?;
-    Ok(String::from_utf8(token.0)?)
+        .and_then(|d| d.get(key).cloned())
+        .with_context(|| format!("the Secret {name} has no {key}"))?;
+    Ok(String::from_utf8(value.0)?)
 }
 
 /// Run `cmd`, for at most [`KOPIA_TIMEOUT`]: its output, or why it failed.

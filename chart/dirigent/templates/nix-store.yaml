@@ -1,0 +1,22 @@
+{{- /* The players' shared Nix store (nix.shared): its volume, which control (choosing and
+deleting generations), the writer Jobs (writing them) and the VMs (reading them, over virtiofs)
+have. Control makes each writer from the template in the dirigent-player ConfigMap. */}}
+{{- if .Values.nix.shared.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dirigent-nix-store
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+  annotations:
+    # its generations outlive an uninstall, as the checkpoints do
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [{{ .Values.nix.shared.accessMode }}]
+  {{- with .Values.nix.shared.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.nix.shared.size }}
+{{- end }}

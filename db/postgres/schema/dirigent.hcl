@@ -306,6 +306,75 @@ table "dirigent.user_settings" {
   primary_key { columns = [column.subject] }
 }
 
+# The players' systems control built from the cluster's own configuration (`player.nixos`), one
+# per configuration and dirigent version (`hash`): a redeploy that changed neither builds none.
+# `building` until its VM reports (with the token whose sha256 is `token`), then `ready` (its
+# `store_path`), `failed` (`error`, the end of Nix's output), or `broken` when a session's VM
+# didn't come up with it.
+table "dirigent.player_systems" {
+  column "hash" { type = text }
+  column "state" {
+    type = text
+    null = false
+  }
+  column "build_id" {
+    type = uuid
+    null = false
+  }
+  column "token" {
+    type = text
+    null = false
+  }
+  column "store_path" {
+    type = text
+    null = true
+  }
+  column "error" {
+    type = text
+    null = true
+  }
+  column "started" {
+    type    = timestamptz
+    null    = false
+    default = sql("now()")
+  }
+  column "updated" {
+    type    = timestamptz
+    null    = false
+    default = sql("now()")
+  }
+  primary_key { columns = [column.hash] }
+  check "player_systems_state" {
+    expr = "state IN ('building', 'ready', 'failed', 'broken')"
+  }
+}
+
+# The store paths players' VMs added to the shared Nix store (the chart's `nix.shared`), told by
+# their players: whether upstream signed each, how often it was added, and the generation that
+# took it, once one did.
+table "dirigent.nix_paths" {
+  column "path" { type = text }
+  column "signed" {
+    type = boolean
+    null = false
+  }
+  column "uses" {
+    type    = integer
+    null    = false
+    default = 1
+  }
+  column "first_seen" {
+    type    = timestamptz
+    null    = false
+    default = sql("now()")
+  }
+  column "promoted_in" {
+    type = bigint
+    null = true
+  }
+  primary_key { columns = [column.path] }
+}
+
 publication "dirigent_chlive" {
   tables = [table.dirigent.session_access, table.dirigent.insert_kinds]
 }
@@ -316,6 +385,7 @@ grant {
     table.dirigent.sessions, table.dirigent.session_access, table.dirigent.chatgpt_links,
     table.dirigent.api_keys, table.dirigent.user_secrets, table.dirigent.session_secrets,
     table.dirigent.web_sessions, table.dirigent.github_installations, table.dirigent.user_settings,
+    table.dirigent.player_systems, table.dirigent.nix_paths,
   ]
   to         = [role.dirigent_control]
 }

@@ -2,8 +2,10 @@
 # 10.43/16), KubeVirt and CloudNativePG, stand-ins for ClickHouse and Kafka (stand-ins.yaml), the
 # images loaded straight into k3s, and the chart with values.yaml (mock players).
 #   kube-test up        start k3s (in the background; its log in .dnvr/k3s/k3s.log)
-#   kube-test install   install KubeVirt, CloudNativePG and the stand-ins, load the images, and
-#                       install (or upgrade) the chart
+#   kube-test install [helm args…]
+#                       install KubeVirt (with virtiofs for volumes, for the shared Nix store),
+#                       CloudNativePG and the stand-ins, load the images, and install (or
+#                       upgrade) the chart, with values.yaml and the args (e.g. `-f more.yaml`)
 #   kube-test load      build and load the images again
 #   kube-test e2e       the cluster's test (player/src/session/chlive.rs, `kube_e2e`), through
 #                       forwarded ports to control and chlive
@@ -61,6 +63,9 @@ install() {
   kubectl apply -f "$m/kubevirt-cr.yaml" >/dev/null
   kubectl apply --server-side -f "$m/cnpg.yaml" >/dev/null
   kubectl -n kubevirt wait kubevirt/kubevirt --for=condition=Available --timeout=600s
+  kubectl -n kubevirt patch kubevirt kubevirt --type merge -p \
+    '{"spec":{"configuration":{"developerConfiguration":{"featureGates":["EnableVirtioFsStorageVolumes"]}}}}' \
+    >/dev/null
   kubectl -n cnpg-system wait deploy/cnpg-controller-manager --for=condition=Available --timeout=300s
   kubectl create namespace dirigent --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   kubectl -n dirigent apply -f "$root/nix/kube-test/stand-ins.yaml" >/dev/null
@@ -68,7 +73,7 @@ install() {
   load
   chart=$(nix build "$root#chart" --no-link --print-out-paths)
   helm upgrade --install dirigent "$chart" -n dirigent -f "$root/nix/kube-test/values.yaml" \
-    --timeout 20m --wait --wait-for-jobs
+    --timeout 20m --wait --wait-for-jobs "$@"
   kubectl -n dirigent get pods
 }
 
@@ -99,7 +104,7 @@ down() {
 
 case "${1:-}" in
   up) up ;;
-  install) install ;;
+  install) shift; install "$@" ;;
   load) load ;;
   e2e) shift; e2e "$@" ;;
   down) down ;;

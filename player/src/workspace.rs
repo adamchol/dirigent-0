@@ -483,6 +483,9 @@ pub(crate) mod tests {
         std::fs::create_dir(&old).unwrap();
         std::fs::write(old.join("keep"), "1").unwrap();
         std::fs::write(old.join("gone"), "1").unwrap();
+        // too big for the log: it comes back from the checkpoint alone
+        let big = std::fs::File::create(old.join("big")).unwrap();
+        big.set_len(dirigent_sync::MAX_FILE_SIZE + 1).unwrap();
         let mut first = Logged {
             log: ready(false),
             files: Vec::new(),
@@ -533,6 +536,10 @@ pub(crate) mod tests {
         );
         assert_eq!(std::fs::read_to_string(work.join("keep")).unwrap(), "2");
         assert!(!work.join("gone").exists());
+        assert_eq!(
+            std::fs::metadata(work.join("big")).unwrap().len(),
+            dirigent_sync::MAX_FILE_SIZE + 1
+        );
         // a secret it wrote: redacted in the log, put back in the workspace
         assert_eq!(
             std::fs::read_to_string(work.join(".env")).unwrap(),

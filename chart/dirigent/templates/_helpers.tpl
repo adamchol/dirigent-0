@@ -52,3 +52,10 @@ imagePullSecrets:
 {{- end }}
 {{- end }}
 {{- end }}
+
+{{- /* The players' Nix cache (nix.cache), as Nix names it: an s3:// store in the checkpoints'
+S3, read with the S3 key in the VMs' `[dirigent]` AWS profile (nix/vm/base.nix). */}}
+{{- define "dirigent.nixCache" -}}
+{{- $tls := and .Values.checkpoints.s3.tls (not .Values.checkpoints.garage.enabled) -}}
+s3://{{ .Values.nix.cache.bucket }}?endpoint={{ ternary "https" "http" $tls }}://{{ include "dirigent.s3Endpoint" . }}&region={{ .Values.nix.cache.region }}&profile=dirigent
+{{- end }}

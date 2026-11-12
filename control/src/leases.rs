@@ -707,6 +707,145 @@ impl Store {
         Ok(())
     }
 
+    /// The players' system built (or being built) for `hash`, if one was.
+    pub async fn player_system(&self, hash: &str) -> anyhow::Result<Option<PlayerSystem>> {
+        let row = self
+            .db
+            .lock()
+            .await
+            .query_opt(
+                "SELECT state, build_id, store_path, error FROM dirigent.player_systems \
+                 WHERE hash = $1",
+                &[&hash],
+            )
+            .await?;
+        Ok(row.map(|r| PlayerSystem {
+            state: r.get(0),
+            build: r.get(1),
+            store_path: r.get(2),
+            error: r.get(3),
+        }))
+    }
+
+    /// `hash`'s system is being built, as `build`, which reports with the token whose sha256 is
+    /// `token` (what was there for it before is replaced).
+    pub async fn build_system(&self, hash: &str, build: Uuid, token: &str) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO dirigent.player_systems (hash, state, build_id, token) \
+                 VALUES ($1, 'building', $2, $3) ON CONFLICT (hash) DO UPDATE SET \
+                 state = 'building', build_id = $2, token = $3, store_path = NULL, error = NULL, \
+                 started = now(), updated = now()",
+                &[&hash, &build, &token],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The build `build` is done, as told with the token whose sha256 is `token`: its system's
+    /// store path, or why it failed. Whether it was a build under way, with that token (each is
+    /// done once).
+    pub async fn system_built(
+        &self,
+        build: Uuid,
+        token: &str,
+        result: Result<&str, &str>,
+    ) -> anyhow::Result<bool> {
+        let (state, path, error) = match result {
+            Ok(path) => ("ready", Some(path), None),
+            Err(error) => ("failed", None, Some(error)),
+        };
+        let n = self
+            .db
+            .lock()
+            .await
+            .execute(
+                "UPDATE dirigent.player_systems SET state = $3, store_path = $4, error = $5, \
+                 updated = now() WHERE build_id = $1 AND token = $2 AND state = 'building'",
+                &[&build, &token, &state, &path, &error],
+            )
+            .await?;
+        Ok(n == 1)
+    }
+
+    /// The build `build` failed without telling (it timed out, or it couldn't be started):
+    /// unless it's done already. Whether it was under way.
+    pub async fn system_failed(&self, build: Uuid, why: &str) -> anyhow::Result<bool> {
+        let n = self
+            .db
+            .lock()
+            .await
+            .execute(
+                "UPDATE dirigent.player_systems SET state = 'failed', error = $2, \
+                 updated = now() WHERE build_id = $1 AND state = 'building'",
+                &[&build, &why],
+            )
+            .await?;
+        Ok(n == 1)
+    }
+
+    /// `hash`'s system is broken: a session's VM didn't come up with it.
+    pub async fn system_broken(&self, hash: &str, why: &str) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .await
+            .execute(
+                "UPDATE dirigent.player_systems SET state = 'broken', error = $2, \
+                 updated = now() WHERE hash = $1 AND state = 'ready'",
+                &[&hash, &why],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Store paths players' VMs added to the shared Nix store, and whether upstream signed each.
+    pub async fn nix_added(&self, paths: &[(String, bool)]) -> anyhow::Result<()> {
+        let (names, signed): (Vec<&str>, Vec<bool>) =
+            paths.iter().map(|(p, s)| (p.as_str(), *s)).unzip();
+        self.db
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO dirigent.nix_paths (path, signed) \
+                 SELECT * FROM unnest($1::text[], $2::bool[]) ON CONFLICT (path) DO UPDATE \
+                 SET uses = nix_paths.uses + 1, signed = nix_paths.signed OR excluded.signed",
+                &[&names, &signed],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The paths no generation has yet: those upstream signed, or (`all`) every one; the most
+    /// used first, 20000 at most.
+    pub async fn unpromoted(&self, all: bool) -> anyhow::Result<Vec<(String, bool)>> {
+        let rows = self
+            .db
+            .lock()
+            .await
+            .query(
+                "SELECT path, signed FROM dirigent.nix_paths \
+                 WHERE promoted_in IS NULL AND (signed OR $1) ORDER BY uses DESC LIMIT 20000",
+                &[&all],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    /// `paths` are in the shared store's generation `generation`.
+    pub async fn promoted(&self, paths: &[String], generation: i64) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .await
+            .execute(
+                "UPDATE dirigent.nix_paths SET promoted_in = $2 WHERE path = ANY($1)",
+                &[&paths, &generation],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// `subject`'s ChatGPT link, if they linked one.
     pub async fn link(&self, subject: &str) -> anyhow::Result<Option<Link>> {
         let row = self
@@ -957,6 +1096,16 @@ impl Store {
 pub enum Scope<'a> {
     User(&'a str),
     Session(Uuid),
+}
+
+/// The players' system for a configuration (`dirigent.player_systems`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerSystem {
+    /// `building`, `ready`, `failed` or `broken`.
+    pub state: String,
+    pub build: Uuid,
+    pub store_path: Option<String>,
+    pub error: Option<String>,
 }
 
 /// A user's ChatGPT link (`dirigent.chatgpt_links`), its refresh token as it's stored:

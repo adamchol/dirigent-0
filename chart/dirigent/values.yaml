@@ -114,6 +114,64 @@ player:
   # more variables, e.g. {ANTHROPIC_BASE_URL: …, RUST_LOG: player=debug}
   env: {}
   nodeSelector: {}
+  # The VMs' own NixOS configuration: files, `configuration.nix` and those it imports (by
+  # relative paths). Empty, the VMs run the image's stock system (nix/vm/defaults.nix); given,
+  # it replaces those defaults, and `imports = [ dirigent.defaults ];` keeps them:
+  #   files:
+  #     configuration.nix: |
+  #       { pkgs, dirigent, ... }: {
+  #         imports = [ dirigent.defaults ./node.nix ];
+  #         environment.systemPackages = [ pkgs.go ];
+  #       }
+  #     node.nix: |
+  #       { pkgs, ... }: { environment.systemPackages = [ pkgs.nodejs ]; }
+  # Control builds its system when it starts, once per configuration and dirigent version (in a
+  # VM: `build`), into the cache (`nix.cache`); each session's VM then boots into it (kexec),
+  # kernel and all. While it's building, or if the build fails, sessions run the stock system. A
+  # session whose VM doesn't come up with it is started again on the stock system; if that one
+  # does, the system is marked broken, and the stock system runs until the configuration
+  # changes. How it went: `kubectl describe configmap dirigent-player-nixos` (its Events), and
+  # control's log. What dirigent needs is checked, and a configuration that takes it away fails
+  # to build: the player's service as it is, the VM's disks' mounts, and the cache's include in
+  # nix.conf. Everything else is yours, including breaking the VM. Every session can read the
+  # built system, so keep secrets out of it.
+  nixos:
+    files: {}
+    build:
+      cpu: 4
+      memory: 8Gi
+      # seconds
+      timeout: 3600
+
+# The players' Nix: the cache control's builds of their system (player.nixos) go to and their
+# VMs fetch it from, a bucket in the checkpoints' S3, signed with a key control makes (the
+# Secret dirigent-nix-signing).
+nix:
+  cache:
+    bucket: dirigent-nix
+    region: us-east-1
+  # A Nix store every players' VM shares, under its own: what VMs added (`nix shell`, builds'
+  # downloads) is put, now and then, in a new generation of it, which the VMs started after
+  # have without fetching it again. On a volume (ReadWriteMany across nodes; ReadWriteOnce
+  # only on one) that the VMs mount read-only over virtiofs, which needs KubeVirt's feature
+  # gate EnableVirtioFsStorageVolumes. It uses Nix's experimental local-overlay store.
+  shared:
+    enabled: false
+    storageClass: ""
+    size: 200Gi
+    # ReadWriteOnce works on a single node only (control, the writers and the VMs all mount it)
+    accessMode: ReadWriteMany
+    # how often a generation is written, at most (seconds), when VMs added something
+    every: 3600
+    # how many generations are kept, besides those VMs have
+    keep: 3
+    # What a generation takes of what VMs added: `upstream`, only what the upstream cache
+    # (cache.nixos.org) signed, which is the same for everyone. `all` takes everything, VMs' own
+    # builds too, so anything a session put in its store (a private repository's source a flake
+    # copied there, a token a build wrote) becomes readable by every later session, and any
+    # session can put what it likes in paths every later session uses. Only for a cluster whose
+    # sessions trust each other.
+    promote: upstream
 
 control:
   resources:

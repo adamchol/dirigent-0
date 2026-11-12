@@ -138,6 +138,10 @@ in
     # mock provider unless DIRIGENT_PLAYER_ARGS says otherwise, e.g. `DIRIGENT_PLAYER_ARGS= dnvr
     # up` for the real one. Publishes `url` (its HTTP API) and `grpcUrl` (where players hold their
     # sessions). Its ports are fixed: players reconnect to the same address when it restarts.
+    # With files in .dnvr/nixos (`configuration.nix` and those it imports, as the chart's
+    # `player.nixos.files`), it builds the players' own system from them here (nix/vm/build.nix),
+    # into the Nix cache on Garage, signed with a dev key (.dnvr/nix-key); local players don't run
+    # it, but the build, its checks and control's part are the cluster's.
     control = {
       env = {
         PG_URL = "dnvr://postgres/url";
@@ -149,6 +153,12 @@ in
         # where it deletes deleted sessions' events (scripts/clickhouse-dev-access.sql's user)
         CH_HTTP_URL = "dnvr://clickhouse/httpUrl";
         CH_ACCESS = "dnvr://migrate-clickhouse/ready";
+        # the players' Nix cache, for a build of their own system
+        S3 = "dnvr://garage/endpoint";
+        S3_REGION = "dnvr://garage/region";
+        S3_ACCESS_KEY = "dnvr://garage/accessKey";
+        S3_SECRET_KEY = "dnvr://garage/secretKey";
+        NIX_BUCKET = "dnvr://garage/bucket.dirigent-nix";
       };
       command = ''
         cd "$DNVR_ROOT"
@@ -157,6 +167,18 @@ in
         grpc=54331
         dnvr-state set grpcUrl "http://127.0.0.1:$grpc"
         cargo build -q -p dirigent-control -p dirigent-player
+        if [ -e .dnvr/nixos/configuration.nix ]; then
+          if [ ! -e .dnvr/nix-key/secret ]; then
+            mkdir -p .dnvr/nix-key
+            nix-store --generate-binary-cache-key dirigent-dev-1 .dnvr/nix-key/secret .dnvr/nix-key/public
+          fi
+          DIRIGENT_PLAYER_BUILD="$(nix build --no-link --print-out-paths .#player-build)/bin/dirigent-build"
+          DIRIGENT_NIX_SIGNING_KEY="$(cat .dnvr/nix-key/secret)"
+          DIRIGENT_NIX_CACHE="s3://$NIX_BUCKET?endpoint=$S3&region=$S3_REGION"
+          export DIRIGENT_PLAYER_BUILD DIRIGENT_NIX_SIGNING_KEY DIRIGENT_NIX_CACHE \
+            DIRIGENT_NIXOS_CONFIG=.dnvr/nixos AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" \
+            AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
+        fi
         # exec'd, not `cargo run`, which wouldn't pass the stop signal on
         # shellcheck disable=SC2086
         exec target/debug/control --listen "127.0.0.1:$port" --grpc-listen "127.0.0.1:$grpc" \
@@ -169,17 +191,20 @@ in
       '';
     };
 
-    # Garage (dnvr's preset): the S3 store workspaces are checkpointed to (through kopia-repo), a
-    # single node with the bucket, and the preset's fixed dev key. Publishes `endpoint`, `region`,
-    # the key, and `bucket.dirigent-workspaces` once it takes requests.
+    # Garage (dnvr's preset): the S3 store workspaces are checkpointed to (through kopia-repo), and
+    # the players' Nix cache is in, a single node with the buckets, and the preset's fixed dev key.
+    # Publishes `endpoint`, `region`, the key, and `bucket.<name>` once it takes requests.
     garage = {
       imports = [ presets.garage ];
-      buckets = [ "dirigent-workspaces" ];
+      buckets = [
+        "dirigent-workspaces"
+        "dirigent-nix"
+      ];
       port = null;
     };
 
     # The kopia repository on Garage, made once, with the checkpoints' policy: `.gitignore`d files
-    # and files over 50 MB are left out, and no snapshot ever expires (the log refers to them).
+    # are left out, files of any size kept, and no snapshot ever expires (the log refers to them).
     # Publishes `token`, which players connect with; then idles.
     kopia-repo = {
       env = {
@@ -199,7 +224,7 @@ in
         if ! kopia repository connect s3 "''${s3[@]}" >/dev/null 2>&1; then
           kopia repository create s3 "''${s3[@]}"
         fi
-        kopia policy set --global --add-dot-ignore .gitignore --max-file-size 50000000 \
+        kopia policy set --global --add-dot-ignore .gitignore --max-file-size 0 \
           --keep-latest 1000000000 --keep-hourly 0 --keep-daily 0 --keep-weekly 0 \
           --keep-monthly 0 --keep-annual 0 >/dev/null
         token=$(kopia repository status -t -s | grep -o -- '--token [^ ]*' | cut -d' ' -f2)

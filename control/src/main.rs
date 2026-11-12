@@ -10,12 +10,14 @@ mod bootstrap;
 mod chatgpt;
 mod github;
 mod leases;
+mod nixstore;
 mod prune;
 mod runner;
 mod seal;
 mod secrets;
 mod settings;
 mod signin;
+mod system;
 mod token;
 
 use std::collections::HashMap;
@@ -49,6 +51,7 @@ use crate::prune::{PruneArgs, Pruner};
 use crate::runner::{Kube, Local, Runner};
 use crate::seal::Seal;
 use crate::secrets::{KeyArgs, Keys};
+use crate::system::System;
 use crate::token::{Signer, CHLIVE, CONTROL};
 
 /// How often a player's connection is pinged, and how long it may go unanswered before the
@@ -114,6 +117,42 @@ struct Cli {
     /// Which control's VMs they are (their `dirigent.dev/runner` label): one per install.
     #[arg(long, env = "DIRIGENT_KUBE_NAME", default_value = "dirigent")]
     kube_name: String,
+
+    /// Build the cluster's own system for the players' VMs here, from a template of its own (JSON;
+    /// Helm's): the player's image in build mode, with the configuration's ConfigMap
+    /// (`--nixos-configmap`) and the cache's signing key as disks.
+    #[arg(long, env = "DIRIGENT_KUBE_BUILD_TEMPLATE", requires = "kube_template")]
+    kube_build_template: Option<PathBuf>,
+
+    /// Write the shared Nix store's generations with Jobs from this template (JSON; Helm's), on
+    /// the volume at `--nix-store`.
+    #[arg(long, env = "DIRIGENT_KUBE_WRITER_TEMPLATE", requires_all = ["kube_template", "dir"])]
+    kube_writer_template: Option<PathBuf>,
+
+    #[command(flatten)]
+    nix_store: nixstore::NixStoreArgs,
+
+    /// The configuration's ConfigMap, which control tells of its builds on (Events).
+    #[arg(
+        long,
+        env = "DIRIGENT_NIXOS_CONFIGMAP",
+        default_value = "dirigent-player-nixos"
+    )]
+    nixos_configmap: String,
+
+    /// The cluster's own NixOS configuration for the players' VMs (`configuration.nix` and the
+    /// files it imports): its system is built at start, unless it was already, for this
+    /// configuration and version. Empty or absent: the stock image's.
+    #[arg(long, env = "DIRIGENT_NIXOS_CONFIG")]
+    nixos_config: Option<PathBuf>,
+
+    /// How long building it may take, in seconds.
+    #[arg(long, env = "DIRIGENT_NIXOS_BUILD_TIMEOUT", default_value_t = 3600)]
+    nixos_build_timeout: u64,
+
+    /// With local players, what builds it (nix/vm/build.nix's `dirigent-build`), here.
+    #[arg(long, env = "DIRIGENT_PLAYER_BUILD")]
+    player_build: Option<PathBuf>,
 
     /// How long a player control started has to take its lease, in seconds.
     #[arg(long, default_value_t = 60)]
@@ -205,6 +244,8 @@ struct Control {
     runner: Option<&'static dyn Runner>,
     /// What deletes sessions; none without ClickHouse (`--clickhouse-url`).
     pruner: Option<&'static Pruner>,
+    /// The cluster's own players' system, when it has a configuration of its own.
+    system: Option<System>,
     startup: Duration,
     /// Whether only the players it started get leases (`--reserved-only`).
     reserved_only: bool,
@@ -261,7 +302,16 @@ async fn main() -> anyhow::Result<()> {
     let detached = store.detach_all().await?;
     let kube: Option<&'static Kube> = match &cli.kube_template {
         Some(template) => Some(Box::leak(Box::new(
-            Kube::new(&cli.kube_name, cli.kube_namespace.as_deref(), template).await?,
+            Kube::new(
+                &cli.kube_name,
+                cli.kube_namespace.as_deref(),
+                template,
+                cli.kube_build_template
+                    .as_deref()
+                    .map(|t| (t, cli.nixos_configmap.as_str())),
+                cli.kube_writer_template.as_deref(),
+            )
+            .await?,
         ))),
         None => None,
     };
@@ -277,11 +327,16 @@ async fn main() -> anyhow::Result<()> {
                 args: cli.player_args.clone(),
                 control_url: format!("http://{}", cli.grpc_listen),
                 control_http: format!("http://{}", cli.listen),
+                build: cli.player_build.clone(),
             })))
         }
         None => None,
     };
     let pruner: Option<&'static Pruner> = Pruner::new(&cli.prune).map(|p| &*Box::leak(Box::new(p)));
+    let system = match &cli.nixos_config {
+        Some(dir) => System::load(dir, Duration::from_secs(cli.nixos_build_timeout))?,
+        None => None,
+    };
     let control = control(
         store,
         Auth { signer, oidc },
@@ -290,17 +345,22 @@ async fn main() -> anyhow::Result<()> {
         github,
         runner,
         pruner,
+        system,
         Duration::from_secs(cli.startup),
         cli.reserved_only,
         Duration::from_secs(cli.session_days * 86400),
     );
     tokio::spawn(sweep(control));
+    tokio::spawn(system::begin(control));
     if let Some(pruner) = pruner {
         tokio::spawn(prune::prune(&control.store, runner, pruner));
         tokio::spawn(prune::maintain(pruner));
     }
     if let Some(kube) = kube {
         tokio::spawn(kube.clear(&control.store, control.startup, Duration::from_secs(30)));
+        if cli.kube_writer_template.is_some() {
+            tokio::spawn(nixstore::keep(control, kube, &cli.nix_store));
+        }
     }
     let listener = tokio::net::TcpListener::bind(cli.listen).await?;
     let grpc = tokio::net::TcpListener::bind(cli.grpc_listen).await?;
@@ -331,6 +391,7 @@ fn control(
     github: Github,
     runner: Option<&'static dyn Runner>,
     pruner: Option<&'static Pruner>,
+    system: Option<System>,
     startup: Duration,
     reserved_only: bool,
     sign_in_ttl: Duration,
@@ -344,6 +405,7 @@ fn control(
         changed: broadcast::channel(64).0,
         runner,
         pruner,
+        system,
         startup,
         reserved_only,
         attached: Default::default(),
@@ -391,6 +453,9 @@ fn router(control: &'static Control) -> Router {
         .route("/links/github/start", post(start_github))
         .route("/links/github/callback", get(github_callback))
         .route("/github/access", get(github_access))
+        .route("/system", get(get_system))
+        .route("/system/builds/{id}", post(system_built))
+        .route("/nix/paths", post(nix_paths))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/session", post(open_sign_in).delete(close_sign_in))
         .route("/session/token", post(sign_in_token))
@@ -704,6 +769,81 @@ async fn github_access(
     })))
 }
 
+/// How the cluster's own players' system goes (`player.nixos`): built, building, failed or
+/// broken; or that it has none (the stock image).
+async fn get_system(
+    State(control): State<&'static Control>,
+    Caller(_): Caller,
+) -> Result<Json<system::Status>, Failed> {
+    system::status(control)
+        .await
+        .map(Json)
+        .map_err(|e| failed("reading the players' system", e))
+}
+
+/// A build VM tells how its build of the players' system went, with the build's token.
+async fn system_built(
+    State(control): State<&'static Control>,
+    Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+    Json(report): Json<system::Report>,
+) -> Result<StatusCode, Failed> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or((StatusCode::UNAUTHORIZED, "no build token".to_string()))?;
+    match system::built(control, id, token, &report).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            "no such build under way, with that token".into(),
+        )),
+        Err(e) => Err(failed("noting the players' system's build", e)),
+    }
+}
+
+/// What a player's VM added to the shared Nix store, which the player tells with its own token.
+#[derive(Deserialize)]
+struct NixPaths {
+    paths: Vec<nixstore::Added>,
+}
+
+/// A player tells what its VM added to the shared Nix store (with its token, chlive's).
+async fn nix_paths(
+    State(control): State<&'static Control>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<NixPaths>,
+) -> Result<StatusCode, Failed> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or((StatusCode::UNAUTHORIZED, "no player's token".to_string()))?;
+    let claims = control.auth.signer.verify(token, CHLIVE).map_err(|e| {
+        (
+            StatusCode::UNAUTHORIZED,
+            format!("not a player's token: {e}"),
+        )
+    })?;
+    if !claims.sub.starts_with("player:") {
+        return Err((StatusCode::FORBIDDEN, "only players tell this".into()));
+    }
+    let paths: Vec<(String, bool)> = body
+        .paths
+        .into_iter()
+        .filter(|a| a.path.starts_with("/nix/store/") && a.path.len() < 256)
+        .take(10_000)
+        .map(|a| (a.path, a.signed))
+        .collect();
+    control
+        .store
+        .nix_added(&paths)
+        .await
+        .map_err(|e| failed("noting the store paths a VM added", e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// The caller's settings, defaults for those they haven't set.
 async fn get_settings(
     State(control): State<&'static Control>,
@@ -880,6 +1020,7 @@ async fn sweep(control: &'static Control) {
                 continue;
             }
             warn!(session = %session, "player lost; starting another");
+            system::lost(control, session);
             if let Err(e) = start(control, session).await {
                 error!(session = %session, "starting a player: {e:#}");
             }
@@ -918,7 +1059,16 @@ async fn start(control: &'static Control, session: Uuid) -> anyhow::Result<Start
         Reserve::Unknown => return Ok(Started::Unknown),
         Reserve::Archived => return Ok(Started::Archived),
     };
-    if let Err(e) = runner.start(session, &player, epoch).await {
+    // the cluster's own system, once it's built, where the runner runs it
+    let system = control
+        .system
+        .as_ref()
+        .filter(|_| runner.runs_systems())
+        .and_then(|s| s.start(session, epoch));
+    if let Err(e) = runner
+        .start(session, &player, epoch, system.as_deref())
+        .await
+    {
         control.store.drop_lease(session).await?;
         return Err(e);
     }
@@ -1442,7 +1592,16 @@ impl Players for Lessor {
         let conn = control.connections.fetch_add(1, Ordering::Relaxed);
         let mut attached = control.attached.lock().await;
         let (epoch, spec, owner) = match control.store.acquire(session, &subject, ask.epoch).await {
-            Ok(Acquire::Acquired(epoch, spec, owner)) => (epoch, spec, owner),
+            Ok(Acquire::Acquired(epoch, spec, owner)) => {
+                // its VM came up (in the cluster's system, if it was started with it; on the stock
+                // image, if it was started again so, which says the system is broken)
+                if let Some(system) = &control.system {
+                    if system.came(session, epoch) {
+                        tokio::spawn(system::broken(control, session));
+                    }
+                }
+                (epoch, spec, owner)
+            }
             Ok(Acquire::Held) => {
                 return Err(Status::failed_precondition(
                     "another player holds the session",
@@ -1917,10 +2076,14 @@ mod e2e {
         }
     }
 
-    /// Notes the players it's to start: (session, player, epoch).
+    /// Notes the players it's to start: (session, player, epoch), and the system each is to
+    /// start in; and the builds of the players' system (id, token), and those ended.
     struct Recorder {
         id: String,
         started: std::sync::Mutex<Vec<(Uuid, String, i64)>>,
+        systems: std::sync::Mutex<Vec<(Uuid, Option<String>)>>,
+        builds: std::sync::Mutex<Vec<(Uuid, String)>>,
+        ended: std::sync::Mutex<Vec<Uuid>>,
         fail: bool,
     }
 
@@ -1930,17 +2093,40 @@ mod e2e {
             &self.id
         }
 
-        async fn start(&self, session: Uuid, player: &str, epoch: i64) -> anyhow::Result<()> {
+        async fn start(
+            &self,
+            session: Uuid,
+            player: &str,
+            epoch: i64,
+            system: Option<&str>,
+        ) -> anyhow::Result<()> {
             anyhow::ensure!(!self.fail, "the runner fails");
             self.started
                 .lock()
                 .unwrap()
                 .push((session, player.into(), epoch));
+            self.systems
+                .lock()
+                .unwrap()
+                .push((session, system.map(Into::into)));
             Ok(())
         }
 
         async fn forget(&self, _: Uuid) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        async fn build(&self, id: Uuid, token: &str, _: &std::path::Path) -> anyhow::Result<()> {
+            self.builds.lock().unwrap().push((id, token.into()));
+            Ok(())
+        }
+
+        async fn end_build(&self, id: Uuid) {
+            self.ended.lock().unwrap().push(id);
+        }
+
+        fn runs_systems(&self) -> bool {
+            true
         }
     }
 
@@ -1960,6 +2146,9 @@ mod e2e {
         Box::leak(Box::new(Recorder {
             id: format!("test:{}", Uuid::new_v4()),
             started: Default::default(),
+            systems: Default::default(),
+            builds: Default::default(),
+            ended: Default::default(),
             fail,
         }))
     }
@@ -1988,6 +2177,7 @@ mod e2e {
             keys,
             github,
             STARTUP,
+            None,
             runner,
         )
         .await
@@ -2008,7 +2198,8 @@ mod e2e {
     /// A started player's time to take its lease, where the runner only notes it.
     const STARTUP: Duration = Duration::from_secs(1);
 
-    /// The same, with `github` for GitHub, and `startup` for a started player to take its lease.
+    /// The same, with `github` for GitHub, `startup` for a started player to take its lease, and
+    /// the cluster's own players' `system`, if it has one.
     #[allow(clippy::too_many_arguments)]
     async fn start_all(
         oidc: Option<Arc<auth::Oidc>>,
@@ -2018,6 +2209,7 @@ mod e2e {
         keys: Option<(KeyArgs, Seal)>,
         github: GithubArgs,
         startup: Duration,
+        system: Option<System>,
         runner: impl FnOnce(&Ctl) -> &'static dyn Runner,
     ) -> Option<Ctl> {
         std::env::var_os("DIRIGENT_E2E")?;
@@ -2069,11 +2261,13 @@ mod e2e {
             github,
             Some(runner),
             pruner,
+            system,
             startup,
             reserved_only,
             Duration::from_secs(3600),
         );
         tokio::spawn(sweep(control));
+        tokio::spawn(system::begin(control));
         if let Some(pruner) = pruner {
             tokio::spawn(prune::prune(&control.store, Some(runner), pruner));
         }
@@ -3088,16 +3282,27 @@ mod e2e {
     async fn start_local(root: &std::path::Path) -> Option<Ctl> {
         let root = root.to_path_buf();
         let (ttl, startup) = (Duration::from_secs(600), Duration::from_secs(15));
-        start_all(None, ttl, false, None, None, no_github(), startup, |ctl| {
-            Box::leak(Box::new(Local {
-                id: format!("local:{}", root.display()),
-                root: root.clone(),
-                program: concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/player").into(),
-                args: vec!["--mock".into()],
-                control_url: format!("http://{}", ctl.grpc),
-                control_http: format!("http://{}", ctl.http),
-            }))
-        })
+        start_all(
+            None,
+            ttl,
+            false,
+            None,
+            None,
+            no_github(),
+            startup,
+            None,
+            |ctl| {
+                Box::leak(Box::new(Local {
+                    id: format!("local:{}", root.display()),
+                    root: root.clone(),
+                    program: concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/player").into(),
+                    args: vec!["--mock".into()],
+                    control_url: format!("http://{}", ctl.grpc),
+                    control_http: format!("http://{}", ctl.http),
+                    build: None,
+                }))
+            },
+        )
         .await
     }
 
@@ -3599,6 +3804,337 @@ mod e2e {
         on_t.close().await;
     }
 
+    /// A configuration for the players' system of its own (so its hash is this test's), in a
+    /// directory to load it from.
+    fn configuration() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let module = format!("# {}\n{{ pkgs, ... }}: {{ }}\n", Uuid::new_v4());
+        std::fs::write(dir.path().join("configuration.nix"), module).unwrap();
+        dir
+    }
+
+    /// A control with the players' system configured in `dir`, its builds taking up to
+    /// `timeout`.
+    async fn start_system(
+        runner: &'static Recorder,
+        dir: &std::path::Path,
+        timeout: Duration,
+    ) -> Option<Ctl> {
+        let system = System::load(dir, timeout).unwrap();
+        let ttl = Duration::from_secs(600);
+        start_all(
+            None,
+            ttl,
+            false,
+            None,
+            None,
+            no_github(),
+            STARTUP,
+            system,
+            |_| runner,
+        )
+        .await
+    }
+
+    /// The builds `runner` was asked for, once there are `n`, within 10 s.
+    async fn builds_n(runner: &Recorder, n: usize) -> Vec<(Uuid, String)> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got = runner.builds.lock().unwrap().clone();
+            if got.len() >= n || tokio::time::Instant::now() > deadline {
+                return got;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// A build VM telling control how `build` went, with `token`.
+    async fn report(
+        base: &Ctl,
+        build: Uuid,
+        token: &str,
+        body: serde_json::Value,
+    ) -> reqwest::StatusCode {
+        reqwest::Client::new()
+            .post(format!("http://{base}/system/builds/{build}"))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn system_state(base: &Ctl) -> serde_json::Value {
+        get_json(base, A, "/system").await.1
+    }
+
+    /// The systems `session`'s players were started in so far.
+    fn systems_of(runner: &Recorder, session: Uuid) -> Vec<Option<String>> {
+        let systems = runner.systems.lock().unwrap();
+        systems
+            .iter()
+            .filter(|(s, _)| *s == session)
+            .map(|(_, system)| system.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn e2e_the_players_system_is_built_once_for_its_configuration_and_version() {
+        let dir = configuration();
+        let runner = recorder(false);
+        let hour = Duration::from_secs(3600);
+        let Some(base) = start_system(runner, dir.path(), hour).await else {
+            return;
+        };
+        let (build, token) = builds_n(runner, 1).await.pop().expect("a build");
+        assert_eq!(system_state(&base).await["state"], "building");
+        // meanwhile, sessions run the stock image
+        let early = Uuid::new_v4();
+        put(&base, early).await;
+        post(&base, &format!("/sessions/{early}/start"), None).await;
+        assert_eq!(systems_of(runner, early), vec![None]);
+
+        let path = "/nix/store/0000000000000000000000000000000a-nixos-system-player";
+        let done = serde_json::json!({ "ok": true, "store_path": path });
+        assert_eq!(
+            report(&base, build, "not its token", done.clone()).await,
+            reqwest::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            report(&base, build, &token, done.clone()).await,
+            reqwest::StatusCode::NO_CONTENT
+        );
+        // told once
+        assert_eq!(
+            report(&base, build, &token, done).await,
+            reqwest::StatusCode::NOT_FOUND
+        );
+        assert_eq!(runner.ended.lock().unwrap().clone(), vec![build]);
+        let state = system_state(&base).await;
+        assert_eq!(
+            (state["state"].as_str(), state["store_path"].as_str()),
+            (Some("ready"), Some(path))
+        );
+        let s = Uuid::new_v4();
+        put(&base, s).await;
+        post(&base, &format!("/sessions/{s}/start"), None).await;
+        assert_eq!(systems_of(runner, s), vec![Some(path.to_string())]);
+
+        // a control started again, with the same configuration: built already
+        let again = recorder(false);
+        let Some(base) = start_system(again, dir.path(), hour).await else {
+            return;
+        };
+        assert!(builds_n(again, 1).await.is_empty(), "built again");
+        let t = Uuid::new_v4();
+        put(&base, t).await;
+        post(&base, &format!("/sessions/{t}/start"), None).await;
+        assert_eq!(systems_of(again, t), vec![Some(path.to_string())]);
+
+        // another configuration: built anew
+        std::fs::write(dir.path().join("more.nix"), "{ }").unwrap();
+        let other = recorder(false);
+        start_system(other, dir.path(), hour).await;
+        assert_eq!(builds_n(other, 1).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn e2e_a_failed_or_late_build_leaves_the_stock_image_until_control_tries_again() {
+        let dir = configuration();
+        let runner = recorder(false);
+        let Some(base) = start_system(runner, dir.path(), Duration::from_secs(3600)).await else {
+            return;
+        };
+        let (build, token) = builds_n(runner, 1).await.pop().expect("a build");
+        let log = "error: undefined variable 'pkgs.nodjs'";
+        assert_eq!(
+            report(
+                &base,
+                build,
+                &token,
+                serde_json::json!({ "ok": false, "log": log })
+            )
+            .await,
+            reqwest::StatusCode::NO_CONTENT
+        );
+        let state = system_state(&base).await;
+        assert_eq!(
+            (state["state"].as_str(), state["error"].as_str()),
+            (Some("failed"), Some(log))
+        );
+        let s = Uuid::new_v4();
+        put(&base, s).await;
+        post(&base, &format!("/sessions/{s}/start"), None).await;
+        assert_eq!(systems_of(runner, s), vec![None]);
+
+        // started again, control tries again; this time the build takes too long
+        let again = recorder(false);
+        let Some(base) = start_system(again, dir.path(), Duration::from_secs(1)).await else {
+            return;
+        };
+        let (late, _) = builds_n(again, 1).await.pop().expect("built again");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while system_state(&base).await["state"] != "failed" {
+            assert!(tokio::time::Instant::now() < deadline, "not timed out");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(system_state(&base).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("not built in"));
+        assert_eq!(again.ended.lock().unwrap().clone(), vec![late]);
+    }
+
+    #[tokio::test]
+    async fn e2e_a_system_no_vm_comes_up_with_is_broken_and_one_that_does_isnt() {
+        let dir = configuration();
+        let runner = recorder(false);
+        let hour = Duration::from_secs(3600);
+        let Some(base) = start_system(runner, dir.path(), hour).await else {
+            return;
+        };
+        let (build, token) = builds_n(runner, 1).await.pop().expect("a build");
+        let path = "/nix/store/0000000000000000000000000000000b-nixos-system-player";
+        let done = serde_json::json!({ "ok": true, "store_path": path });
+        report(&base, build, &token, done).await;
+
+        // its player comes, within its startup: the system works
+        let came = Uuid::new_v4();
+        put(&base, came).await;
+        post(&base, &format!("/sessions/{came}/start"), None).await;
+        let (player, epoch) = started_n(runner, came, 1).await.pop().expect("started");
+        let mut conn = connect(&base).await;
+        assert_eq!(
+            acquire(&mut conn, came, &player, Some(epoch)).await,
+            acquired(epoch)
+        );
+        tokio::time::sleep(STARTUP * 3).await;
+        assert_eq!(system_state(&base).await["state"], "ready");
+
+        // this one's doesn't, nor on the stock image: something else is wrong
+        let neither = Uuid::new_v4();
+        put(&base, neither).await;
+        post(&base, &format!("/sessions/{neither}/start"), None).await;
+        started_n(runner, neither, 3).await;
+        let systems = systems_of(runner, neither);
+        assert_eq!(
+            systems[..3],
+            [Some(path.to_string()), None, Some(path.to_string())]
+        );
+        assert_eq!(system_state(&base).await["state"], "ready");
+        post(&base, &format!("/sessions/{neither}/archive"), None).await;
+
+        // this one's doesn't, but does on the stock image: the system is why
+        let lost = Uuid::new_v4();
+        put(&base, lost).await;
+        post(&base, &format!("/sessions/{lost}/start"), None).await;
+        let (player, epoch) = started_n(runner, lost, 2)
+            .await
+            .pop()
+            .expect("started again");
+        assert_eq!(systems_of(runner, lost), vec![Some(path.to_string()), None]);
+        let mut stock = connect(&base).await;
+        assert_eq!(
+            acquire(&mut stock, lost, &player, Some(epoch)).await,
+            acquired(epoch)
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while system_state(&base).await["state"] != "broken" {
+            assert!(tokio::time::Instant::now() < deadline, "not broken");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let state = system_state(&base).await;
+        assert!(state["error"].as_str().unwrap().contains("didn't come up"));
+        conn.close().await;
+        stock.close().await;
+
+        // broken, it isn't built again for the same configuration
+        let again = recorder(false);
+        let Some(base) = start_system(again, dir.path(), hour).await else {
+            return;
+        };
+        assert!(builds_n(again, 1).await.is_empty(), "built again");
+        let s = Uuid::new_v4();
+        put(&base, s).await;
+        post(&base, &format!("/sessions/{s}/start"), None).await;
+        assert_eq!(systems_of(again, s), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn e2e_players_tell_what_their_vms_added_to_the_shared_store() {
+        let runner = recorder(false);
+        let Some(base) = start_recording(runner).await else {
+            return;
+        };
+        let s = Uuid::new_v4();
+        put(&base, s).await;
+        post(&base, &format!("/sessions/{s}/start"), None).await;
+        let (player, epoch) = started_n(runner, s, 1).await.pop().expect("started");
+        let mut conn = connect(&base).await;
+        assert_eq!(
+            acquire(&mut conn, s, &player, Some(epoch)).await,
+            acquired(epoch)
+        );
+        let token = conn.tokens.as_ref().expect("its tokens").player.clone();
+        let id = Uuid::new_v4().simple();
+        let (upstream, mine) = (
+            format!("/nix/store/{id}-hello"),
+            format!("/nix/store/{id}-mine"),
+        );
+        let body = serde_json::json!({ "paths": [
+            { "path": upstream, "signed": true },
+            { "path": mine, "signed": false },
+            { "path": "/etc/passwd", "signed": true },
+        ] });
+        let tell = |token: Option<String>| {
+            let req = reqwest::Client::new()
+                .post(format!("http://{base}/nix/paths"))
+                .json(&body);
+            let req = match token {
+                Some(t) => req.bearer_auth(t),
+                None => req,
+            };
+            async move { req.send().await.unwrap().status() }
+        };
+        assert_eq!(tell(None).await, reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            tell(Some("not a token".into())).await,
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            tell(Some(token.clone())).await,
+            reqwest::StatusCode::NO_CONTENT
+        );
+        // told again (another VM added it too)
+        assert_eq!(tell(Some(token)).await, reqwest::StatusCode::NO_CONTENT);
+
+        let url = std::env::var("DIRIGENT_CONTROL_POSTGRES").unwrap();
+        let store = Store::connect(&url, Duration::from_secs(1)).await.unwrap();
+        let has = |paths: &[(String, bool)], p: &str| paths.iter().any(|(q, _)| q == p);
+        let signed = store.unpromoted(false).await.unwrap();
+        assert!(has(&signed, &upstream) && !has(&signed, &mine));
+        let all = store.unpromoted(true).await.unwrap();
+        assert!(has(&all, &upstream) && has(&all, &mine) && !has(&all, "/etc/passwd"));
+        store
+            .promoted(std::slice::from_ref(&upstream), 7)
+            .await
+            .unwrap();
+        assert!(!has(&store.unpromoted(true).await.unwrap(), &upstream));
+        conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn e2e_without_a_configuration_there_is_no_system_of_its_own() {
+        let Some(base) = start_recording(recorder(false)).await else {
+            return;
+        };
+        assert_eq!(
+            system_state(&base).await,
+            serde_json::json!({ "configured": false })
+        );
+    }
+
     #[tokio::test]
     async fn e2e_settings_are_each_users_own_defaulted_and_checked() {
         let Some(base) = start_recording(recorder(false)).await else {
@@ -3653,7 +4189,10 @@ mod e2e {
         let runner = recorder(false);
         let ttl = Duration::from_secs(600);
         let github = gh.args(dir.path());
-        let ctl = start_all(None, ttl, false, None, keys, github, STARTUP, |_| runner).await?;
+        let ctl = start_all(None, ttl, false, None, keys, github, STARTUP, None, |_| {
+            runner
+        })
+        .await?;
         Some((ctl, gh, dir))
     }
 

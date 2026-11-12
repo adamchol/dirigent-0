@@ -44,6 +44,21 @@ rules:
     resources: [secrets]
     resourceNames: [dirigent-kopia]
     verbs: [get]
+  # the cache's signing key (control makes it, its public half goes to the players' VMs), and
+  # how the builds of the players' own system go, told on its ConfigMap
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [dirigent-nix-signing]
+    verbs: [get, patch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create]
+  {{- if .Values.nix.shared.enabled }}
+  # the shared Nix store's writers
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, create, delete]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -169,6 +184,30 @@ spec:
               value: dirigent-kopia
             - name: DIRIGENT_KOPIA_STATE
               value: /var/lib/dirigent/kopia
+            {{- if .Values.player.nixos.files }}
+            # the players' own system: its configuration, and the VM it's built in
+            - name: DIRIGENT_NIXOS_CONFIG
+              value: /etc/dirigent/nixos
+            - name: DIRIGENT_KUBE_BUILD_TEMPLATE
+              value: /etc/dirigent/player/build.json
+            - name: DIRIGENT_NIXOS_BUILD_TIMEOUT
+              value: {{ .Values.player.nixos.build.timeout | quote }}
+            {{- end }}
+            {{- with .Values.nix.shared }}
+            {{- if .enabled }}
+            # the shared Nix store: its generations, and what writes them
+            - name: DIRIGENT_NIX_STORE
+              value: /var/lib/dirigent/nix-store
+            - name: DIRIGENT_KUBE_WRITER_TEMPLATE
+              value: /etc/dirigent/player/writer.json
+            - name: DIRIGENT_NIX_PROMOTE
+              value: {{ .promote | quote }}
+            - name: DIRIGENT_NIX_EVERY
+              value: {{ .every | quote }}
+            - name: DIRIGENT_NIX_KEEP
+              value: {{ .keep | quote }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.github.app }}
             {{- if .slug }}
             # the GitHub App's, for private repositories
@@ -193,6 +232,12 @@ spec:
             - { name: keys, mountPath: /etc/dirigent/keys, readOnly: true }
             - { name: player, mountPath: /etc/dirigent/player, readOnly: true }
             - { name: kopia, mountPath: /var/lib/dirigent/kopia }
+            {{- if .Values.player.nixos.files }}
+            - { name: nixos, mountPath: /etc/dirigent/nixos, readOnly: true }
+            {{- end }}
+            {{- if .Values.nix.shared.enabled }}
+            - { name: nix-store, mountPath: /var/lib/dirigent/nix-store }
+            {{- end }}
             {{- if .Values.github.app.slug }}
             - { name: github, mountPath: /etc/dirigent/github, readOnly: true }
             {{- end }}
@@ -204,6 +249,14 @@ spec:
         # control's kopia config and cache
         - name: kopia
           emptyDir: {}
+        {{- if .Values.player.nixos.files }}
+        - name: nixos
+          configMap: { name: dirigent-player-nixos }
+        {{- end }}
+        {{- if .Values.nix.shared.enabled }}
+        - name: nix-store
+          persistentVolumeClaim: { claimName: dirigent-nix-store }
+        {{- end }}
         {{- with .Values.github.app }}
         {{- if .slug }}
         - name: github

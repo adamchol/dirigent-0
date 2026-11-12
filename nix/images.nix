@@ -1,7 +1,7 @@
 # The chart's (chart/dirigent) own images, built from the flake (chlive's, the ingestion's and
 # Garage's are their projects'): `nix build .#<name>-image` gives a docker-archive, which
 # `push-images` sends to the registry (and the test cluster loads directly). The players'
-# is a KubeVirt containerDisk: a NixOS disk image (nix/player-vm.nix).
+# is a KubeVirt containerDisk: a NixOS disk image (nix/vm).
 {
   pkgs,
   lib,
@@ -22,17 +22,20 @@ let
       // args
     );
 
-  playerSystem = nixpkgs.lib.nixosSystem {
-    inherit (pkgs.stdenv.hostPlatform) system;
-    modules = [ (import ./player-vm.nix { inherit dirigent; }) ];
-  };
+  playerSystem =
+    (import ./vm/system.nix {
+      inherit nixpkgs dirigent;
+      inherit (pkgs.stdenv.hostPlatform) system;
+    }).eval
+      ./vm/defaults.nix;
   playerDisk = import "${nixpkgs}/nixos/lib/make-disk-image.nix" {
     inherit pkgs lib;
     inherit (playerSystem) config;
     format = "qcow2";
     partitionTableType = "legacy";
     diskSize = "auto";
-    additionalSpace = "1G";
+    # room for what sessions add to the store; the qcow2 is sparse, so the image stays small
+    additionalSpace = "24G";
   };
 in
 {
@@ -67,7 +70,7 @@ in
 
   # the chart's Jobs and init containers: the schema migrations (openmig.toml and db/, in
   # /dirigent), the kopia repository and Garage's setup, chlive's config and its wait for
-  # control's keys
+  # control's keys; and Nix, for the shared Nix store's generations
   tools = image "tools" {
     contents = with pkgs; [
       openmig
@@ -79,6 +82,7 @@ in
       curl
       jq
       cacert
+      nix
     ];
     extraCommands = ''
       mkdir -p dirigent tmp

@@ -72,6 +72,11 @@ pub async fn ensure(garage: bool, keys: Option<&Path>) -> anyhow::Result<()> {
         postgres("dirigent-control-postgres", "dirigent_control"),
         postgres("dirigent-chlive-postgres", "dirigent_chlive"),
         one("dirigent-kopia-password", "password", hex(32)),
+        Wanted {
+            name: crate::runner::NIX_SIGNING_SECRET,
+            kind: None,
+            keys: nix_signing_key(),
+        },
     ];
     for (name, user) in [
         ("dirigent-clickhouse-sink", "dirigent_sink"),
@@ -251,6 +256,27 @@ fn garage_keys() -> BTreeMap<String, String> {
     ])
 }
 
+/// The cache's signing key, as Nix has them (`nix-store --generate-binary-cache-key`):
+/// DIRIGENT_NIX_SIGNING_KEY, `dirigent-1:<base64 of the Ed25519 seed and public key>`, and
+/// DIRIGENT_NIX_KEY, `dirigent-1:<base64 of the public key>`, which players' VMs trust.
+fn nix_signing_key() -> BTreeMap<String, String> {
+    use base64::Engine;
+    let mut seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut seed);
+    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    BTreeMap::from([
+        (
+            "DIRIGENT_NIX_SIGNING_KEY".to_string(),
+            format!("dirigent-1:{}", b64(&key.to_keypair_bytes())),
+        ),
+        (
+            "DIRIGENT_NIX_KEY".to_string(),
+            format!("dirigent-1:{}", b64(key.verifying_key().as_bytes())),
+        ),
+    ])
+}
+
 /// `n` random bytes, in hex.
 fn hex(n: usize) -> String {
     let mut bytes = vec![0u8; n];
@@ -269,6 +295,32 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn the_caches_signing_key_is_nixs_with_its_public_half() {
+        let keys = nix_signing_key();
+        let mut nix = std::process::Command::new("nix")
+            .args(["--extra-experimental-features", "nix-command", "key"])
+            .arg("convert-secret-to-public")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        let secret = &keys["DIRIGENT_NIX_SIGNING_KEY"];
+        nix.stdin
+            .take()
+            .unwrap()
+            .write_all(secret.as_bytes())
+            .unwrap();
+        let out = nix.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap().trim(),
+            keys["DIRIGENT_NIX_KEY"]
+        );
+        assert_ne!(nix_signing_key(), keys);
     }
 
     #[test]

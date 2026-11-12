@@ -6,6 +6,7 @@ mod history;
 #[cfg(test)]
 mod logs;
 mod mirror;
+mod nixstore;
 mod process;
 mod provider;
 mod secrets;
@@ -224,6 +225,20 @@ async fn main() -> anyhow::Result<()> {
     );
     let spec: &'static SessionSpec = Box::leak(Box::new(lease.spec.clone()));
     let mut session = ChliveSession::new(&id, lease.epoch, &cli.chlive_url, lease.tokens());
+    // on the shared Nix store, what this VM adds to it is told to control, now and then and at the end
+    let tokens = lease.tokens();
+    let reporter =
+        nixstore::Reporter::new(&cli.control_http, move || tokens.borrow().player.clone())
+            .map(|r| &*Box::leak(Box::new(Mutex::new(r))));
+    if let Some(reporter) = reporter {
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(120));
+            loop {
+                every.tick().await;
+                reporter.lock().await.report().await;
+            }
+        });
+    }
     let run = async {
         // the spec's, which the lease came with
         let provider: Arc<dyn Provider> = match spec.provider {
@@ -322,6 +337,12 @@ async fn main() -> anyhow::Result<()> {
             error: format!("{e:#}"),
         };
         let _ = tokio::time::timeout(Duration::from_secs(5), session.publish(&failed)).await;
+    }
+    if let Some(reporter) = reporter {
+        let _ = tokio::time::timeout(Duration::from_secs(60), async {
+            reporter.lock().await.report().await
+        })
+        .await;
     }
     if result.is_ok() && *stop.outside.borrow() {
         info!("handing the session over");

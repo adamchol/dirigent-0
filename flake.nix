@@ -119,6 +119,12 @@
               chart
               ;
             default = dirigent;
+            # what builds the cluster's own players' system (nix/vm/build.nix), for the dev
+            # stack's control, which runs it here
+            player-build = import ./nix/vm/build.nix {
+              inherit pkgs dirigent;
+              inherit (inputs) nixpkgs;
+            };
             # the dev shell's `push-images`, without the shell (CI's)
             push-images = pkgs.writeShellApplication {
               name = "push-images";
@@ -157,6 +163,11 @@
                     || { echo "the chart renders differently each time" >&2; exit 1; }
                   touch $out
                 '';
+            # the stock players' VM, booted (KVM)
+            player-vm = import ./nix/vm/test.nix {
+              inherit pkgs dirigent;
+              inherit (inputs) nixpkgs;
+            };
             chlive-image =
               let
                 tag = "sha-${lib.substring 0 12 inputs.chlive.rev}";

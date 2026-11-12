@@ -31,3 +31,13 @@
 {{- fail "web.httpRoute.parentRefs is required: the Gateway(s) the route attaches to" }}
 {{- end }}
 {{- end }}
+{{- with .Values.player.nixos.files }}
+{{- if not (hasKey . "configuration.nix") }}
+{{- fail "player.nixos.files needs configuration.nix, the configuration's entry" }}
+{{- end }}
+{{- end }}
+{{- if .Values.nix.shared.enabled }}
+{{- if not (has .Values.nix.shared.promote (list "upstream" "all")) }}
+{{- fail "nix.shared.promote is upstream or all" }}
+{{- end }}
+{{- end }}
