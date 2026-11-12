@@ -1134,7 +1134,6 @@ async fn start(control: &'static Control, session: Uuid) -> anyhow::Result<Start
                 return not.map(Started::from);
             }
         };
-        control.pool.wake();
         let player = warm.player.clone();
         let taken = match runner.take(session, &player, epoch).await {
             Ok(()) => warm.tell(session, epoch).await,
@@ -1144,11 +1143,14 @@ async fn start(control: &'static Control, session: Uuid) -> anyhow::Result<Start
             }
         };
         if taken {
+            // once it's the session's, so the round doesn't count it as warm still
+            control.pool.wake();
             return Ok(Started::Player(epoch));
         }
         // gone meanwhile: a VM of its own after all
         warn!(session = %session, player, "the warm VM was gone: starting another");
         runner.unwarm(&player).await;
+        control.pool.wake();
         control.store.drop_lease(session).await?;
     }
     let player = Uuid::new_v4().to_string();
@@ -4550,6 +4552,26 @@ mod e2e {
             if warm.len() >= n || tokio::time::Instant::now() > deadline {
                 return warm;
             }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_with_no_warm_vms_wanted_those_kept_before_go() {
+        let runner = warm_recorder();
+        let machines = test_machines();
+        runner.warm.lock().unwrap().push(runner::Warm {
+            player: Uuid::new_v4().to_string(),
+            machine: machines.defaults,
+            key: runner.warm_key(machines.defaults, None),
+            age: Duration::ZERO,
+        });
+        let Some(_base) = start_machines(runner, machines).await else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !runner.warm.lock().unwrap().is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "the warm VM stays");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }

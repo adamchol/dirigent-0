@@ -149,18 +149,21 @@ pub async fn wait(
     Ok(rx)
 }
 
-/// Keep the pool: a round every 30 s, and when woken. Nothing, without warm VMs.
+/// Keep the pool: a round every 30 s, and when woken. Without warm VMs, one round, which
+/// deletes those kept before.
 pub async fn keep(control: &'static Control) {
-    if control.machines.warm == 0 {
-        return;
-    }
     if !control.runner.is_some_and(|r| r.warms()) {
-        warn!("--warm: this runner keeps no warm VMs");
+        if control.machines.warm > 0 {
+            warn!("--warm: this runner keeps no warm VMs");
+        }
         return;
     }
     loop {
         if let Err(e) = round(control).await {
             error!("keeping the warm VMs: {e:#}");
+        }
+        if control.machines.warm == 0 {
+            return;
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
