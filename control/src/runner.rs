@@ -602,7 +602,7 @@ impl Runner for Kube {
         system: Option<&str>,
         key: &str,
     ) -> anyhow::Result<()> {
-        let mut env = format!("DIRIGENT_WARM=1\nDIRIGENT_PLAYER_ID={player}\n");
+        let mut env = format!("DIRIGENT_WARM=true\nDIRIGENT_PLAYER_ID={player}\n");
         let generation = self.nix(&mut env, system);
         let (cpu, memory, disk) = (
             machine.cpu.to_string(),
