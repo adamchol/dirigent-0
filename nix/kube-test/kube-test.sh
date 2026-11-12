@@ -7,8 +7,8 @@
 #                       CloudNativePG and the stand-ins, load the images, and install (or
 #                       upgrade) the chart, with values.yaml and the args (e.g. `-f more.yaml`)
 #   kube-test load      build and load the images again
-#   kube-test e2e       the cluster's test (player/src/session/chlive.rs, `kube_e2e`), through
-#                       forwarded ports to control and chlive
+#   kube-test e2e       the cluster's tests (player/src/session/chlive.rs, `kube_e2e`), one at
+#                       a time, through forwarded ports to control and chlive
 #   kube-test down      stop k3s (its pods and VMs stop with it; the state stays)
 #   kube-test kubectl … kubectl on the test cluster
 #   kube-test helm …    helm on it
@@ -63,9 +63,12 @@ install() {
   kubectl apply -f "$m/kubevirt-cr.yaml" >/dev/null
   kubectl apply --server-side -f "$m/cnpg.yaml" >/dev/null
   kubectl -n kubevirt wait kubevirt/kubevirt --for=condition=Available --timeout=600s
+  # one of each of KubeVirt's pods on the one node: the second ones' requests leave too little
+  # memory for a VM of 2 GiB
   kubectl -n kubevirt patch kubevirt kubevirt --type merge -p \
-    '{"spec":{"configuration":{"developerConfiguration":{"featureGates":["EnableVirtioFsStorageVolumes"]}}}}' \
+    '{"spec":{"infra":{"replicas":1},"configuration":{"developerConfiguration":{"featureGates":["EnableVirtioFsStorageVolumes"]}}}}' \
     >/dev/null
+  kubectl -n kubevirt scale deploy/virt-operator --replicas=1 >/dev/null
   kubectl -n cnpg-system wait deploy/cnpg-controller-manager --for=condition=Available --timeout=300s
   kubectl create namespace dirigent --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   kubectl -n dirigent apply -f "$root/nix/kube-test/stand-ins.yaml" >/dev/null
@@ -89,7 +92,7 @@ e2e() {
   timeout 30 bash -c 'until curl -fs -o /dev/null http://127.0.0.1:18090/auth; do sleep 1; done'
   cd "$root" || exit
   DIRIGENT_KUBE_E2E=1 CHLIVE_URL=ws://127.0.0.1:18080/live DIRIGENT_CONTROL_HTTP=http://127.0.0.1:18090 \
-    timeout 1200 cargo test -p dirigent-player kube_e2e -- --nocapture "$@"
+    timeout 1200 cargo test -p dirigent-player kube_e2e -- --nocapture --test-threads=1 "$@"
 }
 
 down() {

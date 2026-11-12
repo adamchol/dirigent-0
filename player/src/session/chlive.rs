@@ -1275,18 +1275,114 @@ mod e2e {
         assert!(read.data.contains("slept"), "{}", read.data);
 
         // stopped, its VM powers off and control clears it away
-        let stop = api(
+        stop_and_clear(&stack, &session).await;
+    }
+
+    #[tokio::test]
+    async fn kube_e2e_a_session_on_a_machine_of_its_own_gets_a_vm_that_size() {
+        let Some(stack) = kube_stack() else { return };
+        let machine = serde_json::json!({ "cpu": 2, "memory": 2, "disk": 3 });
+        let session = put_session(
             &stack,
+            serde_json::json!({ "start": true, "resources": machine }),
+        )
+        .await;
+        let user = User::new(&stack, &session);
+        user.say(
+            "!echo cores:$(nproc) mib:$(free -m | awk '/Mem/ {print $2}') \
+             gib:$(df -BG --output=size /var/lib/dirigent | tail -1 | tr -d ' G')",
+        )
+        .await;
+        let log = log_within(&stack, &session, Duration::from_secs(300), |r| {
+            turns_ended(r) == 1
+        })
+        .await;
+        let out = &log.iter().find(|r| r.kind == "tool_result").unwrap().data;
+        let got = |what: &str| -> u32 {
+            out.split(&format!("{what}:"))
+                .find_map(|s| {
+                    let n: String = s.chars().take_while(char::is_ascii_digit).collect();
+                    n.parse().ok()
+                })
+                .unwrap_or_else(|| panic!("no {what} in {out}"))
+        };
+        assert_eq!(got("cores"), 2, "{out}");
+        // the guest's own take of its 2 GiB, and of its 3 GiB disk once formatted
+        assert!((1500..=2048).contains(&got("mib")), "{out}");
+        assert!((2..=3).contains(&got("gib")), "{out}");
+        let [vm] = &vms(&session)[..] else {
+            panic!("{:?}", vms(&session))
+        };
+        assert!(!vm.contains("/warm-"), "a warm VM on another machine: {vm}");
+        stop_and_clear(&stack, &session).await;
+    }
+
+    /// With the chart's `player.warm.count` (`kube-test e2e` installs one): a session on the
+    /// default machine takes the warm VM whose player waits, and another is made.
+    #[tokio::test]
+    async fn kube_e2e_a_session_takes_a_warm_vm_and_another_is_made() {
+        let Some(stack) = kube_stack() else { return };
+        let boot = Duration::from_secs(300);
+        let waiting = waiting_warm_player(boot).await;
+
+        let asked = Instant::now();
+        let session = put_session(&stack, serde_json::json!({ "start": true })).await;
+        log_within(&stack, &session, boot, |r| attached(r) == [1]).await;
+        // no boot: the player was up already
+        let took = asked.elapsed();
+        assert!(took < Duration::from_secs(30), "attached in {took:?}");
+        assert_eq!(
+            vms(&session),
+            [format!("virtualmachineinstance.kubevirt.io/warm-{waiting}")]
+        );
+        let user = User::new(&stack, &session);
+        user.say("!echo warm").await;
+        log_within(&stack, &session, boot, |r| turns_ended(r) == 1).await;
+
+        let next = waiting_warm_player(boot).await;
+        assert_ne!(next, waiting);
+        stop_and_clear(&stack, &session).await;
+    }
+
+    /// A warm VM's player that waits for a session, within `within`.
+    async fn waiting_warm_player(within: Duration) -> String {
+        let deadline = Instant::now() + within;
+        loop {
+            let players = kubectl(&[
+                "get",
+                "vmi",
+                "-l",
+                "dirigent.dev/warm",
+                "-o",
+                "jsonpath={.items[*].metadata.labels.dirigent\\.dev/player}",
+            ]);
+            let log = kubectl(&["logs", "deploy/dirigent-control", "-c", "control"]);
+            let waits = |p: &&str| {
+                log.lines()
+                    .any(|l| l.contains("a warm player waits") && l.contains(*p))
+            };
+            if let Some(p) = players.split_whitespace().find(waits) {
+                return p.to_string();
+            }
+            assert!(Instant::now() < deadline, "no warm player waits: {players}");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    /// Stops the session; its VMs power off and control clears them away.
+    async fn stop_and_clear(stack: &Stack, session: &str) {
+        let stop = api(
+            stack,
             reqwest::Method::POST,
             &format!("/sessions/{session}/stop"),
         );
         assert!(stop.send().await.unwrap().status().is_success());
         let deadline = Instant::now() + Duration::from_secs(180);
-        while !vms(&session).is_empty() {
+        while !vms(session).is_empty() {
             assert!(
                 Instant::now() < deadline,
                 "the VMs stay: {:?}",
-                vms(&session)
+                vms(session)
             );
             tokio::time::sleep(Duration::from_secs(3)).await;
         }

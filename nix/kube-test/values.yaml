@@ -25,6 +25,9 @@ player:
   workspaceSize: 2Gi
   stopGrace: 120
   checkpointMargin: 60
+  # one VM kept booted, which the cluster test takes
+  warm:
+    count: 1
 chlive:
   cacheSize: 1Gi
 ingestion:
