@@ -164,9 +164,13 @@ in
   boot.initrd.systemd.services.dirigent-store = {
     description = "the shared Nix store, under the VM's own";
     wantedBy = [ "initrd-fs.target" ];
+    # before what finds the system's closure in the store: it waits only for mount units, and
+    # this one mounts it itself (booted into the cluster's system, its closure is in the overlay
+    # alone)
     before = [
       "initrd-fs.target"
       "sysroot-nix-store.mount"
+      "initrd-find-nixos-closure.service"
     ];
     requires = [ "sysroot.mount" ];
     after = [ "sysroot.mount" ];
