@@ -60,7 +60,10 @@ install() {
   [ -s "$m/cnpg.yaml" ] || curl -fsSL -m 120 -o "$m/cnpg.yaml" \
     "https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v$cnpg/cnpg-$cnpg.yaml"
   kubectl apply -f "$m/kubevirt-operator.yaml" >/dev/null
-  kubectl apply -f "$m/kubevirt-cr.yaml" >/dev/null
+  # its webhook checks the KubeVirt resource, and isn't served until the operator is up (after
+  # k3s starts again too)
+  kubectl -n kubevirt wait deploy/virt-operator --for=condition=Available --timeout=300s >/dev/null
+  timeout 120 bash -c "until kubectl apply -f '$m/kubevirt-cr.yaml' >/dev/null; do sleep 5; done"
   kubectl apply --server-side -f "$m/cnpg.yaml" >/dev/null
   kubectl -n kubevirt wait kubevirt/kubevirt --for=condition=Available --timeout=600s
   # one of each of KubeVirt's pods on the one node: the second ones' requests leave too little
