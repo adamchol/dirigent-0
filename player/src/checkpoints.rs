@@ -27,10 +27,12 @@ pub struct Checkpoints {
 
 impl Checkpoints {
     /// Connected to the repository `token` (`kopia repository status -t`) for `session`, with
-    /// its state in `state`.
-    pub async fn connect(token: &str, state: &Path, session: &str) -> anyhow::Result<Self> {
+    /// its state in `state`; with none yet (a warm player's, waiting for one), as `waiting`, until
+    /// it has one ([`Checkpoints::for_session`]): connecting takes seconds (its key's derived).
+    pub async fn connect(token: &str, state: &Path, session: Option<&str>) -> anyhow::Result<Self> {
         std::fs::create_dir_all(state)
             .with_context(|| format!("making the kopia state in {}", state.display()))?;
+        let session = session.unwrap_or("waiting");
         let checkpoints = Checkpoints {
             state: state.to_path_buf(),
             session: session.to_string(),
@@ -47,6 +49,17 @@ impl Checkpoints {
             .await
             .map_err(|e| anyhow::anyhow!("connecting to the checkpoints' repository: {e}"))?;
         Ok(checkpoints)
+    }
+
+    /// The same, now for `session`: its snapshots are of its source, `<session>@dirigent`.
+    pub async fn for_session(mut self, session: &str) -> anyhow::Result<Self> {
+        let mut cmd = self.kopia();
+        cmd.args(["repository", "set-client", "--username", session]);
+        run(cmd, CONNECT_TIMEOUT).await.map_err(|e| {
+            anyhow::anyhow!("taking the checkpoints' repository for {session}: {e}")
+        })?;
+        self.session = session.to_string();
+        Ok(self)
     }
 
     /// Snapshot `workdir` after the turn `turn`; the snapshot's id.
@@ -135,7 +148,7 @@ pub(crate) mod tests {
 
     pub(crate) async fn checkpoints(dir: &Path) -> Checkpoints {
         let token = repo(dir);
-        Checkpoints::connect(&token, &dir.join("state"), "s")
+        Checkpoints::connect(&token, &dir.join("state"), Some("s"))
             .await
             .unwrap()
     }
@@ -186,6 +199,27 @@ pub(crate) mod tests {
             std::fs::metadata(to.join("big")).unwrap().len(),
             dirigent_sync::MAX_FILE_SIZE + 1
         );
+    }
+
+    #[tokio::test]
+    async fn connected_before_its_session_a_players_snapshots_are_its_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token = repo(tmp.path());
+        let state = tmp.path().join("state");
+        let cp = Checkpoints::connect(&token, &state, None).await.unwrap();
+        let cp = cp.for_session("s").await.unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("file"), "one").unwrap();
+        cp.snapshot(&ws, "t1").await.unwrap();
+        let mut cmd = cp.kopia();
+        cmd.args(["snapshot", "list", "--all", "--json"]);
+        let out = run(cmd, SNAPSHOT_TIMEOUT).await.unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let source = &listed[0]["source"];
+        assert_eq!(source["userName"], "s", "{listed}");
+        assert_eq!(source["host"], "dirigent", "{listed}");
+        assert_eq!(listed[0]["tags"]["tag:session"], "s", "{listed}");
     }
 
     #[tokio::test]

@@ -203,7 +203,7 @@ impl Tool for ListSessions {
     fn spec(&self) -> ToolSpec {
         spec(
             "list_sessions",
-            "List the sessions you can reach: each one's id, part (coder or dirigent), state (active: a player runs it; away: its player dropped and may come back; idle: none), model, source repository and ref, your role in it (owner: you may write to it, start and stop it, and ask for secrets for it; viewer: you may only read it), and the names of the secrets its tools have. Optionally only those whose repository URL contains `repo`.",
+            "List the sessions you can reach: each one's id, part (coder or dirigent), state (active: a player runs it; away: its player dropped and may come back; idle: none), model, machine (cores/memory GiB/disk GiB, or default), source repository and ref, your role in it (owner: you may write to it, start and stop it, and ask for secrets for it; viewer: you may only read it), and the names of the secrets its tools have. Optionally only those whose repository URL contains `repo`.",
             json!({ "repo": { "type": "string", "description": "A part of the repository URL to match." } }),
             &[],
         )
@@ -238,12 +238,16 @@ impl Tool for ListSessions {
                 }
                 let part = format!("{:?}", s.spec.part).to_lowercase();
                 let role = format!("{:?}", s.role).to_lowercase();
+                let machine = match s.spec.resources {
+                    Some(r) => format!("{}/{}/{}", r.cpu, r.memory, r.disk),
+                    None => "default".into(),
+                };
                 let secrets = match s.secrets.is_empty() {
                     true => "-".to_string(),
                     false => s.secrets.join(","),
                 };
                 Some(format!(
-                    "{}\t{part}\t{}\t{}\t{source}\t{role}\t{secrets}",
+                    "{}\t{part}\t{}\t{}\t{machine}\t{source}\t{role}\t{secrets}",
                     s.id,
                     state(s),
                     s.spec.model
@@ -254,7 +258,7 @@ impl Tool for ListSessions {
             return ToolOutput::ok("No sessions.");
         }
         ToolOutput::ok(format!(
-            "id\tpart\tstate\tmodel\tsource\trole\tsecrets\n{}",
+            "id\tpart\tstate\tmodel\tmachine\tsource\trole\tsecrets\n{}",
             lines.join("\n")
         ))
     }
@@ -273,6 +277,9 @@ impl Tool for CreateSession {
                 "ref": { "type": "string", "description": "A branch or tag." },
                 "model": { "type": "string", "description": "The model; by default the default one." },
                 "effort": { "type": "string", "enum": ["low", "medium", "high", "max", "none"], "description": "How hard it thinks; none: no extended thinking." },
+                "cpu": { "type": "integer", "minimum": 1, "description": "Its machine's cores; by default the default machine's (your user's, or the cluster's)." },
+                "memory": { "type": "integer", "minimum": 1, "description": "Its machine's memory, in GiB; by default the default machine's." },
+                "disk": { "type": "integer", "minimum": 1, "description": "Its workspace's disk, in GiB; by default the default machine's." },
                 "message": { "type": "string", "description": "Its task, as its first message." }
             }),
             &["message"],
@@ -306,6 +313,15 @@ impl Tool for CreateSession {
                 Err(_) => return ToolOutput::error(format!("{e:?} isn't an effort")),
             },
             None => {}
+        }
+        for part in ["cpu", "memory", "disk"] {
+            match input.get(part) {
+                None | Some(Value::Null) => {}
+                Some(n) if n.as_u64().is_some_and(|n| n > 0) => body["resources"][part] = n.clone(),
+                Some(n) => {
+                    return ToolOutput::error(format!("{part}: {n} isn't a positive integer"))
+                }
+            }
         }
         let id = uuid::Uuid::new_v4().to_string();
         let path = format!("/sessions/{id}");

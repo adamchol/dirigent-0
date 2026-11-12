@@ -13,12 +13,14 @@ use anyhow::Context;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Event, ObjectReference, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
-use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, ListParams, PostParams};
+use kube::api::{
+    Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
+};
 use tokio::process::Command;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use dirigent_protocol::control::player_subject;
+use dirigent_protocol::control::{player_subject, Resources};
 
 use crate::leases::Store;
 
@@ -29,14 +31,20 @@ pub trait Runner: Send + Sync {
     fn id(&self) -> &str;
 
     /// Start `player` (an id) on `session`, where the lease for its `epoch` waits for it: in the
-    /// cluster's own `system` (a store path) when there's one ready.
+    /// cluster's own `system` (a store path) when there's one ready, on a `machine` of that size.
     async fn start(
         &self,
         session: Uuid,
         player: &str,
         epoch: i64,
         system: Option<&str>,
+        machine: Resources,
     ) -> anyhow::Result<()>;
+
+    /// Its default machine, where it has one of its own (a VM template's).
+    fn machine(&self) -> Option<Resources> {
+        None
+    }
 
     /// The session `session` is deleted: remove what its players left here (none holds it).
     async fn forget(&self, session: Uuid) -> anyhow::Result<()>;
@@ -57,10 +65,54 @@ pub trait Runner: Send + Sync {
 
     /// Say how the cluster's system goes, where whoever deploys it looks (besides control's log).
     async fn note(&self, _warning: bool, _reason: &str, _message: &str) {}
+
+    /// Whether it keeps warm VMs ([`crate::pool`]).
+    fn warms(&self) -> bool {
+        false
+    }
+
+    /// The key of a warm VM on `machine` in `system` made now: one made with another isn't
+    /// current.
+    fn warm_key(&self, _machine: Resources, _system: Option<&str>) -> String {
+        String::new()
+    }
+
+    /// Make a warm VM, `player`'s, on `machine` in `system`, its key `key`.
+    async fn warm(
+        &self,
+        _player: &str,
+        _machine: Resources,
+        _system: Option<&str>,
+        _key: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this runner keeps no warm VMs")
+    }
+
+    /// Its warm VMs (but those done).
+    async fn warm_vms(&self) -> anyhow::Result<Vec<Warm>> {
+        Ok(vec![])
+    }
+
+    /// The warm `player`'s VM is `session`'s, for its `epoch`th lease: no longer warm.
+    async fn take(&self, _session: Uuid, _player: &str, _epoch: i64) -> anyhow::Result<()> {
+        anyhow::bail!("this runner keeps no warm VMs")
+    }
+
+    /// Delete the warm `player`'s VM.
+    async fn unwarm(&self, _player: &str) {}
+}
+
+/// A warm VM: its player, machine and key, and how long ago it was made.
+#[derive(Debug, Clone)]
+pub struct Warm {
+    pub player: String,
+    pub machine: Resources,
+    pub key: String,
+    pub age: Duration,
 }
 
 /// The environment a player gets: what it needs, and none of control's own (its Postgres).
-const PASSED_ON: &[&str] = &[
+pub(crate) const PASSED_ON: &[&str] = &[
     "PATH",
     "HOME",
     "TMPDIR",
@@ -107,6 +159,7 @@ impl Runner for Local {
         player: &str,
         epoch: i64,
         _system: Option<&str>,
+        _machine: Resources,
     ) -> anyhow::Result<()> {
         let dir = self.root.join(session.to_string());
         std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
@@ -209,9 +262,16 @@ const LABEL_EPOCH: &str = "dirigent.dev/epoch";
 const LABEL_RUNNER: &str = "dirigent.dev/runner";
 const LABEL_BUILD: &str = "dirigent.dev/build";
 const LABEL_GENERATION: &str = "dirigent.dev/nix-generation";
+/// A warm VM's: its key, until a session takes it.
+const LABEL_WARM: &str = "dirigent.dev/warm";
+/// A warm VM's machine.
+const LABEL_CPU: &str = "dirigent.dev/cpu";
+const LABEL_MEMORY: &str = "dirigent.dev/memory";
+const LABEL_DISK: &str = "dirigent.dev/disk";
 
-/// Players in KubeVirt VMs: a `VirtualMachineInstance` each, `player-<session>-<epoch>`, from a
-/// template (Helm's): its image, size, disks, grace period and the Secrets it gets. The VM
+/// Players in KubeVirt VMs: a `VirtualMachineInstance` each, `player-<session>-<epoch>` (or
+/// `warm-<player>`, booted before it's given a session: [`crate::pool`]), from a template
+/// (Helm's): its image, disks, grace period and the Secrets it gets, its machine the session's. The VM
 /// powers off when its player exits; [`Kube::clear`] deletes it then. The cluster's own system
 /// is built in one too, `build-<id>`, from a template of its own (the same image, in build mode,
 /// with the configuration's ConfigMap and the cache's signing key as disks).
@@ -221,6 +281,8 @@ pub struct Kube {
     name: String,
     vmis: Api<DynamicObject>,
     template: serde_json::Value,
+    /// Its VMs' machine, unless a session asks for another.
+    machine: Resources,
     builds: Option<Builds>,
     /// The Jobs that write the shared Nix store's generations, from a template (JSON; Helm's).
     writer: Option<(Api<Job>, serde_json::Value)>,
@@ -254,6 +316,8 @@ impl Kube {
         let template = read_template(template)?;
         // checked once, here: every VM is made from it
         vmi(&template, name, "player-", &[], "")?;
+        let machine = template_machine(&template)?;
+        sized(&template, machine)?;
         let client = kube::Client::try_default()
             .await
             .context("connecting to Kubernetes")?;
@@ -294,6 +358,7 @@ impl Kube {
             name: name.to_string(),
             vmis,
             template,
+            machine,
             builds,
             writer,
         })
@@ -368,7 +433,8 @@ impl Kube {
 
     /// Every `every`, delete this runner's VMs that are done (powered off, or failed), and those
     /// past their `startup` whose player holds no lease (it never came, or lost it). A build's
-    /// is left until it's done: control ends it ([`Runner::end_build`]).
+    /// is left until it's done: control ends it ([`Runner::end_build`]); a warm one is the
+    /// pool's.
     pub async fn clear(&'static self, store: &'static Store, startup: Duration, every: Duration) {
         let mut tick = tokio::time::interval(every);
         loop {
@@ -386,7 +452,9 @@ impl Kube {
             let name = vmi.metadata.name.clone().unwrap_or_default();
             let phase = vmi.data["status"]["phase"].as_str().unwrap_or("");
             let labels = vmi.metadata.labels.as_ref();
-            let build = labels.is_some_and(|l| l.contains_key(LABEL_BUILD));
+            // a build's, or a warm one (the pool's to keep or delete)
+            let aside =
+                labels.is_some_and(|l| l.contains_key(LABEL_BUILD) || l.contains_key(LABEL_WARM));
             let player = labels
                 .and_then(|l| l.get(LABEL_PLAYER))
                 .map(|p| player_subject(p));
@@ -397,7 +465,7 @@ impl Kube {
                 .is_some_and(|t| age(t) > startup);
             let why = match phase {
                 "Succeeded" | "Failed" => phase,
-                _ if build => continue,
+                _ if aside => continue,
                 _ if old && !player.is_some_and(|p| held.contains(&p)) => "holds no lease",
                 _ => continue,
             };
@@ -405,6 +473,23 @@ impl Kube {
             self.delete(&name).await;
         }
         Ok(())
+    }
+
+    /// A player's VM's lines for Nix (into `env`): the cache's key (with builds), the cluster's
+    /// `system`, and the shared Nix store's current generation, which it keeps until it's gone
+    /// (and which it's then labelled with).
+    fn nix(&self, env: &mut String, system: Option<&str>) -> Option<String> {
+        if let Some(builds) = &self.builds {
+            env.push_str(&format!("DIRIGENT_NIX_KEY={}\n", builds.key));
+        }
+        if let Some(system) = system {
+            env.push_str(&format!("DIRIGENT_SYSTEM={system}\n"));
+        }
+        let generation = crate::nixstore::current().map(|n| n.to_string());
+        if let Some(n) = &generation {
+            env.push_str(&format!("DIRIGENT_NIX_GENERATION={n}\n"));
+        }
+        generation
     }
 
     async fn delete(&self, name: &str) {
@@ -447,6 +532,10 @@ impl Runner for Kube {
         &self.id
     }
 
+    fn machine(&self) -> Option<Resources> {
+        Some(self.machine)
+    }
+
     fn runs_systems(&self) -> bool {
         self.builds.is_some()
     }
@@ -457,30 +546,23 @@ impl Runner for Kube {
         player: &str,
         epoch: i64,
         system: Option<&str>,
+        machine: Resources,
     ) -> anyhow::Result<()> {
         let mut env = format!(
             "DIRIGENT_SESSION={session}\nDIRIGENT_PLAYER_ID={player}\nDIRIGENT_EPOCH={epoch}\n"
         );
-        if let Some(builds) = &self.builds {
-            env.push_str(&format!("DIRIGENT_NIX_KEY={}\n", builds.key));
-        }
-        if let Some(system) = system {
-            env.push_str(&format!("DIRIGENT_SYSTEM={system}\n"));
-        }
+        let generation = self.nix(&mut env, system);
         let (session_label, epoch_label) = (session.to_string(), epoch.to_string());
         let mut labels = vec![
             (LABEL_SESSION, session_label.as_str()),
             (LABEL_PLAYER, player),
             (LABEL_EPOCH, epoch_label.as_str()),
         ];
-        // the shared Nix store's generation it has (kept until it's gone)
-        let generation = crate::nixstore::current().map(|n| n.to_string());
         if let Some(n) = &generation {
-            env.push_str(&format!("DIRIGENT_NIX_GENERATION={n}\n"));
             labels.push((LABEL_GENERATION, n));
         }
         let vmi = vmi(
-            &self.template,
+            &sized(&self.template, machine)?,
             &self.name,
             &format!("player-{session}-{epoch}"),
             &labels,
@@ -488,8 +570,117 @@ impl Runner for Kube {
         )?;
         self.create(&vmi).await?;
         let name = vmi.metadata.name.unwrap_or_default();
-        info!(session = %session, player, epoch, vmi = name, system, "player started");
+        info!(session = %session, player, epoch, vmi = name, system, ?machine, "player started");
         Ok(())
+    }
+
+    fn warms(&self) -> bool {
+        true
+    }
+
+    fn warm_key(&self, machine: Resources, system: Option<&str>) -> String {
+        use sha2::{Digest, Sha256};
+        let mut sha = Sha256::new();
+        sha.update(self.template.to_string());
+        sha.update(format!(
+            "{}/{}/{}",
+            machine.cpu, machine.memory, machine.disk
+        ));
+        sha.update(system.unwrap_or("stock"));
+        let generation = crate::nixstore::current().unwrap_or(0);
+        sha.update(generation.to_string());
+        sha.finalize()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    async fn warm(
+        &self,
+        player: &str,
+        machine: Resources,
+        system: Option<&str>,
+        key: &str,
+    ) -> anyhow::Result<()> {
+        let mut env = format!("DIRIGENT_WARM=1\nDIRIGENT_PLAYER_ID={player}\n");
+        let generation = self.nix(&mut env, system);
+        let (cpu, memory, disk) = (
+            machine.cpu.to_string(),
+            machine.memory.to_string(),
+            machine.disk.to_string(),
+        );
+        let mut labels = vec![
+            (LABEL_WARM, key),
+            (LABEL_PLAYER, player),
+            (LABEL_CPU, cpu.as_str()),
+            (LABEL_MEMORY, memory.as_str()),
+            (LABEL_DISK, disk.as_str()),
+        ];
+        if let Some(n) = &generation {
+            labels.push((LABEL_GENERATION, n));
+        }
+        let vmi = vmi(
+            &sized(&self.template, machine)?,
+            &self.name,
+            &format!("warm-{player}"),
+            &labels,
+            &env,
+        )?;
+        self.create(&vmi).await
+    }
+
+    async fn warm_vms(&self) -> anyhow::Result<Vec<Warm>> {
+        let warm =
+            ListParams::default().labels(&format!("{LABEL_RUNNER}={},{LABEL_WARM}", self.name));
+        let mut found = Vec::new();
+        for vmi in self.vmis.list(&warm).await? {
+            if matches!(
+                vmi.data["status"]["phase"].as_str(),
+                Some("Succeeded" | "Failed")
+            ) {
+                continue;
+            }
+            let Some(labels) = vmi.metadata.labels.as_ref() else {
+                continue;
+            };
+            let n = |l: &str| labels.get(l).and_then(|v| v.parse().ok());
+            let (Some(player), Some(key), Some(cpu), Some(memory), Some(disk)) = (
+                labels.get(LABEL_PLAYER),
+                labels.get(LABEL_WARM),
+                n(LABEL_CPU),
+                n(LABEL_MEMORY),
+                n(LABEL_DISK),
+            ) else {
+                continue;
+            };
+            let age = vmi.metadata.creation_timestamp.as_ref().map(age);
+            found.push(Warm {
+                player: player.clone(),
+                machine: Resources { cpu, memory, disk },
+                key: key.clone(),
+                age: age.unwrap_or_default(),
+            });
+        }
+        Ok(found)
+    }
+
+    async fn take(&self, session: Uuid, player: &str, epoch: i64) -> anyhow::Result<()> {
+        let labels = serde_json::json!({ "metadata": { "labels": {
+            LABEL_WARM: null,
+            LABEL_SESSION: session.to_string(),
+            LABEL_EPOCH: epoch.to_string(),
+        } } });
+        let name = format!("warm-{player}");
+        self.vmis
+            .patch(&name, &PatchParams::default(), &Patch::Merge(&labels))
+            .await
+            .with_context(|| format!("giving the warm VM {name} to {session}"))?;
+        info!(session = %session, player, epoch, vmi = name, "a warm VM took the session");
+        Ok(())
+    }
+
+    async fn unwarm(&self, player: &str) {
+        self.delete(&format!("warm-{player}")).await;
     }
 
     async fn forget(&self, session: Uuid) -> anyhow::Result<()> {
@@ -573,6 +764,45 @@ fn vmi_resource() -> ApiResource {
     }
 }
 
+/// The volume of a player's VM template that's its workspace disk (an `emptyDisk`).
+pub const WORK_VOLUME: &str = "work";
+
+/// The machine a VM from `template` has: its cores, guest memory and workspace disk.
+fn template_machine(template: &serde_json::Value) -> anyhow::Result<Resources> {
+    let domain = &template["spec"]["domain"];
+    let cpu = domain["cpu"]["cores"]
+        .as_u64()
+        .context("the VM template has no spec.domain.cpu.cores")?;
+    let memory = domain["memory"]["guest"]
+        .as_str()
+        .context("the VM template has no spec.domain.memory.guest")?;
+    let disk = template["spec"]["volumes"]
+        .as_array()
+        .and_then(|v| v.iter().find(|v| v["name"] == WORK_VOLUME))
+        .and_then(|v| v["emptyDisk"]["capacity"].as_str())
+        .with_context(|| {
+            format!("the VM template has no volume {WORK_VOLUME:?} with an emptyDisk")
+        })?;
+    Ok(Resources {
+        cpu: cpu.try_into().context("the VM template's cores")?,
+        memory: crate::machines::gib(memory).context("the VM template's memory")?,
+        disk: crate::machines::gib(disk).context("the VM template's workspace disk")?,
+    })
+}
+
+/// `template`, its VM on `machine`.
+fn sized(template: &serde_json::Value, machine: Resources) -> anyhow::Result<serde_json::Value> {
+    let mut t = template.clone();
+    t["spec"]["domain"]["cpu"]["cores"] = machine.cpu.into();
+    t["spec"]["domain"]["memory"]["guest"] = format!("{}Gi", machine.memory).into();
+    let work = t["spec"]["volumes"]
+        .as_array_mut()
+        .and_then(|v| v.iter_mut().find(|v| v["name"] == WORK_VOLUME))
+        .with_context(|| format!("the VM template has no volume {WORK_VOLUME:?}"))?;
+    work["emptyDisk"]["capacity"] = format!("{}Gi", machine.disk).into();
+    Ok(t)
+}
+
 /// The VM `name` from `template`: labelled with `labels` (and the runner's), its config
 /// volume's user data with `env` (lines) after the template's.
 fn vmi(
@@ -631,14 +861,45 @@ mod tests {
             "metadata": { "labels": { "app.kubernetes.io/name": "dirigent-player" } },
             "spec": {
                 "terminationGracePeriodSeconds": 3600,
+                "domain": { "cpu": { "cores": 2 }, "memory": { "guest": "4Gi" } },
                 "volumes": [
                     { "name": "disk", "containerDisk": { "image": "player-vm" } },
                     { "name": CONFIG_VOLUME, "cloudInitNoCloud": {
                         "userData": "DIRIGENT_CONTROL_URL=http://control:8091"
                     } },
+                    { "name": WORK_VOLUME, "emptyDisk": { "capacity": "20Gi" } },
                 ],
             },
         })
+    }
+
+    #[test]
+    fn a_vm_is_on_the_templates_machine_or_the_one_asked_for() {
+        let t = template();
+        let default = template_machine(&t).unwrap();
+        assert_eq!(
+            default,
+            Resources {
+                cpu: 2,
+                memory: 4,
+                disk: 20
+            }
+        );
+        let big = Resources {
+            cpu: 8,
+            memory: 32,
+            disk: 100,
+        };
+        let sized = sized(&t, big).unwrap();
+        assert_eq!(template_machine(&sized).unwrap(), big);
+        assert_eq!(sized["spec"]["domain"]["memory"]["guest"], "32Gi");
+        assert_eq!(
+            sized["spec"]["volumes"][2]["emptyDisk"]["capacity"],
+            "100Gi"
+        );
+        let mut odd = template();
+        odd["spec"]["domain"]["memory"]["guest"] = "1536Mi".into();
+        assert!(template_machine(&odd).is_err());
     }
 
     #[test]
@@ -667,7 +928,10 @@ mod tests {
     #[test]
     fn a_template_without_the_config_volume_is_refused() {
         let mut t = template();
-        t["spec"]["volumes"].as_array_mut().unwrap().pop();
+        t["spec"]["volumes"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|v| v["name"] != CONFIG_VOLUME);
         let e = vmi(&t, "d", "v", &[], "").unwrap_err();
         assert!(e.to_string().contains("no volume"), "{e}");
         let mut t = template();

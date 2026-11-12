@@ -18,6 +18,24 @@ service Players {
   // holder gets the session's next epoch. A control that leases only the players it started
   // (`--reserved-only`) ends an `Acquire` without an epoch with PERMISSION_DENIED.
   rpc Lease(stream FromPlayer) returns (stream ToPlayer);
+
+  // A warm player's, booted before any session asked for it (its VM one of those control keeps
+  // ready): it waits, and is told once which session it's given, and the lease's epoch control
+  // reserved for it; it then acquires that lease, as any player control started. Control ends
+  // the call with NOT_FOUND when it has no such warm player (its VM is gone, or not one that's
+  // current): the player must stop. A broken call is made again.
+  rpc Wait(WaitRequest) returns (stream Assigned);
+}
+
+message WaitRequest {
+  string player = 1;
+  // The system its machine runs (/run/current-system's store path), if it can tell.
+  optional string system = 2;
+}
+
+message Assigned {
+  string session = 1;
+  int64 epoch = 2;
 }
 
 message FromPlayer {
@@ -105,6 +123,15 @@ message SessionSpec {
   Part part = 4;
   // Who its model calls are paid to (unspecified: Anthropic).
   Provider provider = 5;
+  // Its machine; absent, the cluster's default one.
+  Resources resources = 6;
+}
+
+// A player's machine: its cores, and its memory and workspace disk in GiB.
+message Resources {
+  uint32 cpu = 1;
+  uint32 memory = 2;
+  uint32 disk = 3;
 }
 
 enum Provider {

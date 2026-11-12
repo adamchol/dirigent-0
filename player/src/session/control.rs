@@ -263,6 +263,50 @@ struct Acquired {
 
 /// A call to control at `url` asking for the session with `ask`: the call, with what's leased;
 /// or why not ([`Refused`], or not reaching control).
+/// As a warm player (`player`, on a machine running `system`), wait at control's gRPC service
+/// at `url` to be given a session: the session, and the epoch of the lease reserved for this
+/// player on it. Waits again while control can't be reached; control not knowing this player
+/// (its VM gone, or no longer one it keeps) is an error.
+pub async fn wait(url: &str, player: &str, system: Option<&str>) -> anyhow::Result<(String, i64)> {
+    let ask = pb::WaitRequest {
+        player: player.to_string(),
+        system: system.map(Into::into),
+    };
+    let mut backoff = Backoff::default();
+    loop {
+        let assigned = async {
+            let channel = Endpoint::from_shared(url.to_string())?
+                .connect_timeout(CONNECT_TIMEOUT)
+                .http2_keep_alive_interval(KEEPALIVE)
+                .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+                .keep_alive_while_idle(true)
+                .connect()
+                .await?;
+            let mut rx = PlayersClient::new(channel)
+                .wait(ask.clone())
+                .await?
+                .into_inner();
+            info!("warm: waiting for a session");
+            match rx.message().await? {
+                Some(a) => Ok((a.session, a.epoch)),
+                None => anyhow::bail!("control ended the call"),
+            }
+        };
+        match assigned.await {
+            Ok(assigned) => return Ok(assigned),
+            Err(e) => match e.downcast_ref::<tonic::Status>() {
+                Some(s) if s.code() == Code::NotFound => {
+                    anyhow::bail!("control has no warm player {player}: {}", s.message())
+                }
+                _ => {
+                    warn!("waiting for a session at control at {url}: {e:#}");
+                    backoff.wait().await;
+                }
+            },
+        }
+    }
+}
+
 async fn hold(url: &str, ask: pb::Acquire) -> anyhow::Result<(Call, Acquired)> {
     let channel = Endpoint::from_shared(url.to_string())?
         .connect_timeout(CONNECT_TIMEOUT)

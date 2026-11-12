@@ -2,7 +2,8 @@
 # checks a configuration kept it): NixOS on KubeVirt running one player, which it powers off
 # after. What the VM is given, by the guest contract:
 # - its environment, as the NoCloud user data (an env file: the template's lines, then
-#   control's for the player: DIRIGENT_SESSION, DIRIGENT_PLAYER_ID, DIRIGENT_EPOCH);
+#   control's for the player: DIRIGENT_SESSION, DIRIGENT_PLAYER_ID, DIRIGENT_EPOCH; or a warm
+#   VM's, DIRIGENT_WARM and DIRIGENT_PLAYER_ID, its player told its session later);
 # - Secrets as disks with serials `dirigent-secret<n>`, a file per key, named as the variable
 #   (DIRIGENT_KOPIA_TOKEN; API keys and sessions' secrets come on the lease instead);
 # - an empty disk with serial `dirigent-work`, formatted on first boot: the workspace and the

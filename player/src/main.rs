@@ -69,8 +69,13 @@ const HELP_STYLES: Styles = Styles::styled()
 struct Cli {
     /// The session to run (a UUID), made through control; if another player holds it, this one
     /// stops.
-    #[arg(long, env = "DIRIGENT_SESSION")]
-    session: String,
+    #[arg(long, env = "DIRIGENT_SESSION", required_unless_present = "warm")]
+    session: Option<String>,
+
+    /// Warm: started before any session asked for one (its machine one that control keeps
+    /// ready), it gets ready for one, and waits for control to give it one.
+    #[arg(long, env = "DIRIGENT_WARM", conflicts_with_all = ["session", "epoch"], requires = "player_id")]
+    warm: bool,
 
     /// Who this player is (a UUID; a new one when absent): to control, which leases it the
     /// session, and to chlive, as `player:<id>`.
@@ -172,7 +177,6 @@ async fn main() -> anyhow::Result<()> {
             .into_boxed_path(),
     );
 
-    let id = uuid(&cli.session, "--session")?;
     let player = match &cli.player_id {
         Some(p) => uuid(p, "--player-id")?,
         None => uuid::Uuid::new_v4().to_string(),
@@ -187,15 +191,40 @@ async fn main() -> anyhow::Result<()> {
         "--state-dir {} is inside the workspace",
         state.display()
     );
-    let checkpoints: Option<&'static Checkpoints> = match &cli.kopia_token {
-        Some(token) => {
-            let checkpoints = Checkpoints::connect(token, &state, &id).await?;
-            Some(Box::leak(Box::new(checkpoints)))
-        }
+    let session = match &cli.session {
+        Some(s) => Some(uuid(s, "--session")?),
+        None => None,
+    };
+    let connected = match &cli.kopia_token {
+        Some(token) => Some(Checkpoints::connect(token, &state, session.as_deref()).await?),
         None => {
             warn!("no --kopia-token: the workspace isn't checkpointed");
             None
         }
+    };
+    // warm, ready as it can be without a session, then given one
+    let (id, epoch) = match session {
+        Some(id) => (id, cli.epoch),
+        None => {
+            let system = std::fs::read_link("/run/current-system")
+                .ok()
+                .map(|p| p.display().to_string());
+            info!(player, system, "warm: ready for a session");
+            let wait = session::control::wait(&cli.control_url, &player, system.as_deref());
+            let (s, epoch) = tokio::select! {
+                given = wait => given?,
+                _ = signals.recv() => {
+                    info!("stopped while waiting for a session");
+                    return Ok(());
+                }
+            };
+            (uuid(&s, "the session control gave")?, Some(epoch))
+        }
+    };
+    let checkpoints: Option<&'static Checkpoints> = match connected {
+        Some(c) if cli.warm => Some(Box::leak(Box::new(c.for_session(&id).await?))),
+        Some(c) => Some(Box::leak(Box::new(c))),
+        None => None,
     };
     info!(
         session = id,
@@ -205,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
     );
     // Stopped meanwhile, the lease control may be granting is still taken (for a while), to be
     // handed over at once: left, the session would wait out its grace period.
-    let acquire = Lease::acquire(&cli.control_url, &id, &player, cli.epoch);
+    let acquire = Lease::acquire(&cli.control_url, &id, &player, epoch);
     tokio::pin!(acquire);
     let (lease, stopped) = tokio::select! {
         lease = &mut acquire => (lease?, false),

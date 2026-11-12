@@ -14,9 +14,10 @@ metadata:
   labels:
     {{- include "dirigent.labels" . | nindent 4 }}
 rules:
+  # the players' VMs, and patched: a warm one's labels, once it's given a session
   - apiGroups: [kubevirt.io]
     resources: [virtualmachineinstances]
-    verbs: [get, list, create, delete]
+    verbs: [get, list, create, delete, patch]
   # the chart's Secrets, which control makes (its `secrets` init container); a create can't be
   # limited to names
   - apiGroups: [""]
@@ -193,6 +194,29 @@ spec:
             - name: DIRIGENT_NIXOS_BUILD_TIMEOUT
               value: {{ .Values.player.nixos.build.timeout | quote }}
             {{- end }}
+            # the players' machines: the most a session's may have, whose defaults, and the warm VMs
+            {{- with .Values.player.limits }}
+            {{- if .cpu }}
+            - name: DIRIGENT_MAX_CPU
+              value: {{ .cpu | quote }}
+            {{- end }}
+            {{- if .memory }}
+            - name: DIRIGENT_MAX_MEMORY
+              value: {{ trimSuffix "Gi" .memory | quote }}
+            {{- end }}
+            {{- if .workspaceSize }}
+            - name: DIRIGENT_MAX_DISK
+              value: {{ trimSuffix "Gi" .workspaceSize | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.player.defaultsPerUser }}
+            - name: DIRIGENT_DEFAULTS_PER_USER
+              value: "true"
+            {{- end }}
+            - name: DIRIGENT_WARM
+              value: {{ .Values.player.warm.count | quote }}
+            - name: DIRIGENT_WARM_ACTIVE_WITHIN
+              value: {{ .Values.player.warm.activeWithin | quote }}
             {{- with .Values.nix.shared }}
             {{- if .enabled }}
             # the shared Nix store: its generations, and what writes them

@@ -123,6 +123,7 @@ async fn round(
     let written = generations(dir)?;
     if let Some(&last) = written.last() {
         if CURRENT.swap(last, Ordering::Relaxed) != last {
+            control.pool.wake();
             info!(
                 generation = last,
                 "VMs get the shared Nix store's generation"

@@ -5,11 +5,17 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::machines::Partial;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     /// How much of a session's log the web's chat shows.
     pub events: Events,
+    /// Their sessions' default machine, where users have their own (`--defaults-per-user`):
+    /// what's left out is the cluster's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<Partial>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,5 +73,9 @@ mod tests {
         let bad = serde_json::json!({ "events": "renamed" });
         assert_eq!(Settings::kept(bad), Settings::default());
         assert_eq!(Settings::kept(serde_json::json!(null)), Settings::default());
+        let machine = serde_json::json!({ "machine": { "cpu": 8, "gpu": 1 } });
+        assert_eq!(Settings::kept(machine).machine, None);
+        let machine = serde_json::json!({ "machine": { "cpu": 8 } });
+        assert_eq!(Settings::kept(machine).machine.unwrap().cpu, Some(8));
     }
 }

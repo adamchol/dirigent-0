@@ -41,3 +41,22 @@
 {{- fail "nix.shared.promote is upstream or all" }}
 {{- end }}
 {{- end }}
+{{- with .Values.player }}
+{{- range $name, $q := dict "player.memory" .memory "player.workspaceSize" .workspaceSize "player.limits.memory" .limits.memory "player.limits.workspaceSize" .limits.workspaceSize }}
+{{- if and $q (not (regexMatch "^[1-9][0-9]*Gi$" (toString $q))) }}
+{{- fail (printf "%s is whole Gi (e.g. 8Gi), not %v" $name $q) }}
+{{- end }}
+{{- end }}
+{{- if and .limits.cpu (gt (int .cpu) (int .limits.cpu)) }}
+{{- fail "player.cpu is over player.limits.cpu" }}
+{{- end }}
+{{- if and .limits.memory (gt (int (trimSuffix "Gi" .memory)) (int (trimSuffix "Gi" .limits.memory))) }}
+{{- fail "player.memory is over player.limits.memory" }}
+{{- end }}
+{{- if and .limits.workspaceSize (gt (int (trimSuffix "Gi" .workspaceSize)) (int (trimSuffix "Gi" .limits.workspaceSize))) }}
+{{- fail "player.workspaceSize is over player.limits.workspaceSize" }}
+{{- end }}
+{{- if lt (int .warm.count) 0 }}
+{{- fail "player.warm.count is 0 or more" }}
+{{- end }}
+{{- end }}

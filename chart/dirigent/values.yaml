@@ -101,10 +101,30 @@ checkpoints:
 
 # The players: one KubeVirt VM each.
 player:
+  # The default machine (memory and disk in whole Gi). A session may ask for another when it's
+  # made (the web's new session, a dirigent's create_session), and keeps it; one that asks for
+  # none gets this one as it is when it starts.
   cpu: 2
   memory: 4Gi
   # the workspace and the player's state, a fresh disk per VM (restored from its checkpoint)
   workspaceSize: 20Gi
+  # The most a session's machine may have; empty, no limit.
+  limits:
+    cpu: null
+    memory: null
+    workspaceSize: null
+  # Each user sets their own sessions' default machine (in the web's Settings), what they leave
+  # out being the one above; otherwise it's the one above for everyone.
+  defaultsPerUser: false
+  # VMs booted ahead of time, which starting sessions take instead of waiting for one to boot:
+  # `count` of them on the default machine; with defaultsPerUser, `count` for each user who made
+  # a session within `activeWithin` seconds, on theirs. A session on any other machine waits for
+  # a VM of its own. Each costs its machine all the time, and is replaced on any upgrade, change
+  # of the default machine, new players' system (player.nixos) or shared store generation
+  # (nix.shared).
+  warm:
+    count: 0
+    activeWithin: 604800
   # How long a player stopped from outside (a node drained, its VM deleted) has: the turn may
   # finish until `stopGrace - checkpointMargin`, then it's cut, checkpointed and handed over.
   stopGrace: 3600

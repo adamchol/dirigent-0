@@ -42,6 +42,7 @@ import { SyncDialog } from "./Sync.tsx";
 import { AnthropicKeyDialog } from "./Keys.tsx";
 import { connectGithub, GithubDialog, useGithubReturn } from "./GitHub.tsx";
 import { SecretsDialog } from "./Secrets.tsx";
+import * as machine from "./machine.ts";
 import { SettingsDialog, useSettings } from "./Settings.tsx";
 import { DeleteDialog, NewSession, SessionMenu, SessionsSidebar, useSessions } from "./Sessions.tsx";
 import { tokens } from "./Timeline.tsx";
@@ -332,6 +333,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
         addToken={addToken}
         connectGithub={() => connectGithub(props.who)}
         again={access}
+        settings={settings}
         made={(id) => {
           select(id);
           sessions.refresh();
@@ -428,6 +430,7 @@ function StatusBar({ info, status }: { info?: SessionInfo; status: LiveStatus | 
         <span className="hidden sm:inline">
           {info.spec.model}
           {info.spec.effort ? ` · ${info.spec.effort}` : ""}
+          {info.spec.resources ? ` · ${machine.brief(info.spec.resources)}` : ""}
         </span>
       )}
       {status && status.context > 0 && <span className="hidden sm:inline">{tokens(status.context)} context</span>}

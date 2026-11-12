@@ -53,9 +53,10 @@ import { Switch } from "@/components/ui/switch";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import * as api from "./api.ts";
-import type { Effort, Me, Model, Part, Provider, SessionInfo } from "./api.ts";
+import type { Effort, Machines, Me, Model, Part, Provider, Resources, SessionInfo, Settings } from "./api.ts";
 import { RepoAccess } from "./GitHub.tsx";
 import { linked } from "./Link.tsx";
+import * as machine from "./machine.ts";
 import { useTitles } from "./Rename.tsx";
 import type { Named } from "./events.ts";
 import { ACTIVITY_QUERY, millis, type ActivityRow } from "./events.ts";
@@ -478,6 +479,12 @@ const PROVIDERS: { value: Provider; label: string }[] = [
 
 const CLAUDE = "claude-sonnet-5";
 
+const MACHINE: { part: keyof Resources; label: string; unit: string }[] = [
+  { part: "cpu", label: "Cores", unit: "CPU" },
+  { part: "memory", label: "Memory", unit: "GiB" },
+  { part: "disk", label: "Disk", unit: "GiB" },
+];
+
 /** Making a session, `who`'s: a coder on a repository, or a dirigent; paid to Anthropic, or with
  * their ChatGPT plan (`connect` links one). */
 export function NewSession(props: {
@@ -491,6 +498,8 @@ export function NewSession(props: {
   connectGithub: () => void;
   /** Changed when access may have: the repository's is checked again. */
   again?: number;
+  /** Its user's, for their default machine. */
+  settings: Settings;
   made: (id: string) => void;
 }) {
   const [part, setPart] = useState<Part>("coder");
@@ -502,8 +511,23 @@ export function NewSession(props: {
   const [effort, setEffort] = useState<Effort | "none">("medium");
   const [start, setStart] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [machines, setMachines] = useState<Machines | null>(null);
+  const [showMachine, setShowMachine] = useState(false);
+  // as typed, until it's changed: the default one
+  const [typed, setTyped] = useState<Record<keyof Resources, string> | null>(null);
   const plan = linked(props.me);
   const { who } = props;
+
+  useEffect(() => {
+    if (!props.open) return;
+    setTyped(null);
+    api.machines(who).then(setMachines, () => setMachines(null));
+  }, [props.open, who]);
+  const dflt = machines ? machine.defaults(machines, props.settings) : null;
+  const shown = (part: keyof Resources) => typed?.[part] ?? String(dflt?.[part] ?? "");
+  const chosen: Resources | null = dflt && { cpu: Number(shown("cpu")), memory: Number(shown("memory")), disk: Number(shown("disk")) };
+  const type = (part: keyof Resources, value: string) =>
+    setTyped((t) => ({ cpu: shown("cpu"), memory: shown("memory"), disk: shown("disk"), ...t, [part]: value }));
 
   // the plan's models, once it's chosen: the first, unless one of them is
   useEffect(() => {
@@ -532,9 +556,16 @@ export function NewSession(props: {
     const id = crypto.randomUUID();
     const source =
       part === "coder" && git.trim() ? { git: { url: git.trim(), ...(ref.trim() ? { ref: ref.trim() } : {}) } } : null;
+    const wrong = chosen && machines && machine.wrong(chosen, machines.limits);
+    if (wrong) {
+      setShowMachine(true);
+      toast.error("Not that machine", { description: wrong });
+      return;
+    }
+    const resources = chosen && dflt ? machine.asked(chosen, dflt) : undefined;
     setBusy(true);
     try {
-      await api.put(props.who, id, { model, effort: effort === "none" ? null : effort, source, part, provider }, start);
+      await api.put(props.who, id, { model, effort: effort === "none" ? null : effort, source, part, provider, ...(resources ? { resources } : {}) }, start);
       props.setOpen(false);
       props.made(id);
     } catch (err) {
@@ -672,6 +703,64 @@ export function NewSession(props: {
                 </Select>
               </Field>
             </div>
+            {chosen && dflt && machines && (
+              <div className="flex flex-col">
+                <button
+                  type="button"
+                  aria-expanded={showMachine}
+                  onClick={() => setShowMachine(!showMachine)}
+                  className="flex items-center gap-1.5 text-left text-sm font-medium"
+                >
+                  <ChevronRightIcon className={cn("size-4 transition-transform", showMachine && "rotate-90")} />
+                  Machine
+                  <span className="ml-auto text-xs font-normal text-muted-foreground">
+                    {machine.summary(chosen)}
+                    {machine.same(chosen, dflt) ? " (default)" : ""}
+                  </span>
+                </button>
+                <AnimatePresence initial={false}>
+                  {showMachine && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.25, ease: [0.23, 1, 0.32, 1] }}
+                      className="overflow-hidden"
+                    >
+                      <div className="grid grid-cols-3 gap-4 pt-3">
+                        {MACHINE.map((m) => (
+                          <Field key={m.part}>
+                            <FieldLabel htmlFor={`machine-${m.part}`}>{m.label}</FieldLabel>
+                            <InputGroup>
+                              <InputGroupInput
+                                id={`machine-${m.part}`}
+                                type="number"
+                                inputMode="numeric"
+                                min={1}
+                                max={machines.limits[m.part]}
+                                value={shown(m.part)}
+                                onChange={(e) => type(m.part, e.target.value)}
+                              />
+                              <InputGroupAddon align="inline-end">{m.unit}</InputGroupAddon>
+                            </InputGroup>
+                          </Field>
+                        ))}
+                      </div>
+                      <FieldDescription className="pt-2">
+                        {!machine.same(chosen, dflt) && machines.warm > 0
+                          ? "Not the default machine: it starts on a VM of its own, which takes longer. "
+                          : ""}
+                        {!machine.same(chosen, dflt) && (
+                          <button type="button" className="text-primary-text hover:underline" onClick={() => setTyped(null)}>
+                            Back to the default
+                          </button>
+                        )}
+                      </FieldDescription>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+            )}
             <Field orientation="horizontal">
               <FieldContent>
                 <FieldTitle>Start it</FieldTitle>

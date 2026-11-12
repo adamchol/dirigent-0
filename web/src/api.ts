@@ -17,6 +17,15 @@ export interface SessionSpec {
   part?: Part;
   /** Absent: Anthropic. */
   provider?: Provider;
+  /** Its machine; absent, the cluster's default one. */
+  resources?: Resources;
+}
+
+/** A player's machine: its cores, and its memory and workspace disk in GiB. */
+export interface Resources {
+  cpu: number;
+  memory: number;
+  disk: number;
 }
 
 /** `SessionInfo` (protocol/src/control.rs): a session as its caller sees it. */
@@ -247,6 +256,9 @@ export function onGithub(url: string): boolean {
 export type Settings = {
   /** How much of a session's log the chat shows. */
   events: Shown;
+  /** Their sessions' default machine, where users have their own (`Machines.per_user`): what's
+   * left out is the cluster's. */
+  machine?: Partial<Resources>;
 };
 
 export async function settings(who: Who): Promise<Settings> {
@@ -269,4 +281,18 @@ export type PlayerSystem = {
 
 export async function playerSystem(who: Who): Promise<PlayerSystem> {
   return (await call(who, "GET", "/system")).json();
+}
+
+/** The players' machines (`control/src/machines.rs`): the cluster's default one, the most a
+ * session's may have (absent: no limit), whether users have their own defaults, and how many VMs
+ * are kept booted (per active user, with `per_user`). */
+export type Machines = {
+  defaults: Resources;
+  limits: Partial<Resources>;
+  per_user: boolean;
+  warm: number;
+};
+
+export async function machines(who: Who): Promise<Machines> {
+  return (await call(who, "GET", "/machines")).json();
 }

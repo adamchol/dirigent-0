@@ -324,7 +324,7 @@ mod e2e {
             Box::leak(dir.path().canonicalize().unwrap().into_boxed_path());
         let state = tempfile::tempdir().unwrap();
         let checkpoints: &'static Checkpoints = Box::leak(Box::new(
-            Checkpoints::connect(&stack.kopia, state.path(), session)
+            Checkpoints::connect(&stack.kopia, state.path(), Some(session))
                 .await
                 .unwrap(),
         ));

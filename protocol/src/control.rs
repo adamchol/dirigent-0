@@ -32,6 +32,17 @@ pub struct SessionSpec {
     /// Who its model calls are paid to.
     #[serde(default, skip_serializing_if = "Provider::is_anthropic")]
     pub provider: Provider,
+    /// Its machine; `None`, the cluster's default one (as it is when the session starts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Resources>,
+}
+
+/// A player's machine: its cores, and its memory and workspace disk in GiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Resources {
+    pub cpu: u32,
+    pub memory: u32,
+    pub disk: u32,
 }
 
 /// Who a session's model calls are paid to: Anthropic, with the player's API key; or OpenAI,
@@ -82,15 +93,23 @@ impl Default for SessionSpec {
             source: None,
             part: Part::Coder,
             provider: Provider::Anthropic,
+            resources: None,
         }
     }
 }
 
 impl SessionSpec {
-    /// Why it can't run, if it can't: a dirigent has no source.
+    /// Why it can't run, if it can't: a dirigent has no source, and a machine has some of each.
     pub fn check(&self) -> Result<(), String> {
         if self.part == Part::Dirigent && self.source.is_some() {
             return Err("a dirigent's session has no source".into());
+        }
+        if let Some(r) = self.resources {
+            if r.cpu == 0 || r.memory == 0 || r.disk == 0 {
+                return Err(
+                    "a machine has at least 1 core, 1 GiB of memory and 1 GiB of disk".into(),
+                );
+            }
         }
         Ok(())
     }
@@ -136,6 +155,11 @@ impl From<SessionSpec> for pb::SessionSpec {
                 Provider::Anthropic => pb::Provider::Anthropic,
                 Provider::Chatgpt => pb::Provider::Chatgpt,
             } as i32,
+            resources: spec.resources.map(|r| pb::Resources {
+                cpu: r.cpu,
+                memory: r.memory,
+                disk: r.disk,
+            }),
         }
     }
 }
@@ -183,6 +207,11 @@ impl TryFrom<pb::SessionSpec> for SessionSpec {
                     ))
                 }
             },
+            resources: spec.resources.map(|r| Resources {
+                cpu: r.cpu,
+                memory: r.memory,
+                disk: r.disk,
+            }),
         })
     }
 }
@@ -300,6 +329,8 @@ mod tests {
         assert_eq!(chatgpt.provider, Provider::Chatgpt);
         let default = serde_json::to_value(SessionSpec::default()).unwrap();
         assert!(default.get("provider").is_none());
+        // nor the default machine
+        assert!(default.get("resources").is_none());
     }
 
     #[test]
@@ -316,6 +347,7 @@ mod tests {
                 }),
                 part: Part::Coder,
                 provider: Provider::Anthropic,
+                resources: None,
             },
             SessionSpec {
                 model: "m".into(),
@@ -326,6 +358,11 @@ mod tests {
                 }),
                 part: Part::Coder,
                 provider: Provider::Chatgpt,
+                resources: Some(Resources {
+                    cpu: 4,
+                    memory: 8,
+                    disk: 30,
+                }),
             },
             SessionSpec {
                 model: "m".into(),
@@ -333,6 +370,7 @@ mod tests {
                 source: None,
                 part: Part::Dirigent,
                 provider: Provider::Anthropic,
+                resources: None,
             },
         ];
         for spec in specs {
@@ -346,6 +384,7 @@ mod tests {
             source: None,
             part: 0,
             provider: 0,
+            resources: None,
         };
         assert!(SessionSpec::try_from(unspecified).is_err());
         assert!(SessionSpec::try_from(pb::SessionSpec::default()).is_err());

@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use dirigent_protocol::control::{Holder, Role, SessionInfo, SessionSpec};
+use dirigent_protocol::control::{Holder, Resources, Role, SessionInfo, SessionSpec};
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls, Row};
 use tracing::error;
@@ -422,6 +422,43 @@ impl Store {
         .await?;
         tx.commit().await?;
         Ok(Reserve::Reserved(epoch))
+    }
+
+    /// The machine `session`'s spec asks for, if it asks for one (and the session exists).
+    pub async fn machine(&self, session: Uuid) -> anyhow::Result<Option<Resources>> {
+        let row = self
+            .db
+            .lock()
+            .await
+            .query_opt(
+                "SELECT spec -> 'resources' FROM dirigent.sessions WHERE id = $1",
+                &[&session],
+            )
+            .await?;
+        match row.and_then(|r| r.get::<_, Option<serde_json::Value>>(0)) {
+            Some(v) => Ok(Some(serde_json::from_value(v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The settings (as kept, if any) of each user who made a session within `within`.
+    pub async fn active_owners(
+        &self,
+        within: Duration,
+    ) -> anyhow::Result<Vec<Option<serde_json::Value>>> {
+        let rows = self
+            .db
+            .lock()
+            .await
+            .query(
+                "SELECT DISTINCT a.subject, u.settings FROM dirigent.session_access a \
+                 JOIN dirigent.sessions s ON s.id = a.session_id \
+                 LEFT JOIN dirigent.user_settings u ON u.subject = a.subject \
+                 WHERE a.role = 'owner' AND s.created > now() - make_interval(secs => $1)",
+                &[&within.as_secs_f64()],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get(1)).collect())
     }
 
     /// The players holding leases (or away, within the grace period) that `runner` started.

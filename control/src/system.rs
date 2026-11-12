@@ -97,6 +97,16 @@ impl System {
         ready
     }
 
+    /// The built system, if there's one (what a warm VM is made in).
+    pub fn ready(&self) -> Option<String> {
+        self.ready.lock().unwrap().clone()
+    }
+
+    /// Whether `session` is a suspect: started again on the stock image, not in the system.
+    pub fn suspect(&self, session: Uuid) -> bool {
+        self.suspects.lock().unwrap().contains_key(&session)
+    }
+
     /// The player that was to take `session` at `epoch` came: its VM came up. Whether it's a
     /// suspect's, on the stock image, so that the system is why the one before didn't.
     pub fn came(&self, session: Uuid, epoch: i64) -> bool {
@@ -279,6 +289,7 @@ pub async fn built(
         Ok(path) => {
             info!(build = %id, path, "the players' system is built");
             *system.ready.lock().unwrap() = Some(path.to_string());
+            control.pool.wake();
             if let Some(runner) = runner {
                 runner.note(false, "Built", path).await;
             }
@@ -319,6 +330,7 @@ pub async fn broken(control: &'static Control, session: Uuid) {
     *system.ready.lock().unwrap() = None;
     system.waiting.lock().unwrap().clear();
     system.suspects.lock().unwrap().clear();
+    control.pool.wake();
     error!(
         hash = system.hash,
         why, "the players' system is broken: sessions run the stock image"

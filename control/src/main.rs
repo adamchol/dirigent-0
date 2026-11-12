@@ -10,7 +10,9 @@ mod bootstrap;
 mod chatgpt;
 mod github;
 mod leases;
+mod machines;
 mod nixstore;
+mod pool;
 mod prune;
 mod runner;
 mod seal;
@@ -35,7 +37,7 @@ use axum::{Json, Router};
 use clap::Parser;
 use dirigent_protocol::control::pb::players_server::{Players, PlayersServer};
 use dirigent_protocol::control::{
-    pb, player_subject, Part, Provider, Role, SessionInfo, SessionSpec, Source,
+    pb, player_subject, Part, Provider, Resources, Role, SessionInfo, SessionSpec, Source,
 };
 use serde::Deserialize;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
@@ -47,6 +49,7 @@ use uuid::Uuid;
 use crate::chatgpt::{ChatGpt, ChatGptArgs, LinkInfo, Model, Started as LinkStarted};
 use crate::github::{Github, GithubArgs, Repo, GITHUB_TOKEN};
 use crate::leases::{Acquire, Archive, Delete, Put, Reserve, Scope, Store};
+use crate::machines::{MachineArgs, Machines, Partial};
 use crate::prune::{PruneArgs, Pruner};
 use crate::runner::{Kube, Local, Runner};
 use crate::seal::Seal;
@@ -131,6 +134,9 @@ struct Cli {
 
     #[command(flatten)]
     nix_store: nixstore::NixStoreArgs,
+
+    #[command(flatten)]
+    machines: MachineArgs,
 
     /// The configuration's ConfigMap, which control tells of its builds on (Events).
     #[arg(
@@ -242,6 +248,10 @@ struct Control {
     /// What changed of leases' credentials, which their holders send again at once.
     changed: broadcast::Sender<Changed>,
     runner: Option<&'static dyn Runner>,
+    /// The players' machines: the default one, the limits, and whose defaults they are.
+    machines: Machines,
+    /// The warm VMs' players waiting for a session.
+    pool: pool::Pool,
     /// What deletes sessions; none without ClickHouse (`--clickhouse-url`).
     pruner: Option<&'static Pruner>,
     /// The cluster's own players' system, when it has a configuration of its own.
@@ -332,6 +342,13 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
+    let args = &cli.machines;
+    let defaults = runner.and_then(|r| r.machine()).unwrap_or(Resources {
+        cpu: args.machine_cpu,
+        memory: args.machine_memory,
+        disk: args.machine_disk,
+    });
+    let machines = Machines::new(args, defaults)?;
     let pruner: Option<&'static Pruner> = Pruner::new(&cli.prune).map(|p| &*Box::leak(Box::new(p)));
     let system = match &cli.nixos_config {
         Some(dir) => System::load(dir, Duration::from_secs(cli.nixos_build_timeout))?,
@@ -344,6 +361,7 @@ async fn main() -> anyhow::Result<()> {
         keys,
         github,
         runner,
+        machines,
         pruner,
         system,
         Duration::from_secs(cli.startup),
@@ -351,7 +369,11 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(cli.session_days * 86400),
     );
     tokio::spawn(sweep(control));
-    tokio::spawn(system::begin(control));
+    // the warm VMs in the system it has, once that's known
+    tokio::spawn(async move {
+        system::begin(control).await;
+        pool::keep(control).await
+    });
     if let Some(pruner) = pruner {
         tokio::spawn(prune::prune(&control.store, runner, pruner));
         tokio::spawn(prune::maintain(pruner));
@@ -390,6 +412,7 @@ fn control(
     keys: Keys,
     github: Github,
     runner: Option<&'static dyn Runner>,
+    machines: Machines,
     pruner: Option<&'static Pruner>,
     system: Option<System>,
     startup: Duration,
@@ -404,6 +427,8 @@ fn control(
         github,
         changed: broadcast::channel(64).0,
         runner,
+        machines,
+        pool: Default::default(),
         pruner,
         system,
         startup,
@@ -457,6 +482,7 @@ fn router(control: &'static Control) -> Router {
         .route("/system/builds/{id}", post(system_built))
         .route("/nix/paths", post(nix_paths))
         .route("/settings", get(get_settings).put(put_settings))
+        .route("/machines", get(get_machines))
         .route("/session", post(open_sign_in).delete(close_sign_in))
         .route("/session/token", post(sign_in_token))
         .route("/token", post(chlive_token))
@@ -844,6 +870,15 @@ async fn nix_paths(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The players' machines: the default one, the most a session's may have, and whether users
+/// have their own defaults.
+async fn get_machines(
+    State(control): State<&'static Control>,
+    Caller(_): Caller,
+) -> Json<&'static Machines> {
+    Json(&control.machines)
+}
+
 /// The caller's settings, defaults for those they haven't set.
 async fn get_settings(
     State(control): State<&'static Control>,
@@ -866,12 +901,27 @@ async fn put_settings(
 ) -> Result<Json<settings::Settings>, Failed> {
     let given: settings::Settings = serde_json::from_slice(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("not settings: {e}")))?;
+    if let Some(machine) = given.machine {
+        let machines = &control.machines;
+        if !machines.per_user {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "users have no default machines of their own here".into(),
+            ));
+        }
+        if let Some(why) = machines.over(machine.over(machines.defaults)) {
+            return Err((StatusCode::BAD_REQUEST, format!("not that machine: {why}")));
+        }
+    }
     let value = serde_json::to_value(&given).expect("settings are JSON");
     control
         .store
         .put_settings(&caller, &value)
         .await
         .map_err(|e| failed("keeping the settings", e))?;
+    if control.machines.per_user {
+        control.pool.wake();
+    }
     Ok(Json(given))
 }
 
@@ -1042,11 +1092,65 @@ enum Started {
     NoRunner,
 }
 
+/// A lease not reserved, as a start's outcome.
+impl From<Reserve> for Started {
+    fn from(r: Reserve) -> Started {
+        match r {
+            Reserve::Reserved(epoch) => Started::Player(epoch),
+            Reserve::Held => Started::Active,
+            Reserve::Unknown => Started::Unknown,
+            Reserve::Archived => Started::Archived,
+        }
+    }
+}
+
 /// Start a player for `session`, unless one holds it.
 async fn start(control: &'static Control, session: Uuid) -> anyhow::Result<Started> {
     let Some(runner) = control.runner else {
         return Ok(Started::NoRunner);
     };
+    // its own machine, if it has one (none: the default one, as it is now)
+    let machine = control
+        .store
+        .machine(session)
+        .await?
+        .unwrap_or(control.machines.defaults);
+    // a warm VM on it, if one waits; not for a suspect, which starts on the stock image
+    let suspect = control.system.as_ref().is_some_and(|s| s.suspect(session));
+    let warm = match pool::key(control, machine) {
+        Some(key) if !suspect => control.pool.take(machine, &key),
+        _ => None,
+    };
+    if let Some(warm) = warm {
+        let subject = player_subject(&warm.player);
+        let epoch = match control
+            .store
+            .reserve(session, &subject, runner.id(), control.startup)
+            .await
+        {
+            Ok(Reserve::Reserved(epoch)) => epoch,
+            not => {
+                control.pool.give_back(warm);
+                return not.map(Started::from);
+            }
+        };
+        control.pool.wake();
+        let player = warm.player.clone();
+        let taken = match runner.take(session, &player, epoch).await {
+            Ok(()) => warm.tell(session, epoch).await,
+            Err(e) => {
+                warn!(session = %session, player, "taking a warm VM: {e:#}");
+                false
+            }
+        };
+        if taken {
+            return Ok(Started::Player(epoch));
+        }
+        // gone meanwhile: a VM of its own after all
+        warn!(session = %session, player, "the warm VM was gone: starting another");
+        runner.unwarm(&player).await;
+        control.store.drop_lease(session).await?;
+    }
     let player = Uuid::new_v4().to_string();
     let subject = player_subject(&player);
     let epoch = match control
@@ -1055,9 +1159,7 @@ async fn start(control: &'static Control, session: Uuid) -> anyhow::Result<Start
         .await?
     {
         Reserve::Reserved(epoch) => epoch,
-        Reserve::Held => return Ok(Started::Active),
-        Reserve::Unknown => return Ok(Started::Unknown),
-        Reserve::Archived => return Ok(Started::Archived),
+        not => return Ok(not.into()),
     };
     // the cluster's own system, once it's built, where the runner runs it
     let system = control
@@ -1066,7 +1168,7 @@ async fn start(control: &'static Control, session: Uuid) -> anyhow::Result<Start
         .filter(|_| runner.runs_systems())
         .and_then(|s| s.start(session, epoch));
     if let Err(e) = runner
-        .start(session, &player, epoch, system.as_deref())
+        .start(session, &player, epoch, system.as_deref(), machine)
         .await
     {
         control.store.drop_lease(session).await?;
@@ -1097,6 +1199,9 @@ struct NewSession {
     /// Who else may read it.
     #[serde(default)]
     viewers: Vec<String>,
+    /// Its machine, as asked for: what's left out is the owner's default (or the cluster's).
+    #[serde(default)]
+    resources: Option<Partial>,
     #[serde(flatten)]
     spec: SessionSpec,
     /// Start it too, as `POST …/start` does.
@@ -1134,8 +1239,25 @@ async fn put_session(
     State(control): State<&'static Control>,
     Caller(caller): Caller,
     Path(id): Path<Uuid>,
-    Json(body): Json<NewSession>,
+    Json(mut body): Json<NewSession>,
 ) -> Result<StatusCode, Failed> {
+    let machines = &control.machines;
+    let own = match machines.per_user {
+        true => control
+            .store
+            .settings(&caller)
+            .await
+            .map_err(|e| failed("reading the settings", e))?
+            .and_then(|s| settings::Settings::kept(s).machine),
+        false => None,
+    };
+    body.spec.resources = machines.resolve(body.resources, own);
+    if let Some(why) = body.spec.resources.and_then(|r| machines.over(r)) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("not that machine: {why}"),
+        ));
+    }
     body.spec
         .check()
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
@@ -1164,6 +1286,10 @@ async fn put_session(
     let status = match put {
         Ok(Put::Made) => {
             info!(session = %id, owner = caller, viewers = ?body.viewers, spec = ?body.spec, "session made");
+            // perhaps a user active anew, whose warm VMs there are
+            if machines.per_user {
+                control.pool.wake();
+            }
             StatusCode::CREATED
         }
         Ok(Put::Exists) => StatusCode::OK,
@@ -1561,6 +1687,17 @@ struct Lessor(&'static Control);
 #[tonic::async_trait]
 impl Players for Lessor {
     type LeaseStream = ReceiverStream<Result<pb::ToPlayer, Status>>;
+    type WaitStream = ReceiverStream<Result<pb::Assigned, Status>>;
+
+    /// A warm player waits to be given a session.
+    async fn wait(
+        &self,
+        request: Request<pb::WaitRequest>,
+    ) -> Result<Response<Self::WaitStream>, Status> {
+        let ask = request.into_inner();
+        let rx = pool::wait(self.0, ask.player, ask.system).await?;
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
 
     /// A player asks for a session; held, it keeps it until it ends its stream (giving it back)
     /// or the call breaks (keeping it for the grace period). Once the session is stopped, the
@@ -2082,9 +2219,16 @@ mod e2e {
         id: String,
         started: std::sync::Mutex<Vec<(Uuid, String, i64)>>,
         systems: std::sync::Mutex<Vec<(Uuid, Option<String>)>>,
+        machines: std::sync::Mutex<Vec<(Uuid, Resources)>>,
         builds: std::sync::Mutex<Vec<(Uuid, String)>>,
         ended: std::sync::Mutex<Vec<Uuid>>,
         fail: bool,
+        /// Whether it keeps warm VMs: those it has (made, and not taken or deleted), those
+        /// taken (session, player, epoch), and what's in their keys besides (a generation).
+        warms: bool,
+        warm: std::sync::Mutex<Vec<runner::Warm>>,
+        taken: std::sync::Mutex<Vec<(Uuid, String, i64)>>,
+        generation: std::sync::atomic::AtomicU64,
     }
 
     #[async_trait::async_trait]
@@ -2099,8 +2243,10 @@ mod e2e {
             player: &str,
             epoch: i64,
             system: Option<&str>,
+            machine: Resources,
         ) -> anyhow::Result<()> {
             anyhow::ensure!(!self.fail, "the runner fails");
+            self.machines.lock().unwrap().push((session, machine));
             self.started
                 .lock()
                 .unwrap()
@@ -2128,6 +2274,48 @@ mod e2e {
         fn runs_systems(&self) -> bool {
             true
         }
+
+        fn warms(&self) -> bool {
+            self.warms
+        }
+
+        fn warm_key(&self, m: Resources, system: Option<&str>) -> String {
+            let generation = self.generation.load(Ordering::Relaxed);
+            format!("{}-{}-{}-{system:?}-{generation}", m.cpu, m.memory, m.disk)
+        }
+
+        async fn warm(
+            &self,
+            player: &str,
+            machine: Resources,
+            _system: Option<&str>,
+            key: &str,
+        ) -> anyhow::Result<()> {
+            self.warm.lock().unwrap().push(runner::Warm {
+                player: player.into(),
+                machine,
+                key: key.into(),
+                age: Duration::ZERO,
+            });
+            Ok(())
+        }
+
+        async fn warm_vms(&self) -> anyhow::Result<Vec<runner::Warm>> {
+            Ok(self.warm.lock().unwrap().clone())
+        }
+
+        async fn take(&self, session: Uuid, player: &str, epoch: i64) -> anyhow::Result<()> {
+            self.warm.lock().unwrap().retain(|w| w.player != player);
+            self.taken
+                .lock()
+                .unwrap()
+                .push((session, player.into(), epoch));
+            Ok(())
+        }
+
+        async fn unwarm(&self, player: &str) {
+            self.warm.lock().unwrap().retain(|w| w.player != player);
+        }
     }
 
     impl Recorder {
@@ -2143,13 +2331,27 @@ mod e2e {
     }
 
     fn recorder(fail: bool) -> &'static Recorder {
+        recorder_of(fail, false)
+    }
+
+    /// One that keeps warm VMs.
+    fn warm_recorder() -> &'static Recorder {
+        recorder_of(false, true)
+    }
+
+    fn recorder_of(fail: bool, warms: bool) -> &'static Recorder {
         Box::leak(Box::new(Recorder {
             id: format!("test:{}", Uuid::new_v4()),
             started: Default::default(),
             systems: Default::default(),
+            machines: Default::default(),
             builds: Default::default(),
             ended: Default::default(),
             fail,
+            warms,
+            warm: Default::default(),
+            taken: Default::default(),
+            generation: Default::default(),
         }))
     }
 
@@ -2178,6 +2380,7 @@ mod e2e {
             github,
             STARTUP,
             None,
+            None,
             runner,
         )
         .await
@@ -2192,6 +2395,22 @@ mod e2e {
             github_app_client_id: None,
             github_app_client_secret: None,
             github_app_key: None,
+        }
+    }
+
+    /// The machines of a test's control: 2 cores, 4 GiB and 20 GiB, no limits, the cluster's
+    /// defaults for everyone, and no warm VMs.
+    fn test_machines() -> Machines {
+        Machines {
+            defaults: Resources {
+                cpu: 2,
+                memory: 4,
+                disk: 20,
+            },
+            limits: Partial::default(),
+            per_user: false,
+            warm: 0,
+            active_within: Duration::from_secs(604800),
         }
     }
 
@@ -2210,6 +2429,7 @@ mod e2e {
         github: GithubArgs,
         startup: Duration,
         system: Option<System>,
+        machines: Option<Machines>,
         runner: impl FnOnce(&Ctl) -> &'static dyn Runner,
     ) -> Option<Ctl> {
         std::env::var_os("DIRIGENT_E2E")?;
@@ -2260,6 +2480,7 @@ mod e2e {
             keys,
             github,
             Some(runner),
+            machines.unwrap_or_else(test_machines),
             pruner,
             system,
             startup,
@@ -2267,7 +2488,10 @@ mod e2e {
             Duration::from_secs(3600),
         );
         tokio::spawn(sweep(control));
-        tokio::spawn(system::begin(control));
+        tokio::spawn(async move {
+            system::begin(control).await;
+            pool::keep(control).await
+        });
         if let Some(pruner) = pruner {
             tokio::spawn(prune::prune(&control.store, Some(runner), pruner));
         }
@@ -3291,6 +3515,7 @@ mod e2e {
             no_github(),
             startup,
             None,
+            None,
             |ctl| {
                 Box::leak(Box::new(Local {
                     id: format!("local:{}", root.display()),
@@ -3831,6 +4056,7 @@ mod e2e {
             no_github(),
             STARTUP,
             system,
+            None,
             |_| runner,
         )
         .await
@@ -4175,6 +4401,438 @@ mod e2e {
         );
     }
 
+    #[tokio::test]
+    async fn e2e_a_sessions_machine_is_asked_for_or_its_owners_default_within_the_limits() {
+        let runner = recorder(false);
+        let machines = Machines {
+            limits: Partial {
+                cpu: Some(8),
+                ..Default::default()
+            },
+            per_user: true,
+            ..test_machines()
+        };
+        let ttl = Duration::from_secs(600);
+        let Some(base) = start_all(
+            None,
+            ttl,
+            false,
+            None,
+            None,
+            no_github(),
+            STARTUP,
+            None,
+            Some(machines),
+            |_| runner,
+        )
+        .await
+        else {
+            return;
+        };
+        let (user, other) = (new_user(), new_user());
+        let (_, got) = get_json(&base, &user, "/machines").await;
+        assert_eq!(
+            got,
+            serde_json::json!({
+                "defaults": { "cpu": 2, "memory": 4, "disk": 20 },
+                "limits": { "cpu": 8 },
+                "per_user": true,
+                "warm": 0,
+            })
+        );
+        let put = reqwest::Method::PUT;
+        let mine = serde_json::json!({ "machine": { "memory": 16 } });
+        let (status, why) = send_json(&base, &user, put.clone(), "/settings", mine).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{why}");
+        let over = serde_json::json!({ "machine": { "cpu": 9 } });
+        let (status, why) = send_json(&base, &user, put.clone(), "/settings", over).await;
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{why}");
+        let machine = |cpu, memory, disk| Resources { cpu, memory, disk };
+        let made = |who: String, body: serde_json::Value| {
+            let base = &base;
+            async move {
+                let s = Uuid::new_v4();
+                let status = put_json(base, s, &who, body).await;
+                let (_, info) = get_json(base, &who, &format!("/sessions/{s}")).await;
+                let resources = info["spec"].get("resources").cloned();
+                (s, status, resources)
+            }
+        };
+        let start = serde_json::json!({ "start": true });
+        // the owner's default, the rest the cluster's
+        let (s, status, kept) = made(user.clone(), start.clone()).await;
+        assert_eq!(status, reqwest::StatusCode::CREATED);
+        assert_eq!(
+            kept,
+            Some(serde_json::json!({ "cpu": 2, "memory": 16, "disk": 20 }))
+        );
+        let started = runner.machines.lock().unwrap().clone();
+        assert!(started.contains(&(s, machine(2, 16, 20))), "{started:?}");
+        // what's asked for, the rest the owner's
+        let asked = serde_json::json!({ "start": true, "resources": { "cpu": 4 } });
+        let (s, _, kept) = made(user.clone(), asked).await;
+        assert_eq!(
+            kept,
+            Some(serde_json::json!({ "cpu": 4, "memory": 16, "disk": 20 }))
+        );
+        assert!(runner
+            .machines
+            .lock()
+            .unwrap()
+            .contains(&(s, machine(4, 16, 20))));
+        // nothing asked for and no defaults of their own: the cluster's, whatever it is then
+        let (s, _, kept) = made(other.clone(), start).await;
+        assert_eq!(kept, None);
+        assert!(runner
+            .machines
+            .lock()
+            .unwrap()
+            .contains(&(s, machine(2, 4, 20))));
+        let over = serde_json::json!({ "resources": { "cpu": 9 } });
+        let (_, status, _) = made(other.clone(), over).await;
+        assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        let none = serde_json::json!({ "resources": { "cpu": 0 } });
+        let (_, status, _) = made(other, none).await;
+        assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn e2e_without_defaults_per_user_settings_have_no_machine() {
+        let Some(base) = start_recording(recorder(false)).await else {
+            return;
+        };
+        let user = new_user();
+        let mine = serde_json::json!({ "machine": { "memory": 16 } });
+        let put = reqwest::Method::PUT;
+        let (status, why) = send_json(&base, &user, put, "/settings", mine).await;
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{why}");
+        assert_eq!(
+            get_json(&base, &user, "/machines").await.1["per_user"],
+            false
+        );
+    }
+
+    /// A control with `runner`, on `machines`.
+    async fn start_machines(runner: &'static dyn Runner, machines: Machines) -> Option<Ctl> {
+        let ttl = Duration::from_secs(600);
+        start_all(
+            None,
+            ttl,
+            false,
+            None,
+            None,
+            no_github(),
+            STARTUP,
+            None,
+            Some(machines),
+            |_| runner,
+        )
+        .await
+    }
+
+    /// `player` waits at control as a warm player: the stream it's told its session on.
+    async fn wait_for(base: &Ctl, player: &str) -> Result<Streaming<pb::Assigned>, Status> {
+        let mut client = PlayersClient::connect(format!("http://{}", base.grpc))
+            .await
+            .unwrap();
+        let ask = pb::WaitRequest {
+            player: player.into(),
+            system: None,
+        };
+        client.wait(ask).await.map(|r| r.into_inner())
+    }
+
+    /// `runner`'s warm VMs, once there are `n`, within 10 s.
+    async fn warm_n(runner: &Recorder, n: usize) -> Vec<runner::Warm> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let warm = runner.warm.lock().unwrap().clone();
+            if warm.len() >= n || tokio::time::Instant::now() > deadline {
+                return warm;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_a_session_takes_a_warm_vm_on_its_machine_and_another_is_made() {
+        let runner = warm_recorder();
+        let machines = Machines {
+            warm: 1,
+            ..test_machines()
+        };
+        let Some(base) = start_machines(runner, machines).await else {
+            return;
+        };
+        let [first] = &warm_n(runner, 1).await[..] else {
+            panic!("no warm VM")
+        };
+        let mut told = wait_for(&base, &first.player).await.unwrap();
+        let stranger = wait_for(&base, &Uuid::new_v4().to_string()).await;
+        assert_eq!(stranger.unwrap_err().code(), Code::NotFound);
+
+        let s = Uuid::new_v4();
+        let start = serde_json::json!({ "start": true });
+        assert_eq!(
+            put_json(&base, s, A, start).await,
+            reqwest::StatusCode::CREATED
+        );
+        let given = tokio::time::timeout(Duration::from_secs(10), told.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!((given.session, given.epoch), (s.to_string(), 1));
+        assert_eq!(runner.of(s), vec![], "no VM of its own");
+        let taken = runner.taken.lock().unwrap().clone();
+        assert_eq!(taken, vec![(s, first.player.clone(), 1)]);
+        let reserved = info(&base, s).await.player.unwrap();
+        assert_eq!(reserved.subject, player_subject(&first.player));
+        let mut conn = connect(&base).await;
+        assert_eq!(
+            acquire(&mut conn, s, &first.player, Some(1)).await,
+            acquired(1)
+        );
+        // another, in its place
+        let [next] = &warm_n(runner, 1).await[..] else {
+            panic!("no other warm VM")
+        };
+        assert_ne!(next.player, first.player);
+
+        // one on another machine waits for a VM of its own
+        let s = Uuid::new_v4();
+        let big = serde_json::json!({ "start": true, "resources": { "cpu": 4 } });
+        put_json(&base, s, A, big).await;
+        assert_eq!(runner.of(s).len(), 1);
+        assert_eq!(runner.taken.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn e2e_without_a_warm_player_waiting_a_session_gets_a_vm_of_its_own() {
+        let runner = warm_recorder();
+        let machines = Machines {
+            warm: 1,
+            ..test_machines()
+        };
+        let Some(base) = start_machines(runner, machines).await else {
+            return;
+        };
+        let [booting] = &warm_n(runner, 1).await[..] else {
+            panic!("no warm VM")
+        };
+        // its player hasn't come: a VM of its own
+        let s = Uuid::new_v4();
+        put_json(&base, s, A, serde_json::json!({ "start": true })).await;
+        assert_eq!(runner.of(s).len(), 1);
+        // one whose VM isn't current any more doesn't wait
+        runner.generation.fetch_add(1, Ordering::Relaxed);
+        let stale = wait_for(&base, &booting.player).await;
+        assert_eq!(stale.unwrap_err().code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn e2e_with_defaults_per_user_warm_vms_are_on_active_users_machines() {
+        let runner = warm_recorder();
+        let machines = Machines {
+            warm: 1,
+            per_user: true,
+            ..test_machines()
+        };
+        let Some(base) = start_machines(runner, machines).await else {
+            return;
+        };
+        let put = reqwest::Method::PUT;
+        for cpu in [3, 5] {
+            let user = new_user();
+            let mine = serde_json::json!({ "machine": { "cpu": cpu, "memory": 1 } });
+            send_json(&base, &user, put.clone(), "/settings", mine).await;
+            put_json(&base, Uuid::new_v4(), &user, serde_json::json!({})).await;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let has = |cpu| {
+            let warm = runner.warm.lock().unwrap();
+            warm.iter().any(|w| {
+                w.machine
+                    == Resources {
+                        cpu,
+                        memory: 1,
+                        disk: 20,
+                    }
+            })
+        };
+        while !(has(3) && has(5)) {
+            assert!(tokio::time::Instant::now() < deadline, "{:?}", runner.warm);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Local players, and warm ones too, in `<root>/warm-<player>`.
+    struct WarmLocal {
+        local: Local,
+        warm: std::sync::Mutex<Vec<runner::Warm>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Runner for WarmLocal {
+        fn id(&self) -> &str {
+            self.local.id()
+        }
+
+        async fn start(
+            &self,
+            session: Uuid,
+            player: &str,
+            epoch: i64,
+            system: Option<&str>,
+            machine: Resources,
+        ) -> anyhow::Result<()> {
+            self.local
+                .start(session, player, epoch, system, machine)
+                .await
+        }
+
+        async fn forget(&self, session: Uuid) -> anyhow::Result<()> {
+            self.local.forget(session).await
+        }
+
+        fn warms(&self) -> bool {
+            true
+        }
+
+        async fn warm(
+            &self,
+            player: &str,
+            machine: Resources,
+            _: Option<&str>,
+            key: &str,
+        ) -> anyhow::Result<()> {
+            let dir = self.local.root.join(format!("warm-{player}"));
+            std::fs::create_dir_all(&dir)?;
+            let log = std::fs::File::create(dir.join("player.log"))?;
+            let mut cmd = tokio::process::Command::new(&self.local.program);
+            cmd.args(["--warm", "--player-id", player])
+                .args(["--control-url", &self.local.control_url])
+                .args(["--control-http", &self.local.control_http])
+                .arg("--workdir")
+                .arg(dir.join("workspace"))
+                .arg("--state-dir")
+                .arg(dir.join("state"))
+                .args(&self.local.args)
+                .env_clear()
+                .envs(
+                    runner::PASSED_ON
+                        .iter()
+                        .filter_map(|k| Some((k, std::env::var_os(k)?))),
+                )
+                .stdout(log.try_clone()?)
+                .stderr(log);
+            // gone with the test
+            // SAFETY: prctl(2) alone, between fork and exec
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    Ok(())
+                });
+            }
+            cmd.spawn()?;
+            self.warm.lock().unwrap().push(runner::Warm {
+                player: player.into(),
+                machine,
+                key: key.into(),
+                age: Duration::ZERO,
+            });
+            Ok(())
+        }
+
+        async fn warm_vms(&self) -> anyhow::Result<Vec<runner::Warm>> {
+            Ok(self.warm.lock().unwrap().clone())
+        }
+
+        async fn take(&self, _: Uuid, player: &str, _: i64) -> anyhow::Result<()> {
+            self.warm.lock().unwrap().retain(|w| w.player != player);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_a_warm_local_player_takes_a_session_it_is_given() {
+        let root = tempfile::tempdir().unwrap();
+        let mut made: Option<&'static WarmLocal> = None;
+        let machines = Machines {
+            warm: 1,
+            ..test_machines()
+        };
+        let ttl = Duration::from_secs(600);
+        let Some(base) = start_all(
+            None,
+            ttl,
+            false,
+            None,
+            None,
+            no_github(),
+            Duration::from_secs(15),
+            None,
+            Some(machines),
+            |ctl| {
+                let runner = Box::leak(Box::new(WarmLocal {
+                    local: Local {
+                        id: format!("local:{}", root.path().display()),
+                        root: root.path().to_path_buf(),
+                        program: concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/player")
+                            .into(),
+                        args: vec!["--mock".into()],
+                        control_url: format!("http://{}", ctl.grpc),
+                        control_http: format!("http://{}", ctl.http),
+                        build: None,
+                    },
+                    warm: Default::default(),
+                }));
+                made = Some(runner);
+                runner
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let runner = made.expect("made");
+        // its player waiting
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let log = loop {
+            let player = runner
+                .warm
+                .lock()
+                .unwrap()
+                .first()
+                .map(|w| w.player.clone());
+            let log = player.map(|p| root.path().join(format!("warm-{p}/player.log")));
+            if let Some(log) = log.filter(|l| {
+                std::fs::read_to_string(l).is_ok_and(|t| t.contains("waiting for a session"))
+            }) {
+                break log;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no warm player waits"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let s = Uuid::new_v4();
+        put_json(&base, s, A, serde_json::json!({ "start": true })).await;
+        let attached =
+            |i: &SessionInfo| i.epoch == 1 && i.player.as_ref().is_some_and(|p| p.attached);
+        info_until(&base, s, attached).await;
+        assert!(
+            !root.path().join(s.to_string()).exists(),
+            "no player of its own"
+        );
+        let stop = format!("/sessions/{s}/stop");
+        post(&base, &stop, None).await;
+        info_until(&base, s, |i| i.player.is_none()).await;
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains(&s.to_string()), "{text}");
+    }
+
     /// A control that keeps secrets, with the fake GitHub's App.
     async fn start_github() -> Option<(Ctl, github::fake::GitHub, tempfile::TempDir)> {
         std::env::var_os("DIRIGENT_E2E")?;
@@ -4189,9 +4847,18 @@ mod e2e {
         let runner = recorder(false);
         let ttl = Duration::from_secs(600);
         let github = gh.args(dir.path());
-        let ctl = start_all(None, ttl, false, None, keys, github, STARTUP, None, |_| {
-            runner
-        })
+        let ctl = start_all(
+            None,
+            ttl,
+            false,
+            None,
+            keys,
+            github,
+            STARTUP,
+            None,
+            None,
+            |_| runner,
+        )
         .await?;
         Some((ctl, gh, dir))
     }
