@@ -90,6 +90,9 @@ in
       cp -r ${../db} dirigent/db
       cp ${../openmig.toml} dirigent/openmig.toml
     '';
+    # cacert has only ca-bundle.crt, and Nix looks for ca-certificates.crt: without, a
+    # generation's writer can't fetch from cache.nixos.org
+    config.Env = [ "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" ];
   };
 
   # KubeVirt's containerDisk: the disk image at /disk, readable by its qemu (uid 107)
