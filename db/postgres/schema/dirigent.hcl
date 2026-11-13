@@ -372,6 +372,12 @@ table "dirigent.nix_paths" {
     type = bigint
     null = true
   }
+  # how many generations' writers couldn't get it
+  column "missed" {
+    type    = integer
+    null    = false
+    default = 0
+  }
   primary_key { columns = [column.path] }
 }
 

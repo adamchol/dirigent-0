@@ -854,8 +854,8 @@ impl Store {
         Ok(())
     }
 
-    /// The paths no generation has yet: those upstream signed, or (`all`) every one; the most
-    /// used first, 20000 at most.
+    /// The paths no generation has yet: those upstream signed, or (`all`) every one, that
+    /// writers missed fewer than 3 times; the most used first, 20000 at most.
     pub async fn unpromoted(&self, all: bool) -> anyhow::Result<Vec<(String, bool)>> {
         let rows = self
             .db
@@ -863,7 +863,8 @@ impl Store {
             .await
             .query(
                 "SELECT path, signed FROM dirigent.nix_paths \
-                 WHERE promoted_in IS NULL AND (signed OR $1) ORDER BY uses DESC LIMIT 20000",
+                 WHERE promoted_in IS NULL AND (signed OR $1) AND missed < 3 \
+                 ORDER BY uses DESC LIMIT 20000",
                 &[&all],
             )
             .await?;
@@ -878,6 +879,19 @@ impl Store {
             .execute(
                 "UPDATE dirigent.nix_paths SET promoted_in = $2 WHERE path = ANY($1)",
                 &[&paths, &generation],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// A generation's writer couldn't get `paths`.
+    pub async fn missed(&self, paths: &[String]) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .await
+            .execute(
+                "UPDATE dirigent.nix_paths SET missed = missed + 1 WHERE path = ANY($1)",
+                &[&paths],
             )
             .await?;
         Ok(())

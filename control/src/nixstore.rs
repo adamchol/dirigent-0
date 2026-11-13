@@ -88,6 +88,16 @@ fn deletable(written: &[u64], keep: usize, used: &HashSet<u64>) -> Vec<u64> {
         .collect()
 }
 
+/// Of `paths`, those generation `n` in `dir` has, and those it doesn't (its writer couldn't get
+/// them). A path may be a symlink into the store, so it's its own entry that counts.
+fn in_generation(dir: &Path, n: u64, paths: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let store = dir.join(format!("gen-{n}/nix/store"));
+    paths.into_iter().partition(|p| {
+        p.strip_prefix("/nix/store/")
+            .is_some_and(|name| std::fs::symlink_metadata(store.join(name)).is_ok())
+    })
+}
+
 /// What a generation's writer adds, a line each: `signed <path>` (from upstream) or
 /// `unsigned <path>` (from the players' cache).
 fn todo(paths: &[(String, bool)]) -> String {
@@ -140,10 +150,14 @@ async fn round(
                     .lines()
                     .filter_map(|l| l.split_once(' ').map(|(_, p)| p.to_string()))
                     .collect();
-                control.store.promoted(&paths, n as i64).await?;
+                // only those it got: the others are tried again
+                let (got, missed) = in_generation(dir, n, paths);
+                control.store.promoted(&got, n as i64).await?;
+                control.store.missed(&missed).await?;
                 info!(
                     generation = n,
-                    paths = paths.len(),
+                    paths = got.len(),
+                    missed = missed.len(),
                     "the shared Nix store's generation is written"
                 );
             }
@@ -219,6 +233,24 @@ mod tests {
         let used = HashSet::from([2]);
         assert_eq!(deletable(&[1, 2, 3, 4, 5], 2, &used), vec![1, 3]);
         assert!(deletable(&[1, 2], 3, &used).is_empty());
+    }
+
+    #[test]
+    fn a_generation_has_only_the_paths_its_writer_got() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("gen-3/nix/store");
+        std::fs::create_dir_all(store.join("aaa-got")).unwrap();
+        std::os::unix::fs::symlink("/nix/store/elsewhere", store.join("bbb-link")).unwrap();
+        let paths = [
+            "/nix/store/aaa-got",
+            "/nix/store/bbb-link",
+            "/nix/store/ccc-missed",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (got, missed) = in_generation(dir.path(), 3, paths);
+        assert_eq!(got, ["/nix/store/aaa-got", "/nix/store/bbb-link"]);
+        assert_eq!(missed, ["/nix/store/ccc-missed"]);
     }
 
     #[test]
