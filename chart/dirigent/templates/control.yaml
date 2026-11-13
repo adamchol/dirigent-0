@@ -232,6 +232,10 @@ spec:
               value: {{ .keep | quote }}
             {{- end }}
             {{- end }}
+            {{- range $k, $v := .Values.control.env }}
+            - name: {{ $k }}
+              value: {{ toString $v | quote }}
+            {{- end }}
             {{- with .Values.github.app }}
             {{- if .slug }}
             # the GitHub App's, for private repositories

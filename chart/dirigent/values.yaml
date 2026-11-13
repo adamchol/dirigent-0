@@ -200,6 +200,8 @@ control:
     requests: { cpu: 100m, memory: 128Mi }
   # how long a started player has to take its lease: its VM's boot and image pull
   startup: 600
+  # more of control's environment, e.g. {RUST_LOG: "control=debug", NO_COLOR: "1"}
+  env: {}
 
 chlive:
   # the published image of the flake's chlive (sha-<12 chars of its commit>; `nix flake check`

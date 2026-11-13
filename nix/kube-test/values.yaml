@@ -28,6 +28,10 @@ player:
   # one VM kept booted, which the cluster test takes
   warm:
     count: 1
+control:
+  # its logs as plain text, for kube-test e2e to read
+  env:
+    NO_COLOR: "1"
 chlive:
   cacheSize: 1Gi
 ingestion:

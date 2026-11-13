@@ -1,6 +1,7 @@
 # The test cluster's stand-ins for what a deployment brings: ClickHouse (with an embedded Keeper,
-# for the sink's KeeperMap state and the pause server) and Kafka (Redpanda), one node each, no
-# persistence. Not for anything but the test.
+# for the sink's KeeperMap state and the pause server) and Kafka (Redpanda), one node each, their
+# data on k3s's local-path volumes, so that a restart of k3s keeps the topics and Connect's and
+# the sink's state. Not for anything but the test.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -81,9 +82,12 @@ spec:
           volumeMounts:
             - { name: config, mountPath: /etc/clickhouse-server/config.d/test.xml, subPath: test.xml }
             - { name: config, mountPath: /etc/clickhouse-server/users.d/admin.xml, subPath: users.xml }
+            - { name: data, mountPath: /var/lib/clickhouse }
       volumes:
         - name: config
           configMap: { name: clickhouse }
+        - name: data
+          persistentVolumeClaim: { claimName: clickhouse-data }
 ---
 apiVersion: v1
 kind: Service
@@ -123,3 +127,26 @@ spec:
             - { containerPort: 9092 }
           readinessProbe:
             tcpSocket: { port: 9092 }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/redpanda/data }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: redpanda-data }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: clickhouse-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 4Gi }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redpanda-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 4Gi }

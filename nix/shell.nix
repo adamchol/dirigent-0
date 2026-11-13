@@ -378,12 +378,15 @@ in
       '';
     };
     kube-test = {
-      description = "The chart on a test cluster here (k3s, KubeVirt, CloudNativePG; mock players): kube-test up|install|load|down|kubectl …, see nix/kube-test/kube-test.sh";
+      description = "The chart on a test cluster here or on the test instance (k3s, KubeVirt, CloudNativePG; mock players): kube-test up|install|load|e2e|gc|remote|down|kubectl …, see nix/kube-test/kube-test.sh";
       runtimeInputs = [
         pkgs.k3s
         pkgs.kubernetes-helm
         pkgs.curl
         pkgs.util-linux
+        pkgs.awscli2
+        pkgs.rsync
+        pkgs.openssh
       ];
       text = ''exec bash ${./kube-test/kube-test.sh} "$@"'';
     };

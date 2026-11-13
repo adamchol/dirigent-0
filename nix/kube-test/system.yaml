@@ -1,0 +1,19 @@
+# With `kube-test install -f nix/kube-test/system.yaml`: the players' VMs on a system of the
+# cluster's own (built in a VM here), with the shared Nix store under theirs, a generation of it
+# written a minute after VMs added something.
+player:
+  nixos:
+    files:
+      configuration.nix: |
+        { pkgs, dirigent, ... }: {
+          imports = [ dirigent.defaults ];
+          environment.systemPackages = [ pkgs.cowsay ];
+        }
+nix:
+  shared:
+    enabled: true
+    # k3s's local-path volumes are on its one node
+    accessMode: ReadWriteOnce
+    size: 20Gi
+    every: 60
+    promote: all
