@@ -25,6 +25,10 @@ pub struct GenaiProvider {
     plan: Option<PlanTokens>,
     /// Anthropic's API key, the lease's; none, a ChatGPT plan's.
     key: Option<AnthropicKey>,
+    /// On a ChatGPT plan, the key its calls' prompts are cached under, as Codex's are: the
+    /// session. Without one, genai asks GPT-5.6 and later for explicit caching
+    /// (`prompt_cache_options`), which a plan's calls are refused with.
+    cache_key: Option<String>,
 }
 
 impl GenaiProvider {
@@ -44,12 +48,14 @@ impl GenaiProvider {
             client: builder.build()?,
             plan: None,
             key: Some(key),
+            cache_key: None,
         })
     }
 
     /// OpenAI's Responses API at `base_url` (`https://api.openai.com/v1/`; keep the `/v1/`), paid
-    /// with the ChatGPT plan whose access tokens `plan` has: each call takes the latest.
-    pub fn chatgpt(plan: PlanTokens, base_url: String) -> anyhow::Result<Self> {
+    /// with the ChatGPT plan whose access tokens `plan` has: each call takes the latest. Its
+    /// prompts are cached under `cache_key`.
+    pub fn chatgpt(plan: PlanTokens, base_url: String, cache_key: String) -> anyhow::Result<Self> {
         let tokens = plan.clone();
         let client = Client::builder()
             .with_auth_resolver_fn(move |_| Ok(tokens.current().ok().map(AuthData::from_single)))
@@ -62,12 +68,16 @@ impl GenaiProvider {
             client,
             plan: Some(plan),
             key: None,
+            cache_key: Some(cache_key),
         })
     }
 
     async fn open(&self, req: &Request) -> Result<DeltaStream, ProviderError> {
         let openai = self.plan.is_some();
-        let (chat_req, opts) = to_chat_request(req, openai);
+        let (chat_req, mut opts) = to_chat_request(req, openai);
+        if let Some(key) = &self.cache_key {
+            opts = opts.with_prompt_cache_key(key.clone());
+        }
         // the Responses adapter, whatever the model's name
         let model = match openai {
             true => format!("openai_resp::{}", req.model),
@@ -475,14 +485,30 @@ impl MapState {
                 });
             }
         }
-        // Final, parsed tool arguments win over the streamed buffer.
+        // Final, parsed tool arguments win over the streamed buffer; a call that streamed nothing
+        // (OpenAI sends parallel calls' arguments whole, with no deltas) is only here
         if let Some(content) = &end.captured_content {
             for tc in content.tool_calls() {
-                if let Some(&index) = self.tool_index.get(&tc.call_id) {
-                    let json = tool_args_json(&tc.fn_arguments);
-                    if !json.is_empty() {
-                        out.push(Delta::ToolCallArgs { index, json });
+                let index = match self.tool_index.get(&tc.call_id) {
+                    Some(&i) => i,
+                    None => {
+                        let i = self.open_block(
+                            out,
+                            ContentBlock::ToolCall {
+                                id: tc.call_id.clone(),
+                                name: tc.fn_name.clone(),
+                                input: Value::Null,
+                            },
+                            Open::Tool,
+                        );
+                        self.close(out);
+                        self.tool_index.insert(tc.call_id.clone(), i);
+                        i
                     }
+                };
+                let json = tool_args_json(&tc.fn_arguments);
+                if !json.is_empty() {
+                    out.push(Delta::ToolCallArgs { index, json });
                 }
             }
         }
@@ -1170,6 +1196,11 @@ mod tests {
                                 "input_tokens_details": { "cached_tokens": 0 },
                                 "output_tokens_details": { "reasoning_tokens": 0 } } } }),
                     ];
+                    let asked = body.0["input"].as_array().and_then(|i| i.last()).cloned();
+                    let events = match asked.is_some_and(|m| m.to_string().contains(PARALLEL)) {
+                        true => parallel_calls().to_vec(),
+                        false => events.to_vec(),
+                    };
                     let sse: String = events
                         .iter()
                         .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
@@ -1182,6 +1213,59 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await });
         Fake { url, requests }
+    }
+
+    /// What makes [`fake`] answer with [`parallel_calls`].
+    const PARALLEL: &str = "read both";
+
+    /// Two calls at once, as OpenAI sends them: each one's arguments whole, with no deltas.
+    fn parallel_calls() -> [Value; 7] {
+        let call = |n: u64, path: &str| {
+            json!({ "type": "function_call", "id": format!("fc_{n}"), "call_id": format!("call_{n}"),
+                "name": "read", "arguments": json!({ "path": path }).to_string(),
+                "status": "completed" })
+        };
+        let added = |n: u64| {
+            let mut item = call(n, "");
+            item["arguments"] = json!("");
+            item["status"] = json!("in_progress");
+            json!({ "type": "response.output_item.added", "output_index": n, "item": item })
+        };
+        let (a, b) = (call(0, "a.txt"), call(1, "b.txt"));
+        [
+            json!({ "type": "response.created",
+                "response": { "id": "r", "model": "gpt-test", "status": "in_progress", "output": [] } }),
+            added(0),
+            json!({ "type": "response.function_call_arguments.done", "item_id": "fc_0",
+                "output_index": 0, "arguments": a["arguments"] }),
+            json!({ "type": "response.output_item.done", "output_index": 0, "item": a }),
+            added(1),
+            json!({ "type": "response.output_item.done", "output_index": 1, "item": b }),
+            json!({ "type": "response.completed", "response": {
+                "id": "r", "model": "gpt-test", "status": "completed", "output": [a, b],
+                "usage": { "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+                    "input_tokens_details": { "cached_tokens": 0 },
+                    "output_tokens_details": { "reasoning_tokens": 0 } } } }),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_chatgpt_plans_parallel_calls_are_all_run() {
+        let api = fake("at-1", None).await;
+        let (tokens, _) = plan(Some("at-1"), Err("unused"));
+        let p = GenaiProvider::chatgpt(tokens, format!("{}/v1/", api.url), "s1".into()).unwrap();
+        let mut req = plan_request();
+        req.messages = vec![Message::user(PARALLEL)];
+        let done = complete(&p, &req).await.unwrap();
+        assert_eq!(done.stop_reason, StopReason::ToolUse);
+        assert_eq!(
+            done.message.content,
+            [("call_0", "a.txt"), ("call_1", "b.txt")].map(|(id, path)| ContentBlock::ToolCall {
+                id: id.into(),
+                name: "read".into(),
+                input: json!({ "path": path }),
+            })
+        );
     }
 
     /// A lease's plan tokens, `token` to begin with: asked afresh, `renewed` (control's part),
@@ -1262,7 +1346,7 @@ mod tests {
     async fn a_chatgpt_plans_call_is_renewed_once_refused_and_says_its_prompt_as_instructions() {
         let api = fake("at-2", None).await;
         let (tokens, asked) = plan(Some("at-1"), Ok("at-2"));
-        let p = GenaiProvider::chatgpt(tokens, format!("{}/v1/", api.url)).unwrap();
+        let p = GenaiProvider::chatgpt(tokens, format!("{}/v1/", api.url), "s1".into()).unwrap();
         let done = complete(&p, &plan_request()).await.unwrap();
         assert_eq!(done.message.text(), REPLY);
         assert_eq!(done.stop_reason, StopReason::EndTurn);
@@ -1274,6 +1358,7 @@ mod tests {
         let (_, body) = &requests[1];
         assert_eq!(body["model"], "gpt-test");
         assert_eq!(body["instructions"], "be brief");
+        assert_eq!(body["prompt_cache_key"], "s1");
         assert_eq!(
             (&body["store"], &body["stream"]),
             (&json!(false), &json!(true))
@@ -1290,6 +1375,7 @@ mod tests {
             "temperature",
             "max_output_tokens",
             "prompt_cache_retention",
+            "prompt_cache_options",
             "previous_response_id",
         ] {
             assert!(body.get(key).is_none(), "{key} in {body}");
@@ -1332,14 +1418,14 @@ mod tests {
         )
         .await;
         let (tokens, _) = plan(Some("at-1"), Ok("at-1"));
-        let p = GenaiProvider::chatgpt(tokens, format!("{}/v1/", api.url)).unwrap();
+        let p = GenaiProvider::chatgpt(tokens, format!("{}/v1/", api.url), "s1".into()).unwrap();
         let e = complete(&p, &plan_request()).await.unwrap_err();
         assert!(!e.retryable(), "{e:?}");
         assert!(e.to_string().contains("usage limit"), "{e}");
 
         let api = fake("at-1", None).await;
         let (tokens, _) = plan(None, Ok("at-1"));
-        let p = GenaiProvider::chatgpt(tokens, format!("{}/v1/", api.url)).unwrap();
+        let p = GenaiProvider::chatgpt(tokens, format!("{}/v1/", api.url), "s1".into()).unwrap();
         let e = complete(&p, &plan_request()).await.unwrap_err();
         assert!(
             !e.retryable() && e.to_string().contains("not linked"),
@@ -1349,7 +1435,7 @@ mod tests {
 
         // refused, and control can't renew it: why, without calling again
         let (tokens, _) = plan(Some("at-0"), Err("the ChatGPT link is broken: revoked"));
-        let p = GenaiProvider::chatgpt(tokens, format!("{}/v1/", api.url)).unwrap();
+        let p = GenaiProvider::chatgpt(tokens, format!("{}/v1/", api.url), "s1".into()).unwrap();
         let e = complete(&p, &plan_request()).await.unwrap_err();
         assert!(!e.retryable() && e.to_string().contains("revoked"), "{e}");
         assert_eq!(api.requests.lock().unwrap().len(), 1);

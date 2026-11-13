@@ -279,6 +279,7 @@ async fn main() -> anyhow::Result<()> {
             ModelProvider::Chatgpt => Arc::new(provider::genai::GenaiProvider::chatgpt(
                 lease.plan_tokens(),
                 cli.openai_base_url.clone(),
+                id.to_string(),
             )?),
         };
         let context_window = cli.context_window.unwrap_or(match spec.provider {
