@@ -20,7 +20,7 @@ fi
 }
 tag=$1
 shift
-images=(control web tools player-vm)
+images=(control web tools player-vm player)
 cd "${DNVR_ROOT:-$PWD}"
 
 if [ -n "${REGISTRY_PASSWORD:-}" ]; then

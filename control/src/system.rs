@@ -1,10 +1,11 @@
 //! The cluster's own players' system: what its VMs run when the chart has a configuration of its
 //! own (`player.nixos.files`, mounted at `--nixos-config`), built ahead of time, by the runner
-//! (a build VM: nix/vm/build.nix), once per configuration and dirigent version. A redeploy that
-//! changed neither builds nothing; a new configuration or version is built at control's start.
+//! (a build VM: nix/vm/build.nix), once per configuration and players' VM image
+//! ([`VM`]). A redeploy that changed neither builds nothing; a new configuration or image is built
+//! at control's start.
 //! Until it's built, or when it can't be, sessions run the stock image. A session whose VM didn't
 //! come up with it is started again on the stock image: if that one does, the system is broken,
-//! and stays so until the configuration or the version changes (if it doesn't either, something
+//! and stays so until the configuration or the image changes (if it doesn't either, something
 //! else is wrong). Only a runner that runs it counts ([`crate::runner::Runner::runs_systems`]).
 
 use std::collections::{BTreeMap, HashMap};
@@ -21,8 +22,9 @@ use uuid::Uuid;
 
 use crate::Control;
 
-/// dirigent's version, which a system is built for (its player is the image's).
-pub const VERSION: &str = match option_env!("DIRIGENT_VERSION") {
+/// The players' VM image a system is built for: its NixOS system's (the flake's, nix/vm); a
+/// cargo build's, its version. Not the player's, which comes on a disk of its own.
+pub const VM: &str = match option_env!("DIRIGENT_VM") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
@@ -30,7 +32,7 @@ pub const VERSION: &str = match option_env!("DIRIGENT_VERSION") {
 pub struct System {
     /// Where the configuration's files are.
     pub dir: PathBuf,
-    /// sha256 of the files (their names and contents) and [`VERSION`].
+    /// sha256 of the files (their names and contents) and [`VM`].
     pub hash: String,
     /// How long a build may take.
     timeout: Duration,
@@ -74,7 +76,7 @@ impl System {
             .with_context(|| format!("{}", dir.display()))?;
         Ok(Some(System {
             dir,
-            hash: hash(&files, VERSION),
+            hash: hash(&files, VM),
             timeout,
             ready: Mutex::new(None),
             waiting: Mutex::new(HashMap::new()),
@@ -407,7 +409,7 @@ mod tests {
             ("configuration.nix".to_string(), b"{ }".to_vec()),
             ("node.nix".to_string(), b"{ }".to_vec()),
         ]);
-        assert_eq!(system.hash, hash(&both, VERSION));
+        assert_eq!(system.hash, hash(&both, VM));
     }
 
     #[test]

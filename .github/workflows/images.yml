@@ -60,7 +60,7 @@ jobs:
         run: |
           nix build --store "$BUILD_STORE" --eval-store auto --builders "" --max-jobs 2 \
             --no-link --print-build-logs .#chart \
-            .#{control,web,tools,player-vm}-image
+            .#{control,web,tools,player-vm,player}-image
       - name: Push
         if: github.event_name != 'pull_request'
         env:

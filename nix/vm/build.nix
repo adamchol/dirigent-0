@@ -6,16 +6,14 @@
 {
   pkgs,
   nixpkgs,
-  dirigent,
 }:
 let
   # What builds the cluster's system from its configuration's files (`--arg configuration`):
-  # nix/vm/system.nix's `checked`, on this image's nixpkgs and player.
+  # nix/vm/system.nix's `checked`, on this image's nixpkgs.
   builder = pkgs.writeText "dirigent-system.nix" ''
     { configuration }:
     (import ${./.}/system.nix {
       nixpkgs = builtins.storePath "${nixpkgs}";
-      dirigent = builtins.storePath "${dirigent}";
       system = "${pkgs.stdenv.hostPlatform.system}";
     }).checked configuration
   '';

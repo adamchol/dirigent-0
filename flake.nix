@@ -31,6 +31,8 @@
       inputs.flake-parts.follows = "flake-parts";
       inputs.dnvr.follows = "dnvr";
     };
+    # the Rust builds: the workspace's dependencies once, then each binary on them
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs =
@@ -62,14 +64,31 @@
             src = inputs.chlive;
             buildInputs = old.buildInputs ++ [ pkgs.openssl ];
           });
+          # the stock players' VM's system (nix/vm), which the VM image has (images.nix); a
+          # cluster's own system is built for it, so control knows it (its store path's hash)
+          vmSystem =
+            (import ./nix/vm/system.nix {
+              inherit (inputs) nixpkgs;
+              inherit (pkgs.stdenv.hostPlatform) system;
+            }).eval
+              ./nix/vm/defaults.nix;
+          vm =
+            if pkgs.stdenv.hostPlatform.isLinux then
+              lib.substring 11 32 (
+                builtins.unsafeDiscardStringContext vmSystem.config.system.build.toplevel.outPath
+              )
+            else
+              "none";
           # the player tells its version (in its `player_attached`): the release it follows, and the
           # commit it was built from
           dirigent = pkgs.callPackage ./nix/packages/dirigent.nix {
+            craneLib = inputs.crane.mkLib pkgs;
             version = chartVersion "appVersion";
             rev = inputs.self.shortRev or inputs.self.dirtyShortRev or "dirty";
+            inherit vm;
           };
           # the CLI alone, for its users (`nix run github:adamchol/dirigent-0#cli -- login …`)
-          cli = pkgs.callPackage ./nix/packages/cli.nix { };
+          cli = pkgs.callPackage ./nix/packages/cli.nix { inherit dirigent; };
           # chlive's TS client, as the web UI takes it (web/chlive-client): its src/, and wasm/, its
           # WebAssembly core
           chliveClient = pkgs.runCommand "chlive-client" { } ''
@@ -103,6 +122,7 @@
               dirigent
               web
               openmig
+              vmSystem
               ;
             inherit (inputs) nixpkgs;
             version = chartVersion "appVersion";
@@ -122,7 +142,7 @@
             # what builds the cluster's own players' system (nix/vm/build.nix), for the dev
             # stack's control, which runs it here
             player-build = import ./nix/vm/build.nix {
-              inherit pkgs dirigent;
+              inherit pkgs;
               inherit (inputs) nixpkgs;
             };
             # the dev shell's `push-images`, without the shell (CI's)
@@ -165,9 +185,21 @@
                 '';
             # the stock players' VM, booted (KVM)
             player-vm = import ./nix/vm/test.nix {
-              inherit pkgs dirigent;
+              inherit pkgs;
               inherit (inputs) nixpkgs;
             };
+            # the player runs on its own disk, on what the VM image has: all it needs but itself
+            player-runs-on-the-image =
+              pkgs.runCommand "dirigent-player-closure-check"
+                {
+                  player = pkgs.closureInfo { rootPaths = [ dirigent.player ]; };
+                  image = pkgs.closureInfo { rootPaths = [ vmSystem.config.system.build.toplevel ]; };
+                }
+                ''
+                  missing=$(grep -vxF -f $image/store-paths $player/store-paths | grep -vxF  || true)
+                  [ -z "$missing" ] || { echo "the VM image hasn't what the player needs: $missing" >&2; exit 1; }
+                  touch $out
+                '';
             chlive-image =
               let
                 tag = "sha-${lib.substring 0 12 inputs.chlive.rev}";

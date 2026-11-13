@@ -8,13 +8,13 @@
 #   (DIRIGENT_KOPIA_TOKEN; API keys and sessions' secrets come on the lease instead);
 # - an empty disk with serial `dirigent-work`, formatted on first boot: the workspace and the
 #   player's state. Its files of any size are checkpointed, those over the log's 50 MB there alone.
+# - the player, as a disk with serial `dirigent-player` (ISO 9660: `player`, its binary, the
+#   players' image of its own, so a new player doesn't make a new VM image). It runs on the
+#   glibc and libgcc this image keeps for it (the flake checks they're the ones it needs).
 # Deleted (a node drained, the VM deleted), KubeVirt shuts the VM down and the player gets
 # SIGTERM; the VM's grace period (`terminationGracePeriodSeconds`) bounds how long it has to
 # finish the turn, checkpoint and hand the session over (its DIRIGENT_STOP_GRACE is less).
-{
-  dirigent,
-  nixpkgs,
-}:
+{ nixpkgs }:
 {
   lib,
   pkgs,
@@ -27,6 +27,8 @@ let
   work = "/var/lib/dirigent";
   # the cluster's configuration's files, in a VM building it (a ConfigMap's disk)
   nixos = "/run/dirigent/nixos";
+  # the player (its disk)
+  player = "/run/dirigent/player";
 
   # The VM's environment, for a unit's script: the user data, then each secret disk's files as
   # variables (mounted once).
@@ -46,7 +48,7 @@ let
   '';
 
   # what builds the cluster's system, in a VM control made for it
-  build = import ./build.nix { inherit pkgs nixpkgs dirigent; };
+  build = import ./build.nix { inherit pkgs nixpkgs; };
 in
 {
   imports = [
@@ -55,6 +57,11 @@ in
   ];
 
   system.stateVersion = "25.11";
+  # what the player's binary runs on (its disk has it alone)
+  system.extraDependencies = [
+    pkgs.glibc
+    pkgs.stdenv.cc.cc.lib
+  ];
   networking.hostName = "player";
   networking.useDHCP = true;
   # KubeVirt's console log (`kubectl logs <virt-launcher> -c guest-console-log`): the boot,
@@ -301,7 +308,9 @@ in
         mountpoint -q ${nixos} || mount -o ro /dev/disk/by-id/virtio-dirigent-nixos ${nixos}
         exec ${build}/bin/dirigent-build ${nixos}
       fi
-      exec ${dirigent}/bin/player --workdir ${work}/workspace --state-dir ${work}/state
+      mkdir -p ${player}
+      mountpoint -q ${player} || mount -o ro /dev/disk/by-id/virtio-dirigent-player ${player}
+      exec ${player}/player --workdir ${work}/workspace --state-dir ${work}/state
     '';
   };
 }

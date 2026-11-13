@@ -29,19 +29,25 @@ sessions' secrets come on the lease */}}
   "app.kubernetes.io/component" "player"
 }}
 {{- $root := dict "name" "root" "containerDisk" (dict "image" (include "dirigent.image" (list . "player-vm")) "imagePullPolicy" .Values.images.pullPolicy) }}
-{{- /* KubeVirt takes one, for the VM's image */}}
+{{- /* the player, on a disk of its own (nix/vm/base.nix mounts it): a new player isn't a new VM
+image */}}
+{{- $player := dict "name" "player" "containerDisk" (dict "image" (include "dirigent.image" (list . "player")) "imagePullPolicy" .Values.images.pullPolicy) }}
+{{- /* KubeVirt takes one, for each of the VM's images */}}
 {{- with .Values.images.pullSecrets }}
 {{- $_ := set $root.containerDisk "imagePullSecret" (first .) }}
+{{- $_ := set $player.containerDisk "imagePullSecret" (first .) }}
 {{- end }}
 {{- $disks := list
   (dict "name" "root" "disk" (dict "bus" "virtio"))
   (dict "name" "dirigent" "disk" (dict "bus" "virtio"))
   (dict "name" "work" "serial" "dirigent-work" "disk" (dict "bus" "virtio"))
+  (dict "name" "player" "serial" "dirigent-player" "disk" (dict "bus" "virtio"))
 }}
 {{- $volumes := list
   $root
   (dict "name" "dirigent" "cloudInitNoCloud" (dict "userData" (join "\n" $env)))
   (dict "name" "work" "emptyDisk" (dict "capacity" .Values.player.workspaceSize))
+  $player
 }}
 {{- range $i, $s := $secrets }}
 {{- $disks = append $disks (dict "name" (printf "secret%d" $i) "serial" (printf "dirigent-secret%d" $i) "disk" (dict "bus" "virtio")) }}

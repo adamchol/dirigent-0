@@ -145,10 +145,11 @@ player:
   #       }
   #     node.nix: |
   #       { pkgs, ... }: { environment.systemPackages = [ pkgs.nodejs ]; }
-  # Control builds its system when it starts, once per configuration and dirigent version (in a
-  # VM: `build`), into the cache (`nix.cache`); each session's VM then boots into it (kexec),
-  # kernel and all. While it's building, or if the build fails, sessions run the stock system. A
-  # session whose VM doesn't come up with it is started again on the stock system; if that one
+  # Control builds its system when it starts, once per configuration and players' VM image (a
+  # release that changes only dirigent's code doesn't rebuild it), in a VM (`build`), into the
+  # cache (`nix.cache`); each session's VM then boots into it (kexec), kernel and all. While
+  # it's building, or if the build fails, sessions run the stock system. A session whose VM
+  # doesn't come up with it is started again on the stock system; if that one
   # does, the system is marked broken, and the stock system runs until the configuration
   # changes. How it went: `kubectl describe configmap dirigent-player-nixos` (its Events), and
   # control's log. What dirigent needs is checked, and a configuration that takes it away fails

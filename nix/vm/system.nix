@@ -4,7 +4,6 @@
 # needs (mkForce can't keep a module from overriding anything, so that's checked from outside).
 {
   nixpkgs,
-  dirigent,
   system,
 }:
 let
@@ -16,7 +15,7 @@ let
       specialArgs.dirigent.defaults = ./defaults.nix;
       modules = [
         { nixpkgs.hostPlatform = system; }
-        (import ./base.nix { inherit dirigent nixpkgs; })
+        (import ./base.nix { inherit nixpkgs; })
         configuration
       ];
     };

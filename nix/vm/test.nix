@@ -3,7 +3,6 @@
 {
   pkgs,
   nixpkgs,
-  dirigent,
 }:
 pkgs.testers.runNixOSTest {
   name = "player-vm";
@@ -12,7 +11,7 @@ pkgs.testers.runNixOSTest {
     { lib, ... }:
     {
       imports = [
-        (import ./base.nix { inherit dirigent nixpkgs; })
+        (import ./base.nix { inherit nixpkgs; })
         ./defaults.nix
       ];
       # no KubeVirt, so no session: the player's unit runs what its commands would find

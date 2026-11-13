@@ -1,7 +1,8 @@
 # The chart's (chart/dirigent) own images, built from the flake (chlive's, the ingestion's and
 # Garage's are their projects'): `nix build .#<name>-image` gives a docker-archive, which
-# `push-images` sends to the registry (and the test cluster loads directly). The players'
-# is a KubeVirt containerDisk: a NixOS disk image (nix/vm).
+# `push-images` sends to the registry (and the test cluster loads directly). The players' VM
+# is two KubeVirt containerDisks: a NixOS disk image (nix/vm), and the player, apart, so that a
+# new player doesn't make a new NixOS image.
 {
   pkgs,
   lib,
@@ -9,6 +10,8 @@
   dirigent,
   web,
   openmig,
+  # the stock players' VM's system (nix/vm), the flake's
+  vmSystem,
   version,
 }:
 let
@@ -21,16 +24,9 @@ let
       }
       // args
     );
-
-  playerSystem =
-    (import ./vm/system.nix {
-      inherit nixpkgs dirigent;
-      inherit (pkgs.stdenv.hostPlatform) system;
-    }).eval
-      ./vm/defaults.nix;
   playerDisk = import "${nixpkgs}/nixos/lib/make-disk-image.nix" {
     inherit pkgs lib;
-    inherit (playerSystem) config;
+    inherit (vmSystem) config;
     format = "qcow2";
     partitionTableType = "legacy";
     diskSize = "auto";
@@ -46,7 +42,7 @@ in
       pkgs.kopia
     ];
     config = {
-      Entrypoint = [ (lib.getExe' dirigent "control") ];
+      Entrypoint = [ (lib.getExe dirigent.control) ];
       Env = [ "PATH=/bin" ];
     };
   };
@@ -102,6 +98,18 @@ in
     copyToRoot = pkgs.runCommand "player-vm-disk" { } ''
       mkdir -p $out/disk
       cp ${playerDisk}/nixos.qcow2 $out/disk/player.qcow2
+    '';
+  };
+
+  # the player (nix/vm/base.nix mounts it by its serial, dirigent-player): its binary, alone on an
+  # ISO 9660 disk
+  player = pkgs.dockerTools.buildImage {
+    name = "dirigent-player";
+    tag = version;
+    copyToRoot = pkgs.runCommand "player-disk" { nativeBuildInputs = [ pkgs.xorriso ]; } ''
+      mkdir -p disk $out/disk
+      cp ${lib.getExe dirigent.player} disk/player
+      xorriso -as mkisofs -quiet -rational-rock -volid DIRIGENT_PLAYER -o $out/disk/player.iso disk
     '';
   };
 }
