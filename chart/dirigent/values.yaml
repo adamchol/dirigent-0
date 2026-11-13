@@ -174,7 +174,8 @@ nix:
   # downloads) is put, now and then, in a new generation of it, which the VMs started after
   # have without fetching it again. On a volume (ReadWriteMany across nodes; ReadWriteOnce
   # only on one) that the VMs mount read-only over virtiofs, which needs KubeVirt's feature
-  # gate EnableVirtioFsStorageVolumes. It uses Nix's experimental local-overlay store.
+  # gate EnableVirtioFsStorageVolumes, and Kubernetes 1.36 (a MutatingAdmissionPolicy keeps a
+  # deleted VM's virtiofs until the VM is gone). It uses Nix's experimental local-overlay store.
   shared:
     enabled: false
     storageClass: ""

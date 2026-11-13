@@ -19,4 +19,59 @@ spec:
   resources:
     requests:
       storage: {{ .Values.nix.shared.size }}
+{{- /* KubeVirt runs each VM's virtiofsd as a plain container of its pod, which gets SIGTERM as
+soon as the VM is deleted or evicted, while the VM still has its grace period: the shared store
+would go from under it, and whatever runs from it (the player's tools, the VM's own shutdown)
+hang. This holds virtiofsd until its VM is gone: it stops by itself once QEMU lets go of it. */}}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: dirigent-{{ .Release.Namespace }}-virtiofs
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+  matchConditions:
+    - name: players-vm
+      expression: >-
+        object.metadata.?labels[?'kubevirt.io'].orValue('') == 'virt-launcher' &&
+        object.metadata.?labels[?'app.kubernetes.io/instance'].orValue('') == '{{ .Release.Name }}'
+  failurePolicy: Fail
+  reinvocationPolicy: Never
+  mutations:
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          lists.range(size(object.spec.containers))
+            .filter(i, object.spec.containers[i].name.startsWith('virtiofs-'))
+            .map(i, JSONPatch{
+              op: 'add',
+              path: '/spec/containers/' + string(i) + '/lifecycle',
+              value: Object.spec.containers.lifecycle{
+                preStop: Object.spec.containers.lifecycle.preStop{
+                  exec: Object.spec.containers.lifecycle.preStop.exec{
+                    command: ['/usr/bin/sleep', string(object.spec.terminationGracePeriodSeconds)]
+                  }
+                }
+              }
+            })
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: dirigent-{{ .Release.Namespace }}-virtiofs
+  labels:
+    {{- include "dirigent.labels" . | nindent 4 }}
+spec:
+  policyName: dirigent-{{ .Release.Namespace }}-virtiofs
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
 {{- end }}
