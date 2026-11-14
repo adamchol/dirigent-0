@@ -274,7 +274,7 @@ in
 
   scripts = stack.scripts // {
     dirigent = {
-      description = "dirigent's CLI (cli/): dirigent login <url> [--control] [--as <subject>], whoami, link chatgpt, unlink chatgpt, models, sync <session> [dir], logout";
+      description = "dirigent's CLI (cli/): dirigent login <url> [--control] [--as <subject>], whoami, link chatgpt, unlink chatgpt, models, sync <session> [dir], import claude-code|codex [<id>] [--dry-run], logout";
       text = ''
         cd "$DNVR_ROOT"
         exec cargo run -q -p dirigent-cli -- "$@"

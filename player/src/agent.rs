@@ -314,7 +314,8 @@ pub fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -
             | Event::Titled { .. }
             | Event::FilesChanged { .. }
             | Event::SecretAnswered { .. }
-            | Event::SecretsChanged { .. } => {}
+            | Event::SecretsChanged { .. }
+            | Event::Imported { .. } => {}
         }
     }
     if !open {
@@ -513,7 +514,8 @@ impl Run<'_> {
             | Event::TurnEnded { .. }
             | Event::Titled { .. }
             | Event::SecretAnswered { .. }
-            | Event::SecretsChanged { .. } => {}
+            | Event::SecretsChanged { .. }
+            | Event::Imported { .. } => {}
             // the workspace, as a tool left it: in the log, never the history
             Event::FilesChanged { .. } => {
                 self.session.publish(&ev).await;
@@ -948,7 +950,8 @@ fn log_event(ev: &Event) {
         | Event::Titled { .. }
         | Event::FilesChanged { .. }
         | Event::SecretAnswered { .. }
-        | Event::SecretsChanged { .. } => {}
+        | Event::SecretsChanged { .. }
+        | Event::Imported { .. } => {}
     }
 }
 
@@ -1238,6 +1241,7 @@ mod tests {
                 Event::FilesChanged { .. } => "files".into(),
                 Event::SecretAnswered { name, provided, .. } => format!("answer:{name}:{provided}"),
                 Event::SecretsChanged { names } => format!("secrets:{}", names.join(",")),
+                Event::Imported { from, .. } => format!("imported:{from}"),
                 Event::ModelDelta { .. } | Event::Titled { .. } => unreachable!("filtered"),
             })
             .collect()

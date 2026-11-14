@@ -2,7 +2,7 @@
 name = "dirigent-cli"
 version = "0.1.0"
 edition = "2021"
-description = "dirigent's command line: signing in, linking accounts that pay for sessions, mirroring workspaces"
+description = "dirigent's command line: signing in, linking accounts that pay for sessions, mirroring workspaces, importing other agents' sessions"
 
 [[bin]]
 name = "dirigent"
@@ -16,13 +16,14 @@ futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process", "signal", "sync"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 base64 = "0.22"
 sha2 = "0.10"
 rand = "0.9"
 rpassword = "7"
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"

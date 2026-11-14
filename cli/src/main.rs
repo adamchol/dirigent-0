@@ -6,6 +6,7 @@
 mod api;
 mod credentials;
 mod google;
+mod import;
 mod loopback;
 mod oauth;
 mod sync;
@@ -92,6 +93,38 @@ enum Command {
         #[arg(long)]
         once: bool,
     },
+    /// Make another agent's session here a dirigent session that goes on from where it was:
+    /// its conversation (thinking kept to read, secrets redacted), on the project's git remote
+    /// with the files as they are here. Not started: your next message starts it.
+    Import {
+        agent: ImportAgent,
+        /// Its id (or its transcript's path); by default the last one of this directory.
+        session: Option<String>,
+        /// The project, when it isn't where the session worked.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// The model it goes on with; by default the one it had.
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<ImportEffort>,
+        /// Who its model calls are paid to; by default the agent's (Claude Code: Anthropic;
+        /// Codex: your ChatGPT plan).
+        #[arg(long)]
+        provider: Option<ImportProvider>,
+        /// Show what would be imported, and import nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Import it into a new session, though it was imported before.
+        #[arg(long)]
+        again: bool,
+        /// Keep what looks like secrets as it is.
+        #[arg(long)]
+        no_redact: bool,
+        /// chlive's WebSocket, when signed in to control's own API (`login --control`).
+        #[arg(long, env = "DIRIGENT_CHLIVE")]
+        chlive: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -100,6 +133,28 @@ enum Account {
     Chatgpt,
     /// An Anthropic API key, which your Anthropic sessions run on rather than the install's.
     Anthropic,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ImportAgent {
+    /// Claude Code (~/.claude/projects).
+    ClaudeCode,
+    /// Codex (~/.codex/sessions).
+    Codex,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ImportEffort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ImportProvider {
+    Anthropic,
+    Chatgpt,
 }
 
 #[derive(Subcommand)]
@@ -359,6 +414,44 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             chlive,
             once,
         } => sync::sync(Api::signed_in(http)?, &session, dir, chlive, once).await?,
+        Command::Import {
+            agent,
+            session,
+            dir,
+            model,
+            effort,
+            provider,
+            dry_run,
+            again,
+            no_redact,
+            chlive,
+        } => {
+            use dirigent_protocol::control::{Effort, Provider};
+            let ask = import::Import {
+                agent: match agent {
+                    ImportAgent::ClaudeCode => import::Agent::ClaudeCode,
+                    ImportAgent::Codex => import::Agent::Codex,
+                },
+                session,
+                dir,
+                model,
+                effort: effort.map(|e| match e {
+                    ImportEffort::Low => Effort::Low,
+                    ImportEffort::Medium => Effort::Medium,
+                    ImportEffort::High => Effort::High,
+                    ImportEffort::Max => Effort::Max,
+                }),
+                provider: provider.map(|p| match p {
+                    ImportProvider::Anthropic => Provider::Anthropic,
+                    ImportProvider::Chatgpt => Provider::Chatgpt,
+                }),
+                dry_run,
+                again,
+                redact: !no_redact,
+                chlive,
+            };
+            import::import(Api::signed_in(http)?, ask).await?
+        }
     }
     Ok(())
 }

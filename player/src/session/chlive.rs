@@ -1139,6 +1139,108 @@ mod e2e {
     }
 
     #[tokio::test]
+    async fn e2e_an_imported_claude_code_session_goes_on_with_its_projects_files() {
+        let Some(stack) = stack() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        // the project: a clone, with a change and a new file not committed
+        let url = workspace::tests::repo(tmp.path());
+        let project = tmp.path().join("project");
+        let cloned = std::process::Command::new("git")
+            .args(["clone", "-q", &url])
+            .arg(&project)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(cloned.success());
+        std::fs::write(project.join("file"), "changed\n").unwrap();
+        std::fs::write(project.join("new.txt"), "not committed\n").unwrap();
+        // its Claude Code session, which named itself
+        let claude = tmp.path().join("claude");
+        let id = new_id();
+        let transcript = claude.join(format!("projects/p/{id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let cwd = project.display().to_string();
+        let lines = [
+            serde_json::json!({ "type": "user", "uuid": "u1", "parentUuid": null, "cwd": cwd,
+                "sessionId": id, "timestamp": "2026-11-01T10:00:00.000Z",
+                "message": { "role": "user", "content": "look at the file" } }),
+            serde_json::json!({ "type": "assistant", "uuid": "r1", "parentUuid": "u1",
+                "timestamp": "2026-11-01T10:00:05.000Z",
+                "message": { "id": "m1", "model": "claude-opus-5-5", "role": "assistant",
+                    "stop_reason": "end_turn",
+                    "content": [{ "type": "thinking", "thinking": "hm", "signature": "s" },
+                                { "type": "text", "text": "It says main." }] } }),
+            serde_json::json!({ "type": "ai-title", "aiTitle": "Looking at the file" }),
+        ];
+        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        std::fs::write(&transcript, text.join("\n")).unwrap();
+        let creds = tmp.path().join("credentials.json");
+        let signed_in =
+            serde_json::json!({ "api": stack.control, "mode": "declared", "subject": USER });
+        std::fs::write(&creds, signed_in.to_string()).unwrap();
+        let import = || {
+            std::process::Command::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../target/debug/dirigent"
+            ))
+            .args(["import", "claude-code", &id, "--chlive", &stack.chlive])
+            .env("DIRIGENT_CREDENTIALS", &creds)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .output()
+            .expect("the CLI (`e2e` builds it)")
+        };
+        let out = import();
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "{said}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let session = said
+            .lines()
+            .find_map(|l| l.strip_prefix("Imported as "))
+            .unwrap_or_else(|| panic!("{said}"))
+            .to_string();
+        // once
+        let again = import();
+        assert!(!again.status.success());
+        assert!(String::from_utf8_lossy(&again.stderr).contains("already imported as"));
+
+        let log = log_until(&stack, &session, |r| r.iter().any(|r| r.kind == "imported")).await;
+        assert!(log.iter().all(|r| r.author == format!("import:{session}")));
+        let kinds: Vec<&str> = log.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "user_message",
+                "turn_started",
+                "assistant_message",
+                "turn_ended",
+                "titled",
+                "imported"
+            ]
+        );
+
+        // its player goes on from there, on the project as it was
+        let player = start(&stack, &session).await;
+        let user = User::new(&stack, &session);
+        user.say("!cat new.txt").await;
+        let log = log_until(&stack, &session, |r| turns_ended(r) == 2).await;
+        let result = log.iter().find(|r| r.kind == "tool_result").unwrap();
+        let Event::ToolResult { content, .. } = result.event().unwrap() else {
+            panic!("{result:?}")
+        };
+        assert!(content.contains("not committed"), "{content}");
+        assert_eq!(
+            std::fs::read_to_string(player.dir.path().join("file")).unwrap(),
+            "changed\n"
+        );
+        // named on import, so not named again
+        assert_eq!(log.iter().filter(|r| r.kind == "titled").count(), 1);
+        player.stop().await;
+    }
+
+    #[tokio::test]
     async fn e2e_a_player_on_a_new_machine_restores_the_last_checkpoint() {
         let Some(stack) = stack() else { return };
         let repos = tempfile::tempdir().unwrap();

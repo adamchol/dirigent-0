@@ -82,7 +82,7 @@ data:
     user = "author"
     key = "session_id"
     rows = [
-      { column = "session_id", provider = "pg", grants = "SELECT session_id FROM session_access WHERE subject = {subject:String} AND role IN ('owner', 'player')" },
+      { column = "session_id", provider = "pg", grants = "SELECT session_id FROM session_access WHERE subject = {subject:String} AND role IN ('owner', 'player', 'importer')" },
       { column = "kind", provider = "pg", grants = "SELECT kind FROM insert_kinds WHERE subject = {subject:String}" },
     ]
 

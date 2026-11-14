@@ -48,7 +48,7 @@ use uuid::Uuid;
 
 use crate::chatgpt::{ChatGpt, ChatGptArgs, LinkInfo, Model, Started as LinkStarted};
 use crate::github::{Github, GithubArgs, Repo, GITHUB_TOKEN};
-use crate::leases::{Acquire, Archive, Delete, Put, Reserve, Scope, Store};
+use crate::leases::{Acquire, Archive, Delete, Import, Put, Reserve, Scope, Store};
 use crate::machines::{MachineArgs, Machines, Partial};
 use crate::prune::{PruneArgs, Pruner};
 use crate::runner::{Kube, Local, Runner};
@@ -450,6 +450,10 @@ fn router(control: &'static Control) -> Router {
         .route("/sessions/{id}/stop", post(stop_session))
         .route("/sessions/{id}/archive", post(archive_session))
         .route("/sessions/{id}/unarchive", post(unarchive_session))
+        .route(
+            "/sessions/{id}/import",
+            post(start_import).delete(finish_import),
+        )
         .route(
             "/sessions/{id}/viewers/{subject}",
             axum::routing::put(add_viewer).delete(remove_viewer),
@@ -1088,6 +1092,8 @@ enum Started {
     Unknown,
     /// It's archived: no player takes it until it's unarchived.
     Archived,
+    /// Its conversation is being imported: no player takes it until that's done.
+    Importing,
     /// There's no runner to start players with.
     NoRunner,
 }
@@ -1100,6 +1106,7 @@ impl From<Reserve> for Started {
             Reserve::Held => Started::Active,
             Reserve::Unknown => Started::Unknown,
             Reserve::Archived => Started::Archived,
+            Reserve::Importing => Started::Importing,
         }
     }
 }
@@ -1322,6 +1329,9 @@ fn started(id: Uuid, r: anyhow::Result<Started>) -> Result<(), Failed> {
         Ok(Started::Active) => Ok(()),
         Ok(Started::Unknown) => Err(not_found()),
         Ok(Started::Archived) => Err((StatusCode::CONFLICT, "the session is archived".into())),
+        Ok(Started::Importing) => {
+            Err((StatusCode::CONFLICT, "the session is being imported".into()))
+        }
         Ok(Started::NoRunner) => Err((
             StatusCode::NOT_IMPLEMENTED,
             "control runs no players (no --players)".into(),
@@ -1426,6 +1436,49 @@ async fn delete_session(
         )),
         Ok(Delete::Unknown) => Err(not_found()),
         Err(e) => Err(failed(&format!("deleting the session {id}"), e)),
+    }
+}
+
+/// Import a conversation from elsewhere into the session, the caller's, which no player has held
+/// yet: a token for chlive as its importer (`import:<id>`), who may write its conversation and
+/// workspace files, and for whom no player takes the session until `DELETE …/import`. Asked
+/// again, another token.
+async fn start_import(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, Failed> {
+    let importer = format!("import:{id}");
+    match control.store.import(id, &caller, &importer).await {
+        Ok(Import::Importing) => {}
+        Ok(Import::Unknown) => return Err(not_found()),
+        // as for anything of another's: there's none
+        Ok(Import::NotOwner) => return Err(not_found()),
+        Ok(Import::Played) => {
+            return Err((
+                StatusCode::CONFLICT,
+                "the session has run: only a new one is imported into".into(),
+            ))
+        }
+        Err(e) => return Err(failed(&format!("importing into the session {id}"), e)),
+    }
+    let token = control.auth.signer.sign(&importer, &[CHLIVE], None);
+    Ok(Json(serde_json::json!({ "token": token })))
+}
+
+/// The session's import is done (or given up): players may take it.
+async fn finish_import(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, Failed> {
+    owned(control, id, &caller).await?;
+    match control.store.imported(id).await {
+        Ok(()) => {
+            info!(session = %id, "session imported");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) => Err(failed(&format!("finishing the import of {id}"), e)),
     }
 }
 
@@ -2961,6 +3014,55 @@ mod e2e {
         );
         assert_eq!(info(&base, s).await.archived, None);
         assert_eq!(acquire(&mut b, s, "b", None).await, acquired(2));
+    }
+
+    #[tokio::test]
+    async fn e2e_a_session_being_imported_takes_no_player_until_its_import_is_done() {
+        let runner = recorder(false);
+        let Some(base) = start_recording(runner).await else {
+            return;
+        };
+        let s = Uuid::new_v4();
+        put(&base, s).await;
+        let path = format!("/sessions/{s}/import");
+        let (status, body) = send_json(
+            &base,
+            A,
+            reqwest::Method::POST,
+            &path,
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        let token: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(token["token"].as_str().is_some_and(|t| !t.is_empty()));
+        assert_eq!(
+            post_as(B, &base, &path, None).await,
+            reqwest::StatusCode::NOT_FOUND
+        );
+        let start = format!("/sessions/{s}/start");
+        assert_eq!(
+            post(&base, &start, None).await,
+            reqwest::StatusCode::CONFLICT
+        );
+        let mut a = connect(&base).await;
+        assert_eq!(acquire(&mut a, s, "a", None).await, HELD);
+        assert!(runner.of(s).is_empty());
+
+        assert_eq!(
+            delete(&base, B, &path).await,
+            reqwest::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            delete(&base, A, &path).await,
+            reqwest::StatusCode::NO_CONTENT
+        );
+        assert_eq!(acquire(&mut a, s, "a", None).await, acquired(1));
+        // a session that ran has a log of its own
+        assert_eq!(
+            post(&base, &path, None).await,
+            reqwest::StatusCode::CONFLICT
+        );
     }
 
     /// A row of `session`'s log, put straight into the stack's ClickHouse (as the sink would).

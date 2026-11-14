@@ -276,3 +276,29 @@ test("the chat shows the conversation alone, its activity too, or all its events
   const cp = all.find((i) => i.t === "note" && i.kind === "checkpoint");
   expect(cp?.t === "note" && cp.detail).toContain("checkpoint at 2026-11-03 12:00:00.000 by player:p");
 });
+
+test("an imported conversation is marked where it ends, shown even with the conversation alone", () => {
+  const t = timeline(
+    [
+      row("m", "user_message", { text: "look" }, "import:s"),
+      row("t", "turn_started", { input: "m" }, "import:s"),
+      row("e", "turn_ended", { reason: "completed" }, "import:s"),
+      row(
+        "i",
+        "imported",
+        { from: "claude-code", session: "cc", cwd: "/p", first: "2026-11-01T10:00:00Z", last: "2026-11-02T09:00:00Z" },
+        "import:s",
+      ),
+    ],
+    "conversation",
+  );
+  expect(t.items.at(-1)).toEqual({
+    t: "note",
+    key: "i",
+    kind: "imported",
+    tone: "mark",
+    text: "imported from Claude Code · 2026-11-01 to 2026-11-02",
+    detail: "Its session cc, in /p. The times above are the import's.",
+  });
+  expect(t.items[0]).toMatchObject({ t: "user", author: "import:s", queued: false });
+});

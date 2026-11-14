@@ -134,7 +134,7 @@ async fn checkout(
 }
 
 /// chlive's WebSocket, beside control's API at the web's `/api`: its `/live`.
-fn live(api: &str) -> anyhow::Result<String> {
+pub(crate) fn live(api: &str) -> anyhow::Result<String> {
     let base = api.strip_suffix("/api").context(
         "signed in to control's own API, so chlive's address isn't known: give it with --chlive",
     )?;

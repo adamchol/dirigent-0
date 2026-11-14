@@ -70,7 +70,8 @@ impl Fold {
             | Event::ToolResult { .. }
             | Event::Titled { .. }
             | Event::FilesChanged { .. }
-            | Event::SecretsChanged { .. } => Some(ev.clone()),
+            | Event::SecretsChanged { .. }
+            | Event::Imported { .. } => Some(ev.clone()),
         }
     }
 

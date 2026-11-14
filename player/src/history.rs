@@ -122,6 +122,14 @@ impl Entry {
                     head.as_ref().map_or(String::new(), |h| format!(" at {h}"))
                 ),
             }),
+            Event::Imported { from, cwd, .. } => Some(Entry::Note {
+                text: format!(
+                    "[The conversation so far happened in {}, working in {cwd}. It goes on here: \
+                     the project is this workspace now, so paths under {cwd} are under the \
+                     working directory instead, and only the tools you have now can be called.]",
+                    agent_name(from)
+                ),
+            }),
             Event::PlayerAttached { .. }
             | Event::PlayerDetached { .. }
             | Event::WorkspaceReady { .. }
@@ -209,11 +217,15 @@ impl History {
     /// it was thought after what the summary replaces, so it's no longer this conversation's,
     /// and Anthropic's newer models refuse it (on accounts from 2026-08-31 on).
     fn compact(&mut self, id: &str, summary: &str, first_kept: &str) {
-        let keep = self
-            .entries
-            .iter()
-            .position(|(id, _)| id == first_kept)
-            .unwrap_or(0);
+        // its own id: nothing before it is kept
+        let keep = match first_kept == id {
+            true => self.entries.len(),
+            false => self
+                .entries
+                .iter()
+                .position(|(id, _)| id == first_kept)
+                .unwrap_or(0),
+        };
         let mut files = Files::default();
         for (_, entry) in self.entries.drain(..keep) {
             files.add(&entry);
@@ -362,6 +374,15 @@ impl History {
         }
         flush(&mut out, &mut results, &mut texts, &calls);
         merge_adjacent(out)
+    }
+}
+
+/// An agent a conversation was imported from, by its name in [`Event::Imported`].
+fn agent_name(from: &str) -> &str {
+    match from {
+        "claude-code" => "Claude Code",
+        "codex" => "Codex",
+        other => other,
     }
 }
 
@@ -547,6 +568,43 @@ mod tests {
         assert!(text.starts_with("[The workspace"), "{text}");
         assert!(text.contains("recreated from its source at abc"), "{text}");
         assert!(text.ends_with('b'), "{text}");
+    }
+
+    #[test]
+    fn an_imported_conversation_goes_on_with_a_note_and_a_compaction_may_keep_nothing() {
+        let msgs = messages(&[
+            user("a"),
+            assistant(vec![text("ok")], StopReason::EndTurn),
+            ended(TurnEndReason::Completed),
+            // its own id: what's before is all summarized
+            compacted("S", "e3"),
+            user("b"),
+            assistant(vec![text("ok")], StopReason::EndTurn),
+            ended(TurnEndReason::Completed),
+            Event::Imported {
+                from: "claude-code".into(),
+                session: "x".into(),
+                cwd: "/home/me/p".into(),
+                first: String::new(),
+                last: String::new(),
+            },
+            user("c"),
+        ]);
+        // "a" and its reply are gone
+        assert_eq!(msgs.len(), 3, "{msgs:?}");
+        let first = msgs[0].text();
+        assert!(
+            first.contains("<summary>\nS\n</summary>") && first.ends_with('b'),
+            "{first}"
+        );
+        let last = msgs[2].text();
+        assert!(
+            last.starts_with(
+                "[The conversation so far happened in Claude Code, working in /home/me/p."
+            ),
+            "{last}"
+        );
+        assert!(last.ends_with('c'), "{last}");
     }
 
     #[test]

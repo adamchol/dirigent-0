@@ -171,9 +171,9 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         compact: bool,
     },
-    /// From the player: `summary` replaces the conversation before the handled event
-    /// `first_kept`, which is kept as it was along with everything after it. `usage` is the
-    /// summary call's.
+    /// From the player (or an importer): `summary` replaces the conversation before the handled
+    /// event `first_kept`, which is kept as it was along with everything after it; when
+    /// `first_kept` is this event's own id, all of it. `usage` is the summary call's.
     Compacted {
         summary: String,
         first_kept: String,
@@ -241,6 +241,16 @@ pub enum Event {
     /// From the player: the names of the secrets the session now has (its tools' environment),
     /// as they changed while it held the session. Never their values.
     SecretsChanged { names: Vec<String> },
+    /// From an importer, after the conversation it wrote before any player held the session:
+    /// it was `from` another agent's session `session` (`claude-code`, `codex`), which worked in
+    /// `cwd` from `first` to `last` (RFC 3339), the times the rows before don't have.
+    Imported {
+        from: String,
+        session: String,
+        cwd: String,
+        first: String,
+        last: String,
+    },
 }
 
 impl Event {
@@ -270,6 +280,7 @@ impl Event {
         "files_changed",
         "secret_answered",
         "secrets_changed",
+        "imported",
     ];
 
     /// An input's text, as the model reads it: a user's message, a session update, or an answer
@@ -356,7 +367,8 @@ mod tests {
             | Event::Titled { .. }
             | Event::FilesChanged { .. }
             | Event::SecretAnswered { .. }
-            | Event::SecretsChanged { .. } => e.kind(),
+            | Event::SecretsChanged { .. }
+            | Event::Imported { .. } => e.kind(),
         };
         let s = String::new;
         let usage = Usage::default();
@@ -447,6 +459,13 @@ mod tests {
                 call: s(),
             },
             Event::SecretsChanged { names: vec![] },
+            Event::Imported {
+                from: s(),
+                session: s(),
+                cwd: s(),
+                first: s(),
+                last: s(),
+            },
         ];
         let kinds: Vec<String> = events.iter().map(one).collect();
         assert_eq!(kinds, Event::KINDS);

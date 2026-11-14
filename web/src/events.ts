@@ -76,7 +76,10 @@ export type Event =
   | { kind: "titled"; data: Named }
   /** The owner's answer to a dirigent's `request_secret` call `call`: never the value. */
   | { kind: "secret_answered"; data: { session: string; name: string; provided: boolean; call: string } }
-  | { kind: "secrets_changed"; data: { names: string[] } };
+  | { kind: "secrets_changed"; data: { names: string[] } }
+  /** The conversation before it was another agent's session (`from`), which worked in `cwd` from
+   * `first` to `last`: its rows have the time it was imported. */
+  | { kind: "imported"; data: { from: string; session: string; cwd: string; first: string; last: string } };
 
 /** What a session is called and is about, by its player or (`hold`ing it) its owner. */
 export interface Named {
@@ -107,8 +110,11 @@ export type Item =
       answer?: "provided" | "declined";
     }
   | { t: "turn"; key: string; reason: string; interrupted: boolean; usage: Usage }
-  /** Anything else: `dim` for the player's own doings, `error` for failures. */
-  | { t: "note"; key: string; kind: string; tone: "dim" | "error"; text: string; detail?: string };
+  /** Anything else: `dim` for the player's own doings, `mark` for what the conversation should show
+   * too, `error` for failures. */
+  | { t: "note"; key: string; kind: string; tone: Tone; text: string; detail?: string };
+
+export type Tone = "dim" | "mark" | "error";
 
 export interface Timeline {
   items: Item[];
@@ -137,6 +143,9 @@ export function parse(row: EventRow): Event {
 export type Shown = "conversation" | "activity" | "all";
 
 /** Events shown as their own items, not notes: under `all`, each gets a note of its own too. */
+/** The agents sessions are imported from, by their names in `imported`. */
+const AGENTS: Record<string, string> = { "claude-code": "Claude Code", codex: "Codex" };
+
 const ITEMS = new Set(["user_message", "session_update", "turn_started", "steered", "user_interrupt", "assistant_message", "tool_result", "turn_ended"]);
 
 /** The log's rows, in order, as a timeline, `shown` as much of it as the user wants. */
@@ -147,7 +156,7 @@ export function timeline(rows: readonly EventRow[], shown: Shown = "activity"): 
   const requests = new Map<string, Extract<Item, { t: "request" }>>();
   let openTurn: string | undefined;
   let usage = NO_USAGE;
-  const note = (row: EventRow, tone: "dim" | "error", text: string, detail?: string) => {
+  const note = (row: EventRow, tone: Tone, text: string, detail?: string) => {
     if (tone === "dim" && shown === "conversation") return;
     if (shown === "all") detail = [detail, raw(row)].filter(Boolean).join("\n\n");
     items.push({ t: "note", key: row.id, kind: row.kind, tone, text, detail });
@@ -309,6 +318,13 @@ export function timeline(rows: readonly EventRow[], shown: Shown = "activity"): 
       case "secrets_changed":
         note(row, "dim", `secrets: ${e.data.names.join(", ") || "none"}`);
         break;
+      case "imported": {
+        const from = AGENTS[e.data.from] ?? e.data.from;
+        const day = (t: string) => t.slice(0, 10);
+        const when = day(e.data.first) === day(e.data.last) ? day(e.data.first) : `${day(e.data.first)} to ${day(e.data.last)}`;
+        note(row, "mark", `imported from ${from} · ${when}`, `Its session ${e.data.session}, in ${e.data.cwd}. The times above are the import's.`);
+        break;
+      }
       default:
         note(row, "dim", (e as { kind: string }).kind);
     }

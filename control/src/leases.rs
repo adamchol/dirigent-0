@@ -59,6 +59,18 @@ pub enum Reserve {
     Held,
     Unknown,
     Archived,
+    /// Its conversation is being imported.
+    Importing,
+}
+
+/// What letting an importer write a session's conversation did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Import {
+    Importing,
+    Unknown,
+    NotOwner,
+    /// A player has held it: its log is a session's of its own.
+    Played,
 }
 
 /// What deleting a session did.
@@ -248,6 +260,10 @@ impl Store {
         if row.get::<_, bool>(2) {
             return Ok(Acquire::Archived);
         }
+        // its importer holds it, as a player would
+        if importing(&tx, session).await? {
+            return Ok(Acquire::Held);
+        }
         let epoch: i64 = row.get(0);
         let spec: SessionSpec = serde_json::from_value(row.get(1))?;
         let owner: String = tx
@@ -303,6 +319,51 @@ impl Store {
         };
         tx.commit().await?;
         Ok(got)
+    }
+
+    /// Let `importer` write the conversation of the session `id`, `owner`'s, which no player has
+    /// held yet (so no player takes it until [`Store::imported`]).
+    pub async fn import(&self, id: Uuid, owner: &str, importer: &str) -> anyhow::Result<Import> {
+        let mut db = self.db.lock().await;
+        let tx = db.transaction().await?;
+        let Some(row) = tx
+            .query_opt(
+                "SELECT s.epoch, o.subject FROM dirigent.sessions s \
+                 LEFT JOIN dirigent.session_access o ON o.session_id = s.id AND o.role = 'owner' \
+                 WHERE s.id = $1 FOR UPDATE OF s",
+                &[&id],
+            )
+            .await?
+        else {
+            return Ok(Import::Unknown);
+        };
+        if row.get::<_, Option<&str>>(1) != Some(owner) {
+            return Ok(Import::NotOwner);
+        }
+        if row.get::<_, i64>(0) > 0 {
+            return Ok(Import::Played);
+        }
+        tx.execute(
+            "INSERT INTO dirigent.session_access (session_id, subject, role) \
+             VALUES ($1, $2, 'importer') ON CONFLICT DO NOTHING",
+            &[&id, &importer],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Import::Importing)
+    }
+
+    /// The session `id`'s importer is done: players may take it.
+    pub async fn imported(&self, id: Uuid) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .await
+            .execute(
+                "DELETE FROM dirigent.session_access WHERE session_id = $1 AND role = 'importer'",
+                &[&id],
+            )
+            .await?;
+        Ok(())
     }
 
     /// `subject` gives its lease on `session` back.
@@ -387,6 +448,9 @@ impl Store {
             None => return Ok(Reserve::Unknown),
             Some(true) => return Ok(Reserve::Archived),
             Some(false) => {}
+        }
+        if importing(&tx, session).await? {
+            return Ok(Reserve::Importing);
         }
         let held = tx
             .query_opt(
@@ -1207,6 +1271,18 @@ fn session_info(row: &Row) -> anyhow::Result<SessionInfo> {
         secrets: row.get(9),
         archived: row.get(10),
     })
+}
+
+/// Whether an importer writes `session`'s conversation.
+async fn importing(tx: &tokio_postgres::Transaction<'_>, session: Uuid) -> anyhow::Result<bool> {
+    let row = tx
+        .query_one(
+            "SELECT EXISTS (SELECT FROM dirigent.session_access \
+             WHERE session_id = $1 AND role = 'importer')",
+            &[&session],
+        )
+        .await?;
+    Ok(row.get(0))
 }
 
 fn role(r: &str) -> Role {

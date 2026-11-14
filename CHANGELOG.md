@@ -2,6 +2,20 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
+## Unreleased
+
+### Added
+- `dirigent import claude-code|codex [<id>]` makes another agent's session a dirigent session that goes on from where it was. Without an id, it takes the last session of the current directory.
+  - The conversation goes into the new session's log: turns, replies, tool calls and results, compactions and the title. Thinking is kept to read but never sent to a model again. Tools dirigent doesn't have stay in the history as they were called.
+  - The workspace is the project's git remote and branch, with the project's files as they are on your machine on top: uncommitted changes and untracked files too, not ignored ones.
+  - What looks like a key or token is redacted, in the conversation and in the files git doesn't have as committed. `--no-redact` keeps it.
+  - `--dry-run` shows what would be imported. Importing the same session again says where it went; `--again` makes another session.
+  - The session isn't started: your next message starts it.
+- Codex sessions are read from Codex's rollout format, which hasn't been tried on a real Codex session yet.
+
+### Notes
+- An imported session's rows carry the time of the import. The web marks where the imported conversation ends, with the dates it really had.
+
 ## 0.1.8 (2026-11-14)
 
 ### Changed

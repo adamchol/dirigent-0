@@ -12,6 +12,7 @@ import {
   ClockIcon,
   FolderGitIcon,
   HistoryIcon,
+  ImportIcon,
   InfoIcon,
   KeyRoundIcon,
   MinimizeIcon,
@@ -38,7 +39,7 @@ import {
   TraceLine,
   TraceTitle,
 } from "@/components/ui/trace";
-import type { Item, Streamed, Usage } from "./events.ts";
+import type { Item, Streamed, Tone, Usage } from "./events.ts";
 import type { Request } from "./Secrets.tsx";
 import { Markdown } from "./Markdown.tsx";
 import { describe, ToolDetail } from "./Tools.tsx";
@@ -234,6 +235,8 @@ function Entry(props: {
                     {b.via.slice(0, 8)}
                   </a>
                 </span>
+              ) : b.author.startsWith("import:") ? (
+                "Imported"
               ) : b.author === props.me ? (
                 "You"
               ) : (
@@ -378,9 +381,10 @@ const NOTE_ICONS: Record<string, React.ReactNode> = {
   workspace_restored: <RefreshCwIcon />,
   checkpoint: <CameraIcon />,
   compacted: <MinimizeIcon />,
+  imported: <ImportIcon />,
 };
 
-function Note(props: { kind: string; tone: "dim" | "error"; text: string; detail?: string }) {
+function Note(props: { kind: string; tone: Tone; text: string; detail?: string }) {
   const icon = props.tone === "error" ? <TriangleAlertIcon /> : (NOTE_ICONS[props.kind] ?? <InfoIcon />);
   const tone = props.tone === "error" ? "text-destructive" : "text-muted-foreground/80";
   if (!props.detail)

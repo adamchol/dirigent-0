@@ -22,8 +22,9 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
 /// The session's log, once the workspace in `workdir` is made from `source`: with the event that
 /// says so appended, if there's one; or why it can't be made (which the player reports as it
 /// fails). And the workspace's mirror (its repository in `mirror`), made from the log and
-/// brought up to date: a workspace restored from a checkpoint becomes the log's last commit, and
-/// what's changed since is committed. Without git, the workspace isn't mirrored.
+/// brought up to date: a workspace restored from a checkpoint, or made for the first time while
+/// the log has files already (an import's), becomes the log's last commit, and what's changed
+/// since is committed. Without git, the workspace isn't mirrored.
 pub async fn open(
     session: &mut dyn Session,
     workdir: &'static Path,
@@ -38,7 +39,14 @@ pub async fn open(
         Ok(None) => {}
         Ok(Some(ev)) => {
             info!(?ev, "workspace in place");
-            restored = matches!(ev, Event::WorkspaceRestored { .. });
+            restored = matches!(
+                ev,
+                Event::WorkspaceRestored { .. }
+                    | Event::WorkspaceReady {
+                        recreated: false,
+                        ..
+                    }
+            );
             let id = session.publish(&ev).await;
             log.push((id, ev));
         }
@@ -54,7 +62,7 @@ pub async fn open(
     };
     if restored {
         if let Err(e) = mirror.restore().await {
-            warn!("the workspace stays as its checkpoint has it: {e:#}");
+            warn!("the workspace stays as it was made: {e:#}");
         }
     }
     for ev in mirror.snapshot("the player starts").await {
@@ -568,5 +576,78 @@ pub(crate) mod tests {
             panic!("{more:?}");
         };
         assert_eq!(parent.as_ref(), Some(commit));
+    }
+
+    #[tokio::test]
+    async fn an_imported_workspace_is_its_source_with_the_files_from_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = repo(tmp.path());
+        // the local working tree the import carried: a file changed, one deleted, one new
+        let local = tmp.path().join("work");
+        std::fs::write(local.join("file"), "changed\n").unwrap();
+        std::fs::write(local.join("new"), "n").unwrap();
+        let repo = dirigent_sync::Repo::open(&tmp.path().join("cli"))
+            .await
+            .unwrap();
+        let mut files = dirigent_sync::Workspace::new(&local);
+        let snapshot = repo
+            .snapshot(&mut files, None, "imported")
+            .await
+            .unwrap()
+            .unwrap();
+        let files = dirigent_sync::events(&snapshot);
+
+        let work = tmp.path().join("ws");
+        std::fs::create_dir(&work).unwrap();
+        let mut session = Logged {
+            log: Vec::new(),
+            files: files.clone(),
+            published: Vec::new(),
+        };
+        let source = git_source(&url, None);
+        open(
+            &mut session,
+            leak(&work),
+            Some(&source),
+            None,
+            &tmp.path().join("mirror"),
+            Secrets::none(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&session.published[..], [Event::WorkspaceReady { .. }]),
+            "cloned, and nothing new to mirror: {:?}",
+            session.published
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.join("file")).unwrap(),
+            "changed\n"
+        );
+        assert_eq!(std::fs::read_to_string(work.join("new")).unwrap(), "n");
+        // on the source's history
+        assert!(work.join(".git").is_dir());
+
+        // a later start leaves it as the session made it
+        std::fs::write(work.join("file"), "later\n").unwrap();
+        let mut again = Logged {
+            log: vec![("e0".into(), session.published[0].clone())],
+            files,
+            published: Vec::new(),
+        };
+        open(
+            &mut again,
+            leak(&work),
+            Some(&source),
+            None,
+            &tmp.path().join("mirror2"),
+            Secrets::none(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(work.join("file")).unwrap(),
+            "later\n"
+        );
     }
 }

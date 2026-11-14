@@ -14,6 +14,7 @@ use crate::{google, oauth};
 /// The header control's `declared` auth takes the caller from.
 const CALLER: &str = "dirigent-user";
 
+#[derive(Clone)]
 pub struct Api {
     pub http: reqwest::Client,
     path: PathBuf,
@@ -100,6 +101,22 @@ impl Api {
     /// A PUT answered with nothing.
     pub async fn put_empty(&mut self, path: &str, body: &impl Serialize) -> anyhow::Result<()> {
         let req = self.request(Method::PUT, path).await?.json(body);
+        checked(req).await.map(|_| ())
+    }
+
+    /// A PUT, answered with nothing but its status (2xx).
+    pub async fn put_status(
+        &mut self,
+        path: &str,
+        body: &impl Serialize,
+    ) -> anyhow::Result<reqwest::StatusCode> {
+        let req = self.request(Method::PUT, path).await?.json(body);
+        checked(req).await.map(|r| r.status())
+    }
+
+    /// A POST answered with nothing.
+    pub async fn post_empty(&mut self, path: &str) -> anyhow::Result<()> {
+        let req = self.request(Method::POST, path).await?;
         checked(req).await.map(|_| ())
     }
 

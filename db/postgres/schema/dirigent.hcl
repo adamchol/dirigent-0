@@ -62,7 +62,9 @@ table "dirigent.sessions" {
 # control restarts) the time until which the player may come back for it; past it, control
 # deletes the row. A session with a lease is active, one without idle. `spawned_by`: the runner
 # control started the player with (reserving the lease for it), and which starts another when the
-# lease expires rather than being given back; null for a player started otherwise.
+# lease expires rather than being given back; null for a player started otherwise. An
+# `importer` (`import:<session>`) writes a conversation from elsewhere into a session no player
+# has held yet (`dirigent import`); while it's there, no player takes the session.
 table "dirigent.session_access" {
   column "session_id" { type = uuid }
   column "subject" { type = text }
@@ -79,7 +81,7 @@ table "dirigent.session_access" {
     on_delete  = CASCADE
   }
   check "session_access_role_check" {
-    expr = "role IN ('owner', 'viewer', 'player')"
+    expr = "role IN ('owner', 'viewer', 'player', 'importer')"
   }
   check "session_access_lease_check" {
     expr = "role = 'player' OR (expires_at IS NULL AND spawned_by IS NULL)"
@@ -106,8 +108,9 @@ table "dirigent.session_access" {
 # The kinds of events each subject may insert (chlive's second insert grant; the first says into
 # which sessions): kept by a trigger from `session_access`, since a grant reads one table keyed
 # by the subject. A player may insert every kind (into the session it holds); an owner only the
-# inputs (its messages, interrupts, renames, and answers to a dirigent's requests for secrets); a
-# viewer nothing. The kinds are `dirigent_protocol::Event`'s (a test keeps the list complete).
+# inputs (its messages, interrupts, renames, and answers to a dirigent's requests for secrets); an
+# importer a conversation's kinds and the workspace's files; a viewer nothing. The kinds are
+# `dirigent_protocol::Event`'s (a test keeps the list complete).
 table "dirigent.insert_kinds" {
   column "subject" { type = text }
   column "kind" { type = text }
@@ -130,13 +133,18 @@ function "dirigent.grant_insert_kinds" {
         'workspace_restored', 'checkpoint', 'checkpoint_failed', 'turn_started', 'steered',
         'model_delta', 'assistant_message', 'model_cancelled', 'error', 'compacted',
         'compaction_failed', 'tool_result', 'turn_ended', 'session_update', 'files_changed',
-        'secrets_changed'];
+        'secrets_changed', 'imported'];
+      conversation text[] := ARRAY[
+        'user_message', 'turn_started', 'steered', 'assistant_message', 'tool_result',
+        'turn_ended', 'compacted', 'titled', 'files_changed', 'imported'];
     BEGIN
       FOREACH who IN ARRAY ARRAY[OLD.subject, NEW.subject] LOOP
         CONTINUE WHEN who IS NULL;
         wanted := CASE
           WHEN EXISTS (SELECT FROM session_access WHERE subject = who AND role = 'player')
             THEN every_kind
+          WHEN EXISTS (SELECT FROM session_access WHERE subject = who AND role = 'importer')
+            THEN conversation
           WHEN EXISTS (SELECT FROM session_access WHERE subject = who AND role = 'owner')
             THEN inputs
           ELSE ARRAY[]::text[]
