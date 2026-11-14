@@ -1518,9 +1518,9 @@ mod tests {
             k,
             vec![
                 "user:a",
-                "retry:1000:api error 529: overloaded",
+                "retry:1000:API error 529: overloaded",
                 "retry:7000:rate limited (retry after Some(7s))",
-                "retry:4000:api error 529: overloaded",
+                "retry:4000:API error 529: overloaded",
                 "assistant:ok now",
                 "end:Completed",
             ]
@@ -1541,7 +1541,7 @@ mod tests {
             k,
             vec![
                 "user:a",
-                "retry:1000:api error 529: overloaded",
+                "retry:1000:API error 529: overloaded",
                 "cancelled",
                 "end:Aborted",
             ]
@@ -1575,7 +1575,7 @@ mod tests {
         h.send("b").await;
         let (k, reqs) = h.finish(2).await;
         assert_eq!(k[0], "user:a");
-        assert!(k[1].starts_with("error:api error 500"));
+        assert!(k[1].starts_with("error:API error 500"));
         assert_eq!(k[2], "end:Failed");
         assert_eq!(k[3], "user:b");
         assert_eq!(k[4], "assistant:ok now");

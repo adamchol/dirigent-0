@@ -83,7 +83,7 @@ pub enum ProviderError {
     RateLimited { retry_after: Option<Duration> },
     #[error("context window exceeded")]
     ContextOverflow,
-    #[error("api error {status}: {message}")]
+    #[error("API error {status}: {message}")]
     Api {
         status: u16,
         message: String,

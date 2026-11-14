@@ -609,7 +609,7 @@ pub fn classify_error(e: ::genai::Error) -> ProviderError {
         }
         Some(s) => ProviderError::Api {
             status: s,
-            message: text,
+            message: body(&e).map_or(text.clone(), said),
             retryable: s >= 500 || lower.contains("overloaded"),
         },
         None => match e {
@@ -618,6 +618,35 @@ pub fn classify_error(e: ::genai::Error) -> ProviderError {
             }
             _ => ProviderError::Transport(text),
         },
+    }
+}
+
+/// The body of a failed call's answer.
+fn body(e: &::genai::Error) -> Option<&str> {
+    match e {
+        ::genai::Error::HttpError { body, .. } => Some(body),
+        ::genai::Error::WebModelCall { webc_error, .. }
+        | ::genai::Error::WebAdapterCall { webc_error, .. } => match webc_error {
+            ::genai::webc::Error::ResponseFailedStatus { body, .. } => Some(body),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// What a failed call's answer says: Anthropic's and OpenAI's `error.message`, with its code
+/// (or type), or OpenAI's `detail`; otherwise the body as it is.
+fn said(body: &str) -> String {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return body.trim().to_string();
+    };
+    let error = &v["error"];
+    let message = error["message"].as_str().or(v["detail"].as_str());
+    let code = error["code"].as_str().or(error["type"].as_str());
+    match (message, code) {
+        (Some(m), Some(c)) => format!("{m} ({c})"),
+        (Some(m), None) => m.to_string(),
+        _ => body.trim().to_string(),
     }
 }
 
@@ -1088,6 +1117,30 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn an_api_error_says_what_the_provider_said() {
+        let shown =
+            |status, body: &str| classify_error(http(status, body, HeaderMap::new())).to_string();
+        assert_eq!(
+            shown(
+                400,
+                r#"{"detail":"The 'gpt-nope' model is not supported when using Codex with a ChatGPT account.","error":{"type":"invalid_request_error","code":"model_not_found","message":"The 'gpt-nope' model is not supported when using Codex with a ChatGPT account."}}"#
+            ),
+            "API error 400: The 'gpt-nope' model is not supported when using Codex with a ChatGPT account. (model_not_found)"
+        );
+        assert_eq!(
+            shown(
+                529,
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#
+            ),
+            "API error 529: Overloaded (overloaded_error)"
+        );
+        assert_eq!(
+            shown(502, "<html>bad gateway</html>\n"),
+            "API error 502: <html>bad gateway</html>"
+        );
     }
 
     #[test]
