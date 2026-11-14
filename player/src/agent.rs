@@ -2235,7 +2235,7 @@ mod tests {
             &h,
             40_000,
             vec![
-                Script::text("SUMMARY", Duration::ZERO),
+                Script::text("## Goal SUMMARY", Duration::ZERO),
                 Script::text("done", Duration::ZERO),
             ],
         )
@@ -2248,7 +2248,7 @@ mod tests {
                 "user:read it",
                 "assistant:+tool",
                 &read,
-                "compacted:SUMMARY",
+                "compacted:## Goal SUMMARY",
                 "assistant:done",
                 "end:Completed"
             ]
@@ -2262,13 +2262,15 @@ mod tests {
         assert!(summary_call.messages[4].text().contains("## Goal"));
         // It streams nothing to the log.
         let streamed_summary = published.lock().unwrap().iter().any(|(_, e)| {
-            matches!(e, Event::ModelDelta { delta: Delta::Text { text, .. } } if text == "SUMMARY")
+            matches!(e, Event::ModelDelta { delta: Delta::Text { text, .. } } if text == "## Goal SUMMARY")
         });
         assert!(!streamed_summary);
         // The next call starts from the summary and keeps the read with its call.
         let m = &reqs[3].messages;
         assert_eq!(m.len(), 3);
-        assert!(m[0].text().contains("<summary>\nSUMMARY\n</summary>"));
+        assert!(m[0]
+            .text()
+            .contains("<summary>\n## Goal SUMMARY\n</summary>"));
         assert!(!m[0].text().contains(FIRST));
         assert!(matches!(m[1].content[0], ContentBlock::ToolCall { .. }));
         assert!(matches!(m[2].content[0], ContentBlock::ToolResult { .. }));
@@ -2282,7 +2284,7 @@ mod tests {
             5_000,
             vec![
                 too_long(),
-                Script::text("SUMMARY", Duration::ZERO),
+                Script::text("## Goal SUMMARY", Duration::ZERO),
                 Script::text("done", Duration::ZERO),
             ],
         )
@@ -2295,12 +2297,12 @@ mod tests {
                 "assistant:+tool",
                 &read,
                 "overflow:context window exceeded",
-                "compacted:SUMMARY",
+                "compacted:## Goal SUMMARY",
                 "assistant:done",
                 "end:Completed"
             ]
         );
-        assert!(reqs[4].messages[0].text().contains("SUMMARY"));
+        assert!(reqs[4].messages[0].text().contains("## Goal SUMMARY"));
     }
 
     #[tokio::test]
@@ -2311,7 +2313,7 @@ mod tests {
             5_000,
             vec![
                 too_long(),
-                Script::text("SUMMARY", Duration::ZERO),
+                Script::text("## Goal SUMMARY", Duration::ZERO),
                 too_long(),
             ],
         )
@@ -2324,7 +2326,7 @@ mod tests {
                 "assistant:+tool",
                 &read,
                 "overflow:context window exceeded",
-                "compacted:SUMMARY",
+                "compacted:## Goal SUMMARY",
                 "error:context window exceeded",
                 "end:Failed"
             ]
@@ -2366,7 +2368,10 @@ mod tests {
         let read = read_after_a_turn(
             &h,
             5_000,
-            vec![too_long(), Script::text("SUMMARY", Duration::from_secs(5))],
+            vec![
+                too_long(),
+                Script::text("## Goal SUMMARY", Duration::from_secs(5)),
+            ],
         )
         .await;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2397,7 +2402,7 @@ mod tests {
             logged_reply("r2"),
             ended(TurnEndReason::Completed),
             Event::Compacted {
-                summary: "SUMMARY".into(),
+                summary: "## Goal SUMMARY".into(),
                 first_kept: "t-second".into(),
                 usage: Usage::default(),
             },
@@ -2408,7 +2413,9 @@ mod tests {
         let (_, reqs) = h.finish(1).await;
         let m = &reqs[0].messages;
         assert_eq!(m.len(), 3);
-        assert!(m[0].text().contains("<summary>\nSUMMARY\n</summary>"));
+        assert!(m[0]
+            .text()
+            .contains("<summary>\n## Goal SUMMARY\n</summary>"));
         assert!(m[0].text().ends_with("second"));
         assert!(!m[0].text().contains("first"));
         assert_eq!(m[1].text(), "r2");
@@ -2534,7 +2541,7 @@ mod tests {
             &h,
             40_000,
             vec![
-                Script::text("SUMMARY of the work", Duration::ZERO),
+                Script::text("## Goal SUMMARY of the work", Duration::ZERO),
                 Script::text("done", Duration::ZERO),
             ],
         )
@@ -2543,8 +2550,8 @@ mod tests {
         let calls = h.provider.titles();
         let retitle = calls[1].messages[0].text();
         assert!(retitle.starts_with("<current>\nTitle: the first message, which a compaction\n"));
-        assert!(retitle.ends_with("<session>\nSUMMARY of the work\n</session>"));
-        assert_eq!(titles(&h)[1].0, "SUMMARY of the work");
+        assert!(retitle.ends_with("<session>\n## Goal SUMMARY of the work\n</session>"));
+        assert_eq!(titles(&h)[1].0, "## Goal SUMMARY of the work");
         h.finish(2).await;
     }
 
@@ -2558,7 +2565,7 @@ mod tests {
             &h,
             40_000,
             vec![
-                Script::text("SUMMARY", Duration::ZERO),
+                Script::text("## Goal SUMMARY", Duration::ZERO),
                 Script::text("done", Duration::ZERO),
             ],
         )
@@ -2576,7 +2583,7 @@ mod tests {
         std::fs::write(&file, format!("{line}\n").repeat(400)).unwrap();
         h.provider.reset([
             tool_script(&[("c2", "Read", json!({ "file_path": file }))]),
-            Script::text("SUMMARY 2", Duration::ZERO),
+            Script::text("## Goal SUMMARY 2", Duration::ZERO),
             Script::text("done 2", Duration::ZERO),
         ]);
         h.send("read the other").await;
@@ -2584,7 +2591,7 @@ mod tests {
         assert!(h.provider.titles()[0].messages[0]
             .text()
             .starts_with("<current>\nTitle: Mine\nDescription: As I named it.\n"));
-        assert_eq!(titles(&h)[0].0, "SUMMARY 2");
+        assert_eq!(titles(&h)[0].0, "## Goal SUMMARY 2");
         h.finish(3).await;
     }
 

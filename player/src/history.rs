@@ -205,7 +205,9 @@ impl History {
 
     /// Replace the entries before `first_kept` with the summary. The files they touched are
     /// derived here, the same way live and on resume, and stay as they are until the next
-    /// compaction so the summary message keeps its bytes.
+    /// compaction so the summary message keeps its bytes. The kept replies lose their thinking:
+    /// it was thought after what the summary replaces, so it's no longer this conversation's,
+    /// and Anthropic's newer models refuse it (on accounts from 2026-08-31 on).
     fn compact(&mut self, id: &str, summary: &str, first_kept: &str) {
         let keep = self
             .entries
@@ -216,6 +218,13 @@ impl History {
         for (_, entry) in self.entries.drain(..keep) {
             files.add(&entry);
         }
+        for (_, entry) in &mut self.entries {
+            if let Entry::Assistant { content, .. } = entry {
+                content.retain(|b| !matches!(b, ContentBlock::Thinking { .. }));
+            }
+        }
+        self.entries
+            .retain(|(_, e)| !matches!(e, Entry::Assistant { content, .. } if content.is_empty()));
         let summary = Entry::Summary {
             text: summary.to_string(),
             files,
@@ -243,25 +252,31 @@ impl History {
         }
     }
 
-    /// Where a compaction would keep from, so that about `keep` tokens stay as they are: the
-    /// id of that entry, and the estimated tokens of what comes before it. Only a user message
-    /// or a reply starts what is kept, so a tool call is never parted from its results. `None`
-    /// when nothing would be dropped.
+    /// Where a compaction would keep from, so that at most about `keep` tokens stay as they
+    /// are: the id of that entry, and the estimated tokens of what comes before it. Only a user
+    /// message or a reply starts what is kept, so a tool call is never parted from its results;
+    /// a last call whose results alone are more is kept with them. `None` when nothing would be
+    /// dropped.
     pub fn cut(&self, keep: u64) -> Option<(String, u64)> {
+        // the longest tail within `keep`
         let mut i = self.entries.len();
         let mut tail = 0;
-        while i > 0 && tail < keep * CHARS_PER_TOKEN {
+        while i > 0 && tail + self.entries[i - 1].1.chars() <= keep * CHARS_PER_TOKEN {
             i -= 1;
             tail += self.entries[i].1.chars();
         }
-        let j = (1..=i.min(self.entries.len().saturating_sub(1)))
-            .rev()
-            .find(|&j| {
-                matches!(
-                    self.entries[j].1,
-                    Entry::User { .. } | Entry::Assistant { .. }
-                )
-            })?;
+        if i == 0 {
+            return None;
+        }
+        let starts = |j: &usize| {
+            matches!(
+                self.entries[*j].1,
+                Entry::User { .. } | Entry::Assistant { .. }
+            )
+        };
+        let j = (i.max(1)..self.entries.len())
+            .find(starts)
+            .or_else(|| (1..i.min(self.entries.len())).rev().find(starts))?;
         Some((
             self.entries[j].0.clone(),
             chars(&self.entries[..j]) / CHARS_PER_TOKEN,
@@ -752,6 +767,34 @@ mod tests {
     }
 
     #[test]
+    fn the_replies_a_compaction_keeps_lose_their_thinking_and_later_ones_keep_it() {
+        let thought = |t: &str| ContentBlock::Thinking {
+            text: t.into(),
+            provider_data: json!({ "signature": t }),
+        };
+        let msgs = messages(&[
+            user("a"),
+            assistant(vec![call("c1")], StopReason::ToolUse),
+            result("c1"),
+            assistant(vec![thought("t1"), call("c2")], StopReason::ToolUse),
+            result("c2"),
+            assistant(vec![thought("t2")], StopReason::EndTurn),
+            compacted("S", "e3"),
+            assistant(vec![thought("t3"), text("done")], StopReason::EndTurn),
+        ]);
+        let assistant: Vec<_> = msgs
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .map(|m| m.content.clone())
+            .collect();
+        // the thinking-only reply is gone with its thinking
+        assert_eq!(
+            assistant,
+            vec![vec![call("c2")], vec![thought("t3"), text("done")]]
+        );
+    }
+
+    #[test]
     fn a_cut_mid_turn_keeps_from_a_reply_and_the_summary_opens_the_turn() {
         let msgs = messages(&[
             user("a"),
@@ -851,5 +894,27 @@ mod tests {
         // Keeping more than there is drops nothing.
         assert_eq!(h.cut(10_000), None);
         assert_eq!(history(&[user("only")]).cut(0), None);
+    }
+
+    #[test]
+    fn the_cut_keeps_no_more_than_the_asked_tokens_past_a_big_result() {
+        let h = history(&[
+            user("a"),
+            assistant(vec![call("c1")], StopReason::ToolUse),
+            Event::ToolResult {
+                call_id: "c1".into(),
+                name: "Read".into(),
+                content: "y".repeat(4000),
+                is_error: false,
+                meta: Value::Null,
+            },
+            assistant(vec![text("r1")], StopReason::EndTurn),
+            ended(TurnEndReason::Completed),
+            user("b"),
+        ]);
+        // Not kept from the call before the result, which would drop only the first message.
+        let (first_kept, dropped) = h.cut(100).unwrap();
+        assert_eq!(first_kept, "e3");
+        assert!(dropped >= 1000, "{dropped}");
     }
 }

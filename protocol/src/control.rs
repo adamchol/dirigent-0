@@ -20,7 +20,7 @@ pub fn player_subject(player: &str) -> String {
 pub struct SessionSpec {
     #[serde(default = "default_model")]
     pub model: String,
-    /// `None`: no extended thinking.
+    /// `None`: no extended thinking (the least there is, on a model that always thinks).
     #[serde(default = "default_effort")]
     pub effort: Option<Effort>,
     /// Where the workspace's files come from; `None`, an empty workspace.

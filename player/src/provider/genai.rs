@@ -223,12 +223,37 @@ fn chat_options(req: &Request) -> ChatOptions {
         .with_capture_tool_calls(true)
         .with_capture_reasoning_content(true)
         .with_reasoning_effort(match req.effort {
+            // as little thinking as it does, on a model that thinks whatever it's asked
+            None if always_thinks(&req.model) => ReasoningEffort::Low,
             None => ReasoningEffort::Zero,
             Some(Effort::Low) => ReasoningEffort::Low,
             Some(Effort::Medium) => ReasoningEffort::Medium,
             Some(Effort::High) => ReasoningEffort::High,
             Some(Effort::Max) => ReasoningEffort::Max,
         })
+}
+
+/// Whether `model` refuses to be asked not to think: Claude Fable and Mythos, and Opus and
+/// Sonnet from 5.5 on (Sonnet's own way to stop, `between_tools`, genai doesn't send).
+fn always_thinks(model: &str) -> bool {
+    let Some(name) = model.strip_prefix("claude-") else {
+        return false;
+    };
+    if name.starts_with("fable") || name.starts_with("mythos") {
+        return true;
+    }
+    let Some(version) = name
+        .strip_prefix("opus-")
+        .or_else(|| name.strip_prefix("sonnet-"))
+    else {
+        return false;
+    };
+    // a minor version, not a date (`claude-sonnet-4-20250514`)
+    let mut parts = version.split('-').map(|p| p.parse::<u32>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), minor) => (major, minor.filter(|m| *m < 100).unwrap_or(0)) >= (5, 5),
+        (None, _) => false,
+    }
 }
 
 /// One neutral message becomes one genai message, except that tool results
@@ -735,6 +760,44 @@ mod tests {
             false,
         );
         assert!(matches!(opts.reasoning_effort, Some(ReasoningEffort::Zero)));
+    }
+
+    #[test]
+    fn no_thinking_is_low_effort_on_a_model_that_always_thinks() {
+        let effort = |model: &str| {
+            let req = Request {
+                model: model.into(),
+                system: None,
+                messages: vec![Message::user("hi")],
+                tools: vec![],
+                effort: None,
+            };
+            chat_options(&req).reasoning_effort
+        };
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-6",
+            "claude-fable-5-1",
+        ] {
+            assert!(
+                matches!(effort(model), Some(ReasoningEffort::Low)),
+                "{model}"
+            );
+        }
+        for model in [
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-haiku-5-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-5-20260101",
+            "gpt-6-astra",
+        ] {
+            assert!(
+                matches!(effort(model), Some(ReasoningEffort::Zero)),
+                "{model}"
+            );
+        }
     }
 
     fn cached(chat: &ChatRequest) -> Vec<bool> {

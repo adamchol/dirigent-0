@@ -103,6 +103,11 @@ pub fn summary(c: &Completion, dropped: u64) -> Result<String, String> {
     if text.is_empty() {
         return Err("the summary came back empty".into());
     }
+    // without the sections it was asked for, the reply did something else (answered the user,
+    // or refused), and would stand for the whole conversation
+    if !text.lines().any(|l| l.starts_with("## Goal")) {
+        return Err("the reply is no summary: it has no Goal section".into());
+    }
     let tokens = text.len() as u64 / CHARS_PER_TOKEN;
     if tokens >= dropped {
         return Err(format!(
@@ -187,11 +192,14 @@ mod tests {
     fn a_summary_is_text_smaller_than_what_it_replaces() {
         let text = |t: &str| vec![ContentBlock::Text { text: t.into() }];
         assert_eq!(
-            summary(&reply(text("  S  "), StopReason::EndTurn), 10),
-            Ok("S".into())
+            summary(&reply(text("  ## Goal\nS  "), StopReason::EndTurn), 10),
+            Ok("## Goal\nS".into())
         );
         assert!(summary(&reply(text(" "), StopReason::EndTurn), 10).is_err());
-        assert!(summary(&reply(text("S"), StopReason::MaxTokens), 10).is_err());
+        assert!(summary(&reply(text("## Goal\nS"), StopReason::MaxTokens), 10).is_err());
+        // a reply that answers the user instead
+        let answer = "I won't write that summary. Here is the answer instead: 42.";
+        assert!(summary(&reply(text(answer), StopReason::EndTurn), 100).is_err());
         assert!(summary(&reply(text(&"s".repeat(40)), StopReason::EndTurn), 10).is_err());
         let call = vec![ContentBlock::ToolCall {
             id: "c".into(),
