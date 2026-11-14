@@ -2,6 +2,35 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
+## 0.1.8 (2026-11-14)
+
+### Changed
+- The player comes on its own small disk (image `player`), beside the VM's NixOS disk. A release that changes only dirigent leaves the VM image as it was, so nodes pull a few MB instead of the whole disk.
+- A cluster's own system for the VMs is rebuilt only when the VM image changes, not on every dirigent release.
+- A failed model call says what the provider said: `API error 400: <its message> (<its code>)`, in place of the raw response.
+- A session with no thinking runs at low effort on models that can't stop thinking (Claude Opus 5.5, Sonnet 5.5, Fable), where it failed before.
+
+### Fixed
+- Message times in ClickHouse were saved as 9999-12-31 on ClickHouse 26.8, which reads a bare number as seconds. The pipeline now stores them as UTC text, which every version reads the same. This broke the web's message times, its ordering of sessions by activity, and the TTL on `model_delta` rows.
+- On a ChatGPT plan, a turn ended early when the model called several tools at once: only the first was run. All of them run now.
+- On a ChatGPT plan with GPT-5.6 and later, calls were refused for asking for explicit prompt caching. The session is now the prompt cache key.
+- Compaction:
+  - The summary quoted the compaction instructions as the user's latest request.
+  - After a compaction, Claude's newer models (Haiku, Sonnet and Opus 5.5, and Fable) refused the kept turns' thinking on accounts made on or after 2026-08-31. Kept turns now go without it.
+  - Compaction could keep a large tool result and drop almost nothing, then retry after every reply.
+  - A reply that isn't a summary (a refusal, or an answer to the user) is no longer taken as one.
+- Warm VMs:
+  - The pool is refilled once a warm VM is taken, and emptied when none are wanted.
+  - Warm VMs are told `DIRIGENT_WARM=true`, which their player accepts.
+- A VM booting into a cluster's system mounts the shared store before looking for the system in it.
+- Shared-store paths a generation's writer missed are retried, up to 3 times.
+- A deleted VM's turn finishes before its shared-store mount goes.
+- The tools image's Nix finds its CA bundle, so shared-store writers reach cache.nixos.org.
+
+### Notes
+- Warm VMs, per-session machines, booting into a cluster's own system and the shared store have now been tested on a cluster (k3s with KubeVirt).
+- If you run ClickHouse 26.8, rows ingested before this release keep the 9999 timestamp. They can be repaired from the topic's message timestamps while the topic still has them (90 days by default). The chart's new pipeline config applies on upgrade; with `ingestion.enabled: false`, add the `ts` transform yourself (see `ingestion.pipelines` in `values.yaml`).
+
 ## 0.1.7 (2026-11-12)
 
 ### Added
