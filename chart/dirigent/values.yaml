@@ -237,10 +237,10 @@ networkPolicy:
 
 # continuous-backup's chart (Kafka Connect with the ClickHouse sink, and the pause server), with
 # dirigent's pipeline. Disabled, it's yours: give pauseServerUrl, and run the session_events
-# pipeline (topic and table session_events, database dirigent, with the InsertField transform
-# below). A deleted session's events are deleted from ClickHouse (by control, as
-# `dirigent_control`), but the topic keeps their messages until its retention (the pipeline's
-# retentionMs, 90 days by default); chlive's snapshots keep them until chlive replaces them.
+# pipeline (topic and table session_events, database dirigent, with the transforms below). A
+# deleted session's events are deleted from ClickHouse (by control, as `dirigent_control`), but
+# the topic keeps their messages until its retention (the pipeline's retentionMs, 90 days by
+# default); chlive's snapshots keep them until chlive replaces them.
 ingestion:
   enabled: true
   pauseServerUrl: ""
@@ -277,9 +277,15 @@ ingestion:
       table: session_events
       database: dirigent
       # each row also stores its message's partition, offset and timestamp, which chlive reads
+      # the timestamp as UTC ISO text: ClickHouse 26.8 reads a bare number as seconds, earlier ones
+      # as milliseconds
       connectorConfig:
-        transforms: kafka
+        transforms: kafka,ts
         transforms.kafka.type: org.apache.kafka.connect.transforms.InsertField$Value
         transforms.kafka.partition.field: partition
         transforms.kafka.offset.field: offset
         transforms.kafka.timestamp.field: ts
+        transforms.ts.type: org.apache.kafka.connect.transforms.TimestampConverter$Value
+        transforms.ts.field: ts
+        transforms.ts.target.type: string
+        transforms.ts.format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"

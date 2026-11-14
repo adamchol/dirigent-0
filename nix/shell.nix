@@ -53,14 +53,20 @@ let
     ];
     # each row also stores its message's partition, offset and timestamp (db/clickhouse),
     # which chlive reads from the messages for live rows (nix/chlive.toml)
+    # (the timestamp as UTC ISO text, which every ClickHouse version reads the same; see
+    # chart/dirigent/values.yaml)
     # chlive verifies control's credentials with its key's public half (nix/chlive.toml)
     chliveEnv.KEYS = "dnvr://keys/ready";
     connectorSettings.session_events = {
-      transforms = "kafka";
+      transforms = "kafka,ts";
       "transforms.kafka.type" = "org.apache.kafka.connect.transforms.InsertField$Value";
       "transforms.kafka.partition.field" = "partition";
       "transforms.kafka.offset.field" = "offset";
       "transforms.kafka.timestamp.field" = "ts";
+      "transforms.ts.type" = "org.apache.kafka.connect.transforms.TimestampConverter$Value";
+      "transforms.ts.field" = "ts";
+      "transforms.ts.target.type" = "string";
+      "transforms.ts.format" = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'";
     };
   };
 
