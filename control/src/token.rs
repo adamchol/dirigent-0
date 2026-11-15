@@ -18,6 +18,14 @@ use sha2::{Digest, Sha256};
 pub const CHLIVE: &str = "chlive";
 pub const CONTROL: &str = "control";
 
+/// A lease's token is good for 90 days.
+const LEASE_TTL: Duration = Duration::from_secs(90 * 24 * 3600);
+
+/// A lease's token is for control's players' service, about that session alone.
+fn lease_audience(session: &str) -> String {
+    format!("lease:{session}")
+}
+
 /// A token's claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claims {
@@ -77,13 +85,30 @@ impl Signer {
 
     /// A token saying it's `sub`, for `aud`; `act`, with it acting for `sub`.
     pub fn sign(&self, sub: &str, aud: &[&str], act: Option<&str>) -> String {
+        self.sign_for(sub, aud, act, self.ttl)
+    }
+
+    /// The token of the lease on `session` control reserved for `player` (its subject): for that
+    /// player alone to take it. Good for as long as a player may hold a lease (resuming it after
+    /// control restarts too); the session's next epoch makes it useless anyway.
+    pub fn lease(&self, session: &str, player: &str) -> String {
+        self.sign_for(player, &[&lease_audience(session)], None, LEASE_TTL)
+    }
+
+    /// Whether `token` is that of a lease on `session` for `player`.
+    pub fn leases(&self, token: &str, session: &str, player: &str) -> bool {
+        self.verify(token, &lease_audience(session))
+            .is_ok_and(|c| c.sub == player)
+    }
+
+    fn sign_for(&self, sub: &str, aud: &[&str], act: Option<&str>, ttl: Duration) -> String {
         let iat = now();
         let claims = Claims {
             iss: self.issuer.clone(),
             sub: sub.into(),
             aud: aud.iter().map(|a| a.to_string()).collect(),
             iat,
-            exp: iat + self.ttl.as_secs(),
+            exp: iat + ttl.as_secs(),
             act: act.map(|a| Actor { sub: a.into() }),
         };
         let mut header = Header::new(Algorithm::EdDSA);
@@ -198,6 +223,20 @@ mod tests {
         let claims = s.verify(&t, CONTROL).unwrap();
         assert_eq!(claims.sub, "user:a");
         assert_eq!(claims.act.unwrap().sub, "player:d");
+    }
+
+    #[test]
+    fn a_leases_token_is_for_its_session_and_player_alone() {
+        let s = signer();
+        let t = s.lease("s1", "player:p");
+        assert!(s.leases(&t, "s1", "player:p"));
+        assert!(!s.leases(&t, "s2", "player:p"));
+        assert!(!s.leases(&t, "s1", "player:q"));
+        assert!(!signer().leases(&t, "s1", "player:p"));
+        // for nothing else
+        assert!(s.verify(&t, CHLIVE).is_err() && s.verify(&t, CONTROL).is_err());
+        let claims = s.verify(&t, "lease:s1").unwrap();
+        assert!(claims.exp - claims.iat > 30 * 24 * 3600);
     }
 
     #[test]

@@ -126,6 +126,7 @@ mod tests {
             Event::PlayerAttached {
                 epoch: 3,
                 version: Some("0.1.3+abc1234".into()),
+                environment: Some("adam's MacBook".into()),
             },
             Event::UserInterrupt { turn: "t1".into() },
             Event::TurnStarted { input: "m1".into() },

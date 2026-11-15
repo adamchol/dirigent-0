@@ -73,6 +73,40 @@ spec:
               service:
                 name: dirigent-web
                 port: { name: http }
+{{- if $.Values.hosts.expose }}
+---
+# control's players' service, for hosts (`dirigent host`): gRPC, which needs its own Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dirigent-players
+  labels:
+    {{- include "dirigent.labels" $ | nindent 4 }}
+  {{- with $.Values.hosts.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range list "Lease" "Host" }}
+          - path: /dirigent.control.v1.Players/{{ . }}
+            pathType: Exact
+            backend:
+              service:
+                name: dirigent-control
+                port: { name: grpc }
+          {{- end }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- with .Values.web.httpRoute }}
@@ -96,6 +130,17 @@ spec:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   rules:
+    {{- if $.Values.hosts.expose }}
+    # control's players' service, for hosts (`dirigent host`): gRPC calls held for as long as a
+    # host runs, so with no request timeout
+    - matches:
+        - path: { type: Exact, value: /dirigent.control.v1.Players/Lease }
+        - path: { type: Exact, value: /dirigent.control.v1.Players/Host }
+      backendRefs:
+        - { name: dirigent-control, port: 8091 }
+      timeouts:
+        request: 0s
+    {{- end }}
     - matches:
         - path: { type: PathPrefix, value: / }
       backendRefs:

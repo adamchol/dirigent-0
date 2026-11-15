@@ -46,6 +46,12 @@ table "dirigent.sessions" {
     type = timestamptz
     null = true
   }
+  # Where its owner placed it: the name of one of their hosts (`dirigent host`), where its players
+  # run while the host is connected; null, the cluster's own runner.
+  column "environment" {
+    type = text
+    null = true
+  }
   # Since when it's being deleted (its owner deleted it, archived: no one has access, and control
   # removes what it left, this row last).
   column "deleting" {

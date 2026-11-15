@@ -41,6 +41,8 @@ pub struct ChliveSession {
     own: HashSet<String>,
     /// The log after `load`; `None` before it and once it's ended.
     log: Option<Events<EventRow>>,
+    /// Where the player runs, when it's not the cluster's VM.
+    environment: Option<String>,
 }
 
 /// A row to insert, and who waits for it to be in.
@@ -69,7 +71,14 @@ impl ChliveSession {
             writes,
             own: HashSet::new(),
             log: None,
+            environment: None,
         }
+    }
+
+    /// Running in `environment` (a host's name): its attaching says so.
+    pub fn in_environment(mut self, environment: Option<String>) -> Self {
+        self.environment = environment;
+        self
     }
 
     /// Insert `PlayerAttached`, again until chlive takes it: then it has the lease's grant,
@@ -82,6 +91,7 @@ impl ChliveSession {
             &Event::PlayerAttached {
                 epoch: self.epoch,
                 version: Some(crate::VERSION.into()),
+                environment: self.environment.clone(),
             },
         );
         let started = Instant::now();
@@ -330,7 +340,7 @@ mod e2e {
         ));
         let provider = Arc::new(MockProvider::default());
         let player = new_id();
-        let lease = Lease::acquire(&stack.control_ws, session, &player, None)
+        let lease = Lease::acquire(&stack.control_ws, session, &player, None, None)
             .await
             .unwrap();
         let (tools, follower) = match lease.spec.part {
@@ -652,7 +662,7 @@ mod e2e {
         let user = User::new(&stack, &session);
         let first = start(&stack, &session).await;
         log_until(&stack, &session, |r| attached(r) == [1]).await;
-        let refused = Lease::acquire(&stack.control_ws, &session, &new_id(), None).await;
+        let refused = Lease::acquire(&stack.control_ws, &session, &new_id(), None, None).await;
         let err = refused.err().expect("the second player got a held session");
         assert!(matches!(err.downcast_ref(), Some(Refused::Held)), "{err:#}");
         first.stop().await;
@@ -882,7 +892,7 @@ mod e2e {
 
         // a player's are for its session only
         let other = new_session(&stack).await;
-        let lease = Lease::acquire(&stack.control_ws, &session, &new_id(), None)
+        let lease = Lease::acquire(&stack.control_ws, &session, &new_id(), None, None)
             .await
             .unwrap();
         let opts = ClientOptions::new(&stack.chlive).credentials(player_token(lease.tokens()));
@@ -894,6 +904,7 @@ mod e2e {
                 &Event::PlayerAttached {
                     epoch: 1,
                     version: None,
+                    environment: None,
                 },
             )
         };
@@ -1125,6 +1136,7 @@ mod e2e {
             source: Some(got),
             head: Some(head),
             recreated: false,
+            ..
         } = ready.event().unwrap()
         else {
             panic!("{ready:?}");
@@ -1238,6 +1250,135 @@ mod e2e {
         // named on import, so not named again
         assert_eq!(log.iter().filter(|r| r.kind == "titled").count(), 1);
         player.stop().await;
+    }
+
+    #[tokio::test]
+    async fn e2e_a_session_placed_on_a_host_runs_there_and_moves_back_with_its_files() {
+        let Some(stack) = stack() else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let name = format!("e2e-{}", &new_id()[..8]);
+        let creds = tmp.path().join("credentials.json");
+        let signed_in =
+            serde_json::json!({ "api": stack.control, "mode": "declared", "subject": USER });
+        std::fs::write(&creds, signed_in.to_string()).unwrap();
+        let roots = tmp.path().join("sessions");
+        let config = tmp.path().join("host.toml");
+        let host_toml = format!(
+            "name = {name:?}\nchlive = {:?}\nplayers = {:?}\nroots = [{:?}]\nslots = 1\n\
+             player_args = [\"--mock\"]\n",
+            stack.chlive,
+            stack.control_ws,
+            roots.display().to_string(),
+        );
+        std::fs::write(&config, host_toml).unwrap();
+        let _host = tokio::process::Command::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/debug/dirigent"
+        ))
+        .args(["host", "run"])
+        .env("DIRIGENT_CREDENTIALS", &creds)
+        .env("DIRIGENT_HOST_CONFIG", &config)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the CLI (`e2e` builds it)");
+        // connected, it's one of the user's environments
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let listed: serde_json::Value = api(&stack, reqwest::Method::GET, "/environments")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let hosts = listed["hosts"].as_array().cloned().unwrap_or_default();
+            if hosts.iter().any(|h| h["name"] == name.as_str()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the host never connected: {listed}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let session = new_session(&stack).await;
+        let place = |host: Option<&str>| {
+            api(
+                &stack,
+                reqwest::Method::PUT,
+                &format!("/sessions/{session}/environment"),
+            )
+            .json(&serde_json::json!({ "host": host }))
+            .send()
+        };
+        assert!(place(Some(&name)).await.unwrap().status().is_success());
+        let start = || {
+            api(
+                &stack,
+                reqwest::Method::POST,
+                &format!("/sessions/{session}/start"),
+            )
+            .send()
+        };
+        assert!(start().await.unwrap().status().is_success());
+        let user = User::new(&stack, &session);
+        user.say("!echo from the host > notes.txt").await;
+        let log = log_until(&stack, &session, |r| turns_ended(r) == 1).await;
+        let attached = log.iter().find(|r| r.kind == "player_attached").unwrap();
+        let Event::PlayerAttached { environment, .. } = attached.event().unwrap() else {
+            panic!()
+        };
+        assert!(environment.is_some_and(|e| e.starts_with(&name)));
+        assert!(roots.join(&session).join("workspace/notes.txt").exists());
+
+        // stopped, and placed on the cluster: its next player starts there, with its files
+        let stop = api(
+            &stack,
+            reqwest::Method::POST,
+            &format!("/sessions/{session}/stop"),
+        );
+        assert!(stop.send().await.unwrap().status().is_success());
+        log_until(&stack, &session, |r| {
+            r.iter().any(|r| r.kind == "player_detached")
+        })
+        .await;
+        assert!(place(None).await.unwrap().status().is_success());
+        user.say("!cat notes.txt").await;
+        assert!(start().await.unwrap().status().is_success());
+        let log = log_until(&stack, &session, |r| turns_ended(r) == 2).await;
+        let ready = log
+            .iter()
+            .rev()
+            .find(|r| r.kind == "workspace_ready")
+            .unwrap();
+        assert!(matches!(
+            ready.event().unwrap(),
+            Event::WorkspaceReady {
+                recreated: true,
+                files: Some(_),
+                ..
+            }
+        ));
+        let results: Vec<String> = log
+            .iter()
+            .filter_map(|r| match r.event() {
+                Ok(Event::ToolResult { content, .. }) => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            results.last().unwrap().contains("from the host"),
+            "{results:?}"
+        );
+        let stop = api(
+            &stack,
+            reqwest::Method::POST,
+            &format!("/sessions/{session}/stop"),
+        );
+        stop.send().await.unwrap();
     }
 
     #[tokio::test]

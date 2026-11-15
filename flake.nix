@@ -45,6 +45,17 @@
       ];
       imports = [ inputs.dnvr.flakeModule ];
 
+      # `dirigent host` as a service: yours (home-manager), or the machine's (NixOS, nix-darwin)
+      flake =
+        let
+          self = inputs.self;
+        in
+        {
+          homeManagerModules.dirigent-host = import ./nix/modules/home-manager.nix { inherit self; };
+          nixosModules.dirigent-host = import ./nix/modules/nixos.nix { inherit self; };
+          darwinModules.dirigent-host = import ./nix/modules/darwin.nix { inherit self; };
+        };
+
       perSystem =
         {
           pkgs,

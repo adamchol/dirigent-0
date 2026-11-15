@@ -11,7 +11,7 @@ import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import * as api from "./api.ts";
-import type { Machines, PlayerSystem, Resources, Settings, Who } from "./api.ts";
+import type { Host, Machines, PlayerSystem, Resources, Settings, Who } from "./api.ts";
 import * as machine from "./machine.ts";
 import type { Shown } from "./events.ts";
 
@@ -121,10 +121,15 @@ export function SettingsDialog(props: {
   const shown = SHOWN.find((s) => s.value === props.settings.events) ?? SHOWN[1]!;
   const [system, setSystem] = useState<PlayerSystem | null>(null);
   const [machines, setMachines] = useState<Machines | null>(null);
+  const [hosts, setHosts] = useState<Host[] | null>(null);
   useEffect(() => {
     if (!props.open) return;
     api.playerSystem(props.who).then(setSystem, () => setSystem(null));
     api.machines(props.who).then(setMachines, () => setMachines(null));
+    api.environments(props.who).then(
+      (e) => setHosts(e.hosts),
+      () => setHosts(null),
+    );
   }, [props.open, props.who]);
   return (
     <Dialog open={props.open} onOpenChange={(o) => !o && props.close()}>
@@ -160,6 +165,21 @@ export function SettingsDialog(props: {
             {system && <FieldDescription>{systemText(system)}</FieldDescription>}
           </Field>
         )}
+        <Field>
+          <FieldLabel>Your hosts</FieldLabel>
+          {hosts && hosts.length > 0 ? (
+            hosts.map((h) => (
+              <FieldDescription key={h.name}>
+                {api.hostLine(h)}: {h.cpus} cores, {h.memory} GB, {h.slots} {h.slots === 1 ? "session" : "sessions"} at once
+              </FieldDescription>
+            ))
+          ) : (
+            <FieldDescription>
+              None connected. A machine of yours runs your sessions with `dirigent host install` (or `brew services start
+              dirigent`); a session's menu then moves it there.
+            </FieldDescription>
+          )}
+        </Field>
         <DialogFooter>
           <DialogClose render={<Button type="button" variant="outline" />}>Done</DialogClose>
         </DialogFooter>

@@ -52,15 +52,24 @@ impl Mirror {
     }
 
     /// Make the workspace the last commit's, over what was restored from a checkpoint (which
-    /// may be older): the changes since come back, and what was deleted since goes.
-    pub async fn restore(&self) -> anyhow::Result<()> {
+    /// may be older) or just made: the changes since come back, and what was deleted since goes.
+    /// The commit, if the log has one.
+    pub async fn restore(&self) -> anyhow::Result<Option<String>> {
         let Some(last) = &self.last else {
-            return Ok(());
+            return Ok(None);
         };
         self.repo.checkout(self.workdir, last, false).await?;
         self.unredact().await?;
         info!(commit = last, "the workspace is the log's last commit");
-        Ok(())
+        Ok(Some(last.clone()))
+    }
+
+    /// Whether the log's last commit has files (a dirigent's workspace never has any).
+    pub async fn has_files(&self) -> bool {
+        match &self.last {
+            Some(last) => !self.repo.is_empty(last).await.unwrap_or(true),
+            None => false,
+        }
     }
 
     /// Put the secrets the session has back where a commit has `[secret:NAME]`.

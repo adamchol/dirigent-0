@@ -17,6 +17,7 @@ use tokio::sync::OnceCell;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::hosts::Hosts;
 use crate::leases::Store;
 use crate::runner::Runner;
 
@@ -107,7 +108,12 @@ impl Pruner {
 
 /// Every 10 seconds, remove what the sessions being deleted left, the oldest first; a step that
 /// fails is tried again next time.
-pub async fn prune(store: &'static Store, runner: Option<&'static dyn Runner>, pruner: &Pruner) {
+pub async fn prune(
+    store: &'static Store,
+    runner: Option<&'static dyn Runner>,
+    hosts: &Hosts,
+    pruner: &Pruner,
+) {
     let mut every = tokio::time::interval(Duration::from_secs(10));
     loop {
         every.tick().await;
@@ -119,7 +125,7 @@ pub async fn prune(store: &'static Store, runner: Option<&'static dyn Runner>, p
             }
         };
         for (session, settled) in sessions {
-            match prune_one(store, runner, pruner, session, settled).await {
+            match prune_one(store, runner, hosts, pruner, session, settled).await {
                 Ok(true) => info!(session = %session, "session deleted"),
                 Ok(false) => {}
                 Err(e) => warn!(session = %session, "deleting the session: {e:#}"),
@@ -132,6 +138,7 @@ pub async fn prune(store: &'static Store, runner: Option<&'static dyn Runner>, p
 async fn prune_one(
     store: &Store,
     runner: Option<&dyn Runner>,
+    hosts: &Hosts,
     pruner: &Pruner,
     session: Uuid,
     settled: bool,
@@ -139,6 +146,8 @@ async fn prune_one(
     if let Some(runner) = runner {
         runner.forget(session).await.context("on the runner")?;
     }
+    // a host away now forgets it as it connects
+    hosts.forget(session).await;
     if let Some(kopia) = &pruner.kopia {
         kopia.forget(session).await.context("its checkpoints")?;
     }

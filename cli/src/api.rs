@@ -39,6 +39,18 @@ impl Api {
         })
     }
 
+    /// Who the caller is, as a header control takes (its name and value): the subject it says in
+    /// `declared` auth, the Google ID token otherwise.
+    pub async fn caller(&mut self) -> anyhow::Result<(&'static str, String)> {
+        Ok(match &self.creds.auth {
+            Auth::Declared { subject } => (CALLER, subject.clone()),
+            Auth::Oidc { .. } => (
+                "authorization",
+                format!("Bearer {}", self.id_token().await?),
+            ),
+        })
+    }
+
     /// The Google ID token, renewed (and saved) when it's about to expire.
     async fn id_token(&mut self) -> anyhow::Result<String> {
         let Auth::Oidc {

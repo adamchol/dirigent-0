@@ -37,10 +37,10 @@ export interface Usage {
 export type Source = { git: { url: string; ref?: string } };
 
 export type Event =
-  | { kind: "player_attached"; data: { epoch: number; version?: string } }
+  | { kind: "player_attached"; data: { epoch: number; version?: string; environment?: string } }
   | { kind: "player_detached"; data: { epoch: number } }
   | { kind: "player_failed"; data: { epoch: number; error: string } }
-  | { kind: "workspace_ready"; data: { source?: Source; head?: string; recreated?: boolean } }
+  | { kind: "workspace_ready"; data: { source?: Source; head?: string; recreated?: boolean; files?: string } }
   | { kind: "workspace_restored"; data: { snapshot: string } }
   | { kind: "checkpoint"; data: { turn: string; snapshot: string } }
   | { kind: "checkpoint_failed"; data: { turn: string; error: string } }
@@ -279,7 +279,7 @@ export function timeline(rows: readonly EventRow[], shown: Shown = "activity"): 
         note(
           row,
           "dim",
-          `${subject(row.author)} attached (epoch ${e.data.epoch}${e.data.version ? `, ${e.data.version}` : ""})`,
+          `${subject(row.author)} attached${e.data.environment ? ` on ${e.data.environment}` : ""} (epoch ${e.data.epoch}${e.data.version ? `, ${e.data.version}` : ""})`,
         );
         break;
       case "player_detached":
@@ -294,7 +294,8 @@ export function timeline(rows: readonly EventRow[], shown: Shown = "activity"): 
       case "workspace_ready": {
         const from = e.data.source ? `${e.data.source.git.url}${e.data.source.git.ref ? `@${e.data.source.git.ref}` : ""}` : "empty";
         const head = e.data.head ? ` at ${e.data.head.slice(0, 12)}` : "";
-        note(row, e.data.recreated ? "error" : "dim", `workspace ${e.data.recreated ? "recreated (changes lost)" : "ready"}: ${from}${head}`);
+        if (e.data.recreated && e.data.files) note(row, "dim", `workspace made again, with the session's files: ${from}${head}`);
+        else note(row, e.data.recreated ? "error" : "dim", `workspace ${e.data.recreated ? "recreated (changes lost)" : "ready"}: ${from}${head}`);
         break;
       }
       case "workspace_restored":

@@ -113,6 +113,16 @@ impl Entry {
             Event::Compacted { .. } => None,
             Event::WorkspaceReady {
                 recreated: true,
+                files: Some(_),
+                ..
+            } => Some(Entry::Note {
+                text: "[The workspace was made again, on another machine, with the files the \
+                       session had: files that .gitignore leaves out, and files over 50 MB, \
+                       are gone (build outputs and dependencies, which can be made again).]"
+                    .into(),
+            }),
+            Event::WorkspaceReady {
+                recreated: true,
                 head,
                 ..
             } => Some(Entry::Note {
@@ -187,6 +197,8 @@ pub struct History {
     /// Entries from here on came after the last compaction, so their usage measures the
     /// context as it is now.
     measured_from: usize,
+    /// Where the last player ran (`None` within: the cluster's VM), once one attached.
+    environment: Option<Option<String>>,
 }
 
 impl History {
@@ -199,7 +211,18 @@ impl History {
     }
 
     pub fn push(&mut self, id: &str, ev: &Event) {
-        if let Event::Compacted {
+        if let Event::PlayerAttached { environment, .. } = ev {
+            let was = self.environment.replace(environment.clone());
+            if was.is_some_and(|was| was != *environment) {
+                let now = environment.as_deref().unwrap_or("a VM of the cluster's");
+                let text = format!(
+                    "[The session moved: it runs on {now} now, as the system prompt describes. \
+                     Its workspace came along; paths outside it, and the tools installed, may \
+                     differ.]"
+                );
+                self.entries.push((id.to_string(), Entry::Note { text }));
+            }
+        } else if let Event::Compacted {
             summary,
             first_kept,
             ..
@@ -553,6 +576,7 @@ mod tests {
             source: None,
             head: Some("abc".into()),
             recreated,
+            files: None,
         };
         let msgs = messages(&[
             ready(false),
@@ -568,6 +592,41 @@ mod tests {
         assert!(text.starts_with("[The workspace"), "{text}");
         assert!(text.contains("recreated from its source at abc"), "{text}");
         assert!(text.ends_with('b'), "{text}");
+    }
+
+    #[test]
+    fn a_session_moving_to_another_environment_is_a_note() {
+        let attached = |environment: Option<&str>| Event::PlayerAttached {
+            epoch: 1,
+            version: None,
+            environment: environment.map(Into::into),
+        };
+        let msgs = messages(&[
+            attached(None),
+            user("a"),
+            assistant(vec![text("ok")], StopReason::EndTurn),
+            ended(TurnEndReason::Completed),
+            // the same again: nothing to say
+            attached(None),
+            user("b"),
+            assistant(vec![text("ok")], StopReason::EndTurn),
+            ended(TurnEndReason::Completed),
+            attached(Some("adam's MacBook")),
+            user("c"),
+            assistant(vec![text("ok")], StopReason::EndTurn),
+            ended(TurnEndReason::Completed),
+            attached(None),
+            user("d"),
+        ]);
+        let texts: Vec<String> = msgs
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.text())
+            .collect();
+        assert_eq!(texts[..2], ["a".to_string(), "b".to_string()]);
+        assert!(texts[2].starts_with("[The session moved: it runs on adam's MacBook now"));
+        assert!(texts[2].ends_with('c'));
+        assert!(texts[3].starts_with("[The session moved: it runs on a VM of the cluster's now"));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Endpoint;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Code, Streaming};
 use tracing::{info, warn};
 
@@ -50,18 +50,21 @@ struct Call {
 
 impl Lease {
     /// Hold `session` as `player`, through control's gRPC service at `url`: the lease `epoch`
-    /// control reserved for it, or the session if it's free. Retries while control can't be
-    /// reached; another player holding the session, or the reserved lease gone, is an error.
+    /// control reserved for it (taken with its `token`), or the session if it's free. Retries
+    /// while control can't be reached; another player holding the session, or the reserved lease
+    /// gone, is an error.
     pub async fn acquire(
         url: &str,
         session: &str,
         player: &str,
         epoch: Option<i64>,
+        token: Option<String>,
     ) -> anyhow::Result<Lease> {
         let ask = |epoch| pb::Acquire {
             session: session.to_string(),
             player: player.to_string(),
             epoch,
+            token: token.clone(),
         };
         let mut backoff = Backoff::default();
         let (
@@ -265,9 +268,13 @@ struct Acquired {
 /// or why not ([`Refused`], or not reaching control).
 /// As a warm player (`player`, on a machine running `system`), wait at control's gRPC service
 /// at `url` to be given a session: the session, and the epoch of the lease reserved for this
-/// player on it. Waits again while control can't be reached; control not knowing this player
-/// (its VM gone, or no longer one it keeps) is an error.
-pub async fn wait(url: &str, player: &str, system: Option<&str>) -> anyhow::Result<(String, i64)> {
+/// player on it, with its token. Waits again while control can't be reached; control not
+/// knowing this player (its VM gone, or no longer one it keeps) is an error.
+pub async fn wait(
+    url: &str,
+    player: &str,
+    system: Option<&str>,
+) -> anyhow::Result<(String, i64, String)> {
     let ask = pb::WaitRequest {
         player: player.to_string(),
         system: system.map(Into::into),
@@ -275,20 +282,13 @@ pub async fn wait(url: &str, player: &str, system: Option<&str>) -> anyhow::Resu
     let mut backoff = Backoff::default();
     loop {
         let assigned = async {
-            let channel = Endpoint::from_shared(url.to_string())?
-                .connect_timeout(CONNECT_TIMEOUT)
-                .http2_keep_alive_interval(KEEPALIVE)
-                .keep_alive_timeout(KEEPALIVE_TIMEOUT)
-                .keep_alive_while_idle(true)
-                .connect()
-                .await?;
-            let mut rx = PlayersClient::new(channel)
+            let mut rx = PlayersClient::new(channel(url).await?)
                 .wait(ask.clone())
                 .await?
                 .into_inner();
             info!("warm: waiting for a session");
             match rx.message().await? {
-                Some(a) => Ok((a.session, a.epoch)),
+                Some(a) => Ok((a.session, a.epoch, a.token)),
                 None => anyhow::bail!("control ended the call"),
             }
         };
@@ -307,14 +307,22 @@ pub async fn wait(url: &str, player: &str, system: Option<&str>) -> anyhow::Resu
     }
 }
 
-async fn hold(url: &str, ask: pb::Acquire) -> anyhow::Result<(Call, Acquired)> {
-    let channel = Endpoint::from_shared(url.to_string())?
+/// A connection to control's gRPC service at `url`: `http://` within a cluster or a tailnet,
+/// `https://` through a gateway.
+pub async fn channel(url: &str) -> anyhow::Result<Channel> {
+    let mut endpoint = Endpoint::from_shared(url.to_string())?
         .connect_timeout(CONNECT_TIMEOUT)
         .http2_keep_alive_interval(KEEPALIVE)
         .keep_alive_timeout(KEEPALIVE_TIMEOUT)
-        .keep_alive_while_idle(true)
-        .connect()
-        .await?;
+        .keep_alive_while_idle(true);
+    if url.starts_with("https://") {
+        endpoint = endpoint.tls_config(ClientTlsConfig::new().with_webpki_roots())?;
+    }
+    Ok(endpoint.connect().await?)
+}
+
+async fn hold(url: &str, ask: pb::Acquire) -> anyhow::Result<(Call, Acquired)> {
+    let channel = channel(url).await?;
     let (tx, rx) = mpsc::channel(4);
     let ask = pb::FromPlayer {
         msg: Some(pb::from_player::Msg::Acquire(ask)),

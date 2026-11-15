@@ -6,6 +6,7 @@
 mod api;
 mod credentials;
 mod google;
+mod host;
 mod import;
 mod loopback;
 mod oauth;
@@ -24,6 +25,9 @@ use crate::api::Api;
 use crate::credentials::{Auth, Credentials};
 use crate::loopback::Loopback;
 
+/// The hidden first argument that makes this binary a player (`dirigent host` runs its players so).
+pub const PLAYER: &str = "__player";
+
 const HELP_STYLES: Styles = Styles::styled()
     .header(AnsiColor::BrightMagenta.on_default().bold())
     .usage(AnsiColor::BrightMagenta.on_default().bold())
@@ -34,7 +38,12 @@ const HELP_STYLES: Styles = Styles::styled()
     .error(AnsiColor::BrightRed.on_default().bold());
 
 #[derive(Parser)]
-#[command(name = "dirigent", about = "dirigent's command line", styles = HELP_STYLES)]
+#[command(
+    name = "dirigent",
+    about = "dirigent's command line",
+    version = dirigent_player::VERSION,
+    styles = HELP_STYLES
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -92,6 +101,14 @@ enum Command {
         /// Sync once, then exit, rather than keep following the session.
         #[arg(long)]
         once: bool,
+    },
+    /// This machine as a place where your sessions run: a daemon connected to dirigent as you,
+    /// running a player for each session you place on it (the web's session menu, or
+    /// `PUT /sessions/{id}/environment`), in a directory of its own under the host's roots. Its
+    /// config: `~/.config/dirigent/host.toml` (url, name, roots, slots, labels, environment).
+    Host {
+        #[command(subcommand)]
+        command: HostCommand,
     },
     /// Make another agent's session here a dirigent session that goes on from where it was:
     /// its conversation (thinking kept to read, secrets redacted), on the project's git remote
@@ -155,6 +172,40 @@ enum ImportEffort {
 enum ImportProvider {
     Anthropic,
     Chatgpt,
+}
+
+#[derive(Subcommand)]
+enum HostCommand {
+    /// Run the host here, until it's stopped (what the service runs).
+    Run {
+        /// As the system's service: its roots by default under /var/lib/dirigent.
+        #[arg(long)]
+        system: bool,
+    },
+    /// Install the host as a service and start it: yours (a launchd agent on macOS, a systemd
+    /// user unit on Linux), or with --system the machine's (a launchd daemon, a systemd system
+    /// unit; as root), its credentials copied from yours to /etc/dirigent.
+    Install {
+        #[arg(long)]
+        system: bool,
+        /// The system's service runs as this user, not root.
+        #[arg(long, requires = "system")]
+        user: Option<String>,
+        /// The credentials the system's service signs in with (by default, the signed-in ones of
+        /// the user running sudo).
+        #[arg(long, requires = "system")]
+        credentials: Option<PathBuf>,
+    },
+    /// Stop the service and remove it (players running go on until their sessions stop).
+    Uninstall {
+        #[arg(long)]
+        system: bool,
+    },
+    /// Whether the service is installed, and running.
+    Status {
+        #[arg(long)]
+        system: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -230,6 +281,17 @@ struct Model {
 
 #[tokio::main]
 async fn main() {
+    // a player `dirigent host` runs, in a process of its own: its arguments are the player's
+    let mut args = std::env::args_os();
+    if args.nth(1).is_some_and(|a| a == PLAYER) {
+        let player =
+            dirigent_player::Args::parse_from(std::iter::once("player".into()).chain(args));
+        if let Err(e) = dirigent_player::run(player).await {
+            eprintln!("player: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(e) = run(Cli::parse()).await {
         eprintln!("dirigent: {e:#}");
         std::process::exit(1);
@@ -414,6 +476,33 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             chlive,
             once,
         } => sync::sync(Api::signed_in(http)?, &session, dir, chlive, once).await?,
+        Command::Host { command } => {
+            use host::service::{self, Service};
+            match command {
+                HostCommand::Run { system } => {
+                    tracing_subscriber::fmt()
+                        .with_env_filter(
+                            tracing_subscriber::EnvFilter::try_from_default_env()
+                                .unwrap_or_else(|_| "dirigent=info".into()),
+                        )
+                        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+                        .init();
+                    let config = host::Config::load(&host::config_path()?)?;
+                    host::run(Api::signed_in(http)?, config, system).await?
+                }
+                HostCommand::Install {
+                    system,
+                    user,
+                    credentials,
+                } => service::install(&Service { system, user }, credentials).await?,
+                HostCommand::Uninstall { system } => {
+                    service::uninstall(&Service { system, user: None }).await?
+                }
+                HostCommand::Status { system } => {
+                    service::status(&Service { system, user: None }).await?
+                }
+            }
+        }
         Command::Import {
             agent,
             session,

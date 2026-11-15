@@ -67,6 +67,7 @@ let
       "transforms.ts.field" = "ts";
       "transforms.ts.target.type" = "string";
       "transforms.ts.format" = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'";
+      clickhouseSettings = "async_insert=0,insert_deduplicate=1,date_time_input_format=best_effort";
     };
   };
 

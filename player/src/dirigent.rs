@@ -915,6 +915,7 @@ mod tests {
                     source: None,
                     head: None,
                     recreated: false,
+                    files: None,
                 },
             ),
             row(2, "m1", &msg("fix it")),

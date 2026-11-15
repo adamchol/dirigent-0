@@ -254,6 +254,9 @@ pub struct SessionInfo {
     /// milliseconds since the Unix epoch.
     #[serde(default)]
     pub archived: Option<i64>,
+    /// Where its owner placed it: one of their hosts, by name; none, the cluster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
 }
 
 /// A user's part in a session.
@@ -291,6 +294,7 @@ mod tests {
             created: 0,
             secrets: vec!["GITHUB_TOKEN".into()],
             archived: None,
+            environment: None,
         };
         let wire = serde_json::to_value(&info).unwrap();
         assert_eq!(

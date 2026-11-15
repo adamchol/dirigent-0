@@ -47,11 +47,13 @@ pub struct Taken {
 }
 
 impl Taken {
-    /// Tell it its session, `session`'s `epoch`th lease: whether it's still there to be told.
-    pub async fn tell(self, session: Uuid, epoch: i64) -> bool {
+    /// Tell it its session, `session`'s `epoch`th lease (its `token`): whether it's still there to
+    /// be told.
+    pub async fn tell(self, session: Uuid, epoch: i64, token: String) -> bool {
         let assigned = pb::Assigned {
             session: session.to_string(),
             epoch,
+            token,
         };
         self.waiting.tx.send(Ok(assigned)).await.is_ok()
     }

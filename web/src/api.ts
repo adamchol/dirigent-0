@@ -48,6 +48,8 @@ export interface SessionInfo {
   /** Since when it's archived (no player takes it until it's unarchived), in milliseconds since
    * the Unix epoch; none, it isn't. */
   archived?: number | null;
+  /** Where its owner placed it: one of their hosts, by name; none, the cluster. */
+  environment?: string | null;
 }
 
 /** How control knows its callers (`GET /auth`). */
@@ -133,9 +135,15 @@ export async function sessions(who: Who): Promise<SessionInfo[]> {
   return (await call(who, "GET", "/sessions")).json();
 }
 
-/** Make the session `id`, `who`'s (or find it, with the same spec). */
-export async function put(who: Who, id: string, spec: Partial<SessionSpec>, start: boolean) {
-  await call(who, "PUT", `/sessions/${id}`, { ...spec, start });
+/** Make the session `id`, `who`'s (or find it, with the same spec): on their host `environment`,
+ * or the cluster. */
+export async function put(who: Who, id: string, spec: Partial<SessionSpec>, start: boolean, environment?: string | null) {
+  await call(who, "PUT", `/sessions/${id}`, { ...spec, start, ...(environment ? { environment } : {}) });
+}
+
+/** Place the session on `who`'s host `host` (none: the cluster), for its next start. */
+export async function placeOn(who: Who, id: string, host: string | null) {
+  await call(who, "PUT", `/sessions/${id}/environment`, { host });
 }
 
 export async function start(who: Who, id: string) {
@@ -295,4 +303,33 @@ export type Machines = {
 
 export async function machines(who: Who): Promise<Machines> {
   return (await call(who, "GET", "/machines")).json();
+}
+
+/** One of the user's hosts (`dirigent host`), connected now. */
+export interface Host {
+  name: string;
+  os: string;
+  arch: string;
+  cpus: number;
+  memory: number;
+  labels: string[];
+  slots: number;
+  version: string;
+}
+
+/** Where `who`'s sessions can run: the cluster (when control runs players there, its machines)
+ * and their hosts connected now. */
+export interface Environments {
+  cluster: Machines | null;
+  hosts: Host[];
+}
+
+export async function environments(who: Who): Promise<Environments> {
+  return (await call(who, "GET", "/environments")).json();
+}
+
+/** A host as a line: its name, system and what it has. */
+export function hostLine(h: Host): string {
+  const system = h.os === "macos" ? "macOS" : h.os === "linux" ? "Linux" : h.os;
+  return [h.name, `${system} ${h.arch}`, ...h.labels].join(" · ");
 }

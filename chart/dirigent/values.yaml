@@ -131,7 +131,7 @@ player:
   checkpointMargin: 300
   # the mock model, no API calls (tests)
   mock: false
-  # more variables, e.g. {ANTHROPIC_BASE_URL: …, RUST_LOG: player=debug}
+  # more variables, e.g. {ANTHROPIC_BASE_URL: …, RUST_LOG: dirigent_player=debug}
   env: {}
   nodeSelector: {}
   # The VMs' own NixOS configuration: files, `configuration.nix` and those it imports (by
@@ -229,6 +229,20 @@ web:
     timeouts: {}
     annotations: {}
 
+# Hosts: your users' own machines running players for their sessions (`dirigent host`), which
+# connect to control's players' service (gRPC) as their user. With `expose`, the web's Ingress or
+# HTTPRoute routes that service's `Lease` and `Host` calls to control too, so a host reaches
+# dirigent at the web's address alone (`url` in its host.toml). Otherwise, reach control's `grpc`
+# port another way (e.g. on a tailnet, the control Service annotated for the Tailscale
+# operator: `tailscale.com/expose: "true"`) and give hosts its address (`players` in host.toml).
+hosts:
+  expose: false
+  # The players' own Ingress (beside the web's, at its host and TLS), for an Ingress controller
+  # that proxies gRPC: its annotations, e.g. ingress-nginx's
+  # {nginx.ingress.kubernetes.io/backend-protocol: GRPC}.
+  ingress:
+    annotations: {}
+
 networkPolicy:
   enabled: true
   # the cluster's pod and service ranges: the players reach the internet, but in the cluster only
@@ -277,8 +291,8 @@ ingestion:
       table: session_events
       database: dirigent
       # each row also stores its message's partition, offset and timestamp, which chlive reads
-      # the timestamp as UTC ISO text: ClickHouse 26.8 reads a bare number as seconds, earlier ones
-      # as milliseconds
+      # the timestamp as UTC ISO text (read "best effort"): ClickHouse 26.8 reads a bare number as
+      # seconds, earlier ones as milliseconds
       connectorConfig:
         transforms: kafka,ts
         transforms.kafka.type: org.apache.kafka.connect.transforms.InsertField$Value
@@ -289,3 +303,6 @@ ingestion:
         transforms.ts.field: ts
         transforms.ts.target.type: string
         transforms.ts.format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"
+        # which ClickHouse reads only "best effort" (its default `basic` before 26.x refuses the
+        # `T` and `Z`); the sink's own settings kept
+        clickhouseSettings: "async_insert=0,insert_deduplicate=1,date_time_input_format=best_effort"

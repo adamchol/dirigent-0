@@ -22,9 +22,10 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
 /// The session's log, once the workspace in `workdir` is made from `source`: with the event that
 /// says so appended, if there's one; or why it can't be made (which the player reports as it
 /// fails). And the workspace's mirror (its repository in `mirror`), made from the log and
-/// brought up to date: a workspace restored from a checkpoint, or made for the first time while
-/// the log has files already (an import's), becomes the log's last commit, and what's changed
-/// since is committed. Without git, the workspace isn't mirrored.
+/// brought up to date: a workspace restored from a checkpoint, or made here (the first time,
+/// as an import's is, or again, found gone with no checkpoint to restore), becomes the log's
+/// last commit, and what's changed since is committed. Without git, the workspace isn't
+/// mirrored.
 pub async fn open(
     session: &mut dyn Session,
     workdir: &'static Path,
@@ -34,41 +35,65 @@ pub async fn open(
     secrets: Secrets,
 ) -> anyhow::Result<(Vec<(String, Event)>, Option<Mirror>)> {
     let mut log = session.load().await?;
-    let mut restored = false;
-    match prepare(workdir, source, &log, checkpoints, &secrets).await {
-        Ok(None) => {}
-        Ok(Some(ev)) => {
-            info!(?ev, "workspace in place");
-            restored = matches!(
-                ev,
-                Event::WorkspaceRestored { .. }
-                    | Event::WorkspaceReady {
-                        recreated: false,
-                        ..
-                    }
-            );
-            let id = session.publish(&ev).await;
-            log.push((id, ev));
-        }
+    let empty = is_empty(workdir).map_err(|e| anyhow::anyhow!(e))?;
+    let ready = log
+        .iter()
+        .any(|(_, e)| matches!(e, Event::WorkspaceReady { .. }));
+    let mut made = match prepare(workdir, source, &log, checkpoints, &secrets).await {
+        Ok(made) => made,
         Err(error) => anyhow::bail!("the workspace couldn't be made: {error}"),
-    }
+    };
     let files = session.files().await?;
-    let mut mirror = match Mirror::open(mirror, workdir, &files, secrets).await {
-        Ok(m) => m,
+    let mirror = match Mirror::open(mirror, workdir, &files, secrets).await {
+        Ok(m) => Some(m),
         Err(e) => {
             warn!("the workspace isn't mirrored: {e:#}");
-            return Ok((log, None));
+            None
         }
     };
-    if restored {
-        if let Err(e) = mirror.restore().await {
-            warn!("the workspace stays as it was made: {e:#}");
+    // a workspace without a source, found gone: it has only what the log has
+    let gone = made.is_none() && empty && ready;
+    let restore = match &mirror {
+        Some(m) if gone => m.has_files().await,
+        _ => made.is_some(),
+    };
+    if let Some(m) = mirror.as_ref().filter(|_| restore) {
+        match m.restore().await {
+            Ok(Some(commit)) => match &mut made {
+                Some(Event::WorkspaceReady { files, .. }) => *files = Some(commit),
+                Some(_) => {}
+                None => {
+                    made = Some(Event::WorkspaceReady {
+                        source: None,
+                        head: None,
+                        recreated: true,
+                        files: Some(commit),
+                    })
+                }
+            },
+            Ok(None) => {}
+            Err(e) => warn!("the workspace stays as it was made: {e:#}"),
         }
     }
+    if let Some(ev) = made {
+        info!(?ev, "workspace in place");
+        let id = session.publish(&ev).await;
+        log.push((id, ev));
+    }
+    let Some(mut mirror) = mirror else {
+        return Ok((log, None));
+    };
     for ev in mirror.snapshot("the player starts").await {
         session.publish(&ev).await;
     }
     Ok((log, Some(mirror)))
+}
+
+fn is_empty(dir: &Path) -> Result<bool, String> {
+    Ok(std::fs::read_dir(dir)
+        .map_err(|e| format!("reading {}: {e}", dir.display()))?
+        .next()
+        .is_none())
 }
 
 /// Make the workspace in `workdir` (which exists) from `source`, as `log` (the session's log so
@@ -85,10 +110,7 @@ pub async fn prepare(
     let ready = log
         .iter()
         .any(|(_, e)| matches!(e, Event::WorkspaceReady { .. }));
-    let empty = std::fs::read_dir(workdir)
-        .map_err(|e| format!("reading {}: {e}", workdir.display()))?
-        .next()
-        .is_none();
+    let empty = is_empty(workdir)?;
     let last = log.iter().rev().find_map(|(_, e)| match e {
         Event::Checkpoint { snapshot, .. } => Some(snapshot),
         _ => None,
@@ -113,6 +135,7 @@ pub async fn prepare(
             source: None,
             head: None,
             recreated: false,
+            files: None,
         })),
         (Some(_), false, false) => Err(format!(
             "{} isn't empty, so the source can't be cloned into it",
@@ -124,6 +147,7 @@ pub async fn prepare(
                 source: Some(source.clone()),
                 head: Some(head(workdir).await?),
                 recreated,
+                files: None,
             }))
         }
     }
@@ -237,6 +261,7 @@ pub(crate) mod tests {
                 source: None,
                 head: None,
                 recreated,
+                files: None,
             },
         )]
     }
@@ -252,6 +277,7 @@ pub(crate) mod tests {
             source: Some(got),
             head: Some(head),
             recreated: false,
+            ..
         }) = prepare(&work, Some(&source), &[], None, &Secrets::none())
             .await
             .unwrap()
@@ -325,7 +351,8 @@ pub(crate) mod tests {
             Ok(Some(Event::WorkspaceReady {
                 source: None,
                 head: None,
-                recreated: false
+                recreated: false,
+                files: None,
             }))
         );
         assert_eq!(
@@ -649,5 +676,63 @@ pub(crate) mod tests {
             std::fs::read_to_string(work.join("file")).unwrap(),
             "later\n"
         );
+    }
+
+    #[tokio::test]
+    async fn a_workspace_found_gone_without_checkpoints_gets_the_sessions_files_from_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = repo(tmp.path());
+        // what the session had: its source's files, one changed and one new
+        let had = tmp.path().join("had");
+        std::fs::create_dir(&had).unwrap();
+        std::fs::write(had.join("file"), "changed\n").unwrap();
+        std::fs::write(had.join("new"), "n").unwrap();
+        let mirrored = dirigent_sync::Repo::open(&tmp.path().join("m"))
+            .await
+            .unwrap();
+        let mut files = dirigent_sync::Workspace::new(&had);
+        let snapshot = mirrored
+            .snapshot(&mut files, None, "Write c1")
+            .await
+            .unwrap()
+            .unwrap();
+        let files = dirigent_sync::events(&snapshot);
+
+        for source in [Some(git_source(&url, None)), None] {
+            // on another machine, with no checkpoint to restore
+            let work = tempfile::tempdir().unwrap();
+            let mut session = Logged {
+                log: ready(false),
+                files: files.clone(),
+                published: Vec::new(),
+            };
+            open(
+                &mut session,
+                leak(work.path()),
+                source.as_ref(),
+                None,
+                &tmp.path().join(format!("mirror-{}", source.is_some())),
+                Secrets::none(),
+            )
+            .await
+            .unwrap();
+            let [Event::WorkspaceReady {
+                recreated: true,
+                files: Some(commit),
+                ..
+            }] = &session.published[..]
+            else {
+                panic!("{:?}", session.published)
+            };
+            assert_eq!(commit, &snapshot.commit);
+            assert_eq!(
+                std::fs::read_to_string(work.path().join("file")).unwrap(),
+                "changed\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(work.path().join("new")).unwrap(),
+                "n"
+            );
+        }
     }
 }

@@ -16,7 +16,8 @@ service Players {
   // control starts); the call breaking (the connection lost, HTTP/2 keepalive timing out) keeps
   // it for a grace period, in which the same player may resume it with its epoch. Each new
   // holder gets the session's next epoch. A control that leases only the players it started
-  // (`--reserved-only`) ends an `Acquire` without an epoch with PERMISSION_DENIED.
+  // (`--reserved-only`) ends an `Acquire` without the reserved lease's epoch and token with
+  // PERMISSION_DENIED.
   rpc Lease(stream FromPlayer) returns (stream ToPlayer);
 
   // A warm player's, booted before any session asked for it (its VM one of those control keeps
@@ -25,6 +26,16 @@ service Players {
   // the call with NOT_FOUND when it has no such warm player (its VM is gone, or not one that's
   // current): the player must stop. A broken call is made again.
   rpc Wait(WaitRequest) returns (stream Assigned);
+
+  // A host's (`dirigent host`): a machine of a user's, which runs players for that user's
+  // sessions placed on it. The call is made as that user (`authorization: Bearer <token>`
+  // metadata, as control's API takes; in declared auth, `dirigent-user`), and held while the
+  // host runs: it's connected for as long as the call is open, which is all control knows of it.
+  // The host's first message is its `Hello`; then control tells it which players to start, and
+  // which sessions' workspaces to forget (those gone, at once, and those it has that aren't, as it
+  // connects). A second host of the user's with the same name takes the first one's place.
+  // UNAUTHENTICATED without a user.
+  rpc Host(stream FromHost) returns (stream ToHost);
 }
 
 message WaitRequest {
@@ -36,6 +47,8 @@ message WaitRequest {
 message Assigned {
   string session = 1;
   int64 epoch = 2;
+  // The reserved lease's token (see `Acquire`).
+  string token = 3;
 }
 
 message FromPlayer {
@@ -66,6 +79,9 @@ message Acquire {
   // The lease it resumes: one control reserved for it, or the one it held before its connection
   // broke. It gets that lease back or none, never a new one. Absent: the session, if it's free.
   optional int64 epoch = 3;
+  // The reserved lease's token, which control gave the runner that started the player: for it alone
+  // to take the lease (control leasing only the players it started requires it).
+  optional string token = 4;
 }
 
 message ToPlayer {
@@ -161,4 +177,66 @@ enum Effort {
 message GitSource {
   string url = 1;
   optional string ref = 2;
+}
+
+message FromHost {
+  oneof msg {
+    Hello hello = 1;
+    Started started = 2;
+    StartFailed start_failed = 3;
+  }
+}
+
+// What a host is, as it connects.
+message Hello {
+  // Its name, its user's choice (by default its hostname): how sessions are placed on it.
+  string name = 1;
+  // Its system: `macos`, `linux`; `aarch64`, `x86_64`.
+  string os = 2;
+  string arch = 3;
+  uint32 cpus = 4;
+  // In GiB.
+  uint32 memory = 5;
+  // Its user's words for what it has (e.g. `xcode`).
+  repeated string labels = 6;
+  // How many players it runs at once.
+  uint32 slots = 7;
+  // Its CLI's version.
+  string version = 8;
+  // The sessions whose workspaces it has.
+  repeated string sessions = 9;
+}
+
+// It started the player `player` for `session`, as control asked.
+message Started {
+  string session = 1;
+  string player = 2;
+}
+
+// It couldn't, and why.
+message StartFailed {
+  string session = 1;
+  string player = 2;
+  string error = 3;
+}
+
+message ToHost {
+  oneof msg {
+    Start start = 1;
+    Forget forget = 2;
+  }
+}
+
+// Start a player for `session`, where the lease for its `epoch` waits for `player`, which takes
+// it with `token`.
+message Start {
+  string session = 1;
+  string player = 2;
+  int64 epoch = 3;
+  string token = 4;
+}
+
+// Remove what the host has of `session`, which is gone (or never its user's).
+message Forget {
+  string session = 1;
 }

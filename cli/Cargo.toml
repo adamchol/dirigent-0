@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 dirigent-protocol = { path = "../protocol" }
 dirigent-sync = { path = "../sync" }
+dirigent-player = { path = "../player" }
 chlive-client = { git = "https://github.com/dialohq/chlive", branch = "master" }
 futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process", "signal", "sync"] }
@@ -24,6 +25,11 @@ sha2 = "0.10"
 rand = "0.9"
 rpassword = "7"
 regex = "1"
+toml = "0.9"
+tonic = "0.14"
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"

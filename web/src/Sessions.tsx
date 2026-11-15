@@ -19,6 +19,7 @@ import {
   PencilIcon,
   PlayIcon,
   PlusIcon,
+  ServerIcon,
   SquareIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -40,7 +41,12 @@ import {
   DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel, FieldTitle } from "@/components/ui/field";
@@ -53,7 +59,7 @@ import { Switch } from "@/components/ui/switch";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import * as api from "./api.ts";
-import type { Effort, Machines, Me, Model, Part, Provider, Resources, SessionInfo, Settings } from "./api.ts";
+import type { Effort, Host, Machines, Me, Model, Part, Provider, Resources, SessionInfo, Settings } from "./api.ts";
 import { RepoAccess } from "./GitHub.tsx";
 import { linked } from "./Link.tsx";
 import * as machine from "./machine.ts";
@@ -123,6 +129,44 @@ function act(what: string, f: () => Promise<void>, changed: () => void) {
     }
     changed();
   };
+}
+
+/** Where the session runs, its owner's to change while it's idle: the cluster, or one of their
+ * hosts connected now (and the one it's on, if that's away). Its next player starts there. */
+function RunsOnItems(props: { info: SessionInfo; who: api.Who; changed: () => void }) {
+  const [hosts, setHosts] = useState<Host[] | null>(null);
+  useEffect(() => {
+    api.environments(props.who).then(
+      (e) => setHosts(e.hosts),
+      () => setHosts([]),
+    );
+  }, [props.who]);
+  const on = props.info.environment ?? "";
+  const names = (hosts ?? []).map((h) => h.name);
+  const away = on && hosts && !names.includes(on);
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger>
+        <ServerIcon /> Runs on
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent>
+        <DropdownMenuRadioGroup
+          value={on}
+          onValueChange={(v: string) =>
+            act("Not moved", () => api.placeOn(props.who, props.info.id, v || null), props.changed)()
+          }
+        >
+          <DropdownMenuRadioItem value="">The cluster</DropdownMenuRadioItem>
+          {(hosts ?? []).map((h) => (
+            <DropdownMenuRadioItem key={h.name} value={h.name}>
+              {api.hostLine(h)}
+            </DropdownMenuRadioItem>
+          ))}
+          {away && <DropdownMenuRadioItem value={on}>{on} (not connected)</DropdownMenuRadioItem>}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
 }
 
 /** Archiving the session, or unarchiving it, and deleting it once it's archived (`remove`): its
@@ -235,6 +279,7 @@ export function SessionMenu(props: {
             <DropdownMenuItem onClick={() => navigator.clipboard.writeText(props.id).then(() => toast.success("Session ID copied"))}>
               <CopyIcon /> Copy ID
             </DropdownMenuItem>
+            {owner && info && idle && <RunsOnItems info={info} who={who} changed={changed} />}
             {owner && info && idle && <ArchiveItems info={info} who={who} changed={changed} remove={props.remove} />}
           </DropdownMenuGroup>
           {owner && !idle && (
@@ -513,6 +558,9 @@ export function NewSession(props: {
   const [busy, setBusy] = useState(false);
   const [machines, setMachines] = useState<Machines | null>(null);
   const [showMachine, setShowMachine] = useState(false);
+  // the user's hosts connected now, and the one it's to run on ("": the cluster)
+  const [hosts, setHosts] = useState<Host[]>([]);
+  const [host, setHost] = useState("");
   // as typed, until it's changed: the default one
   const [typed, setTyped] = useState<Record<keyof Resources, string> | null>(null);
   const plan = linked(props.me);
@@ -522,6 +570,10 @@ export function NewSession(props: {
     if (!props.open) return;
     setTyped(null);
     api.machines(who).then(setMachines, () => setMachines(null));
+    api.environments(who).then(
+      (e) => setHosts(e.hosts),
+      () => setHosts([]),
+    );
   }, [props.open, who]);
   const dflt = machines ? machine.defaults(machines, props.settings) : null;
   const shown = (part: keyof Resources) => typed?.[part] ?? String(dflt?.[part] ?? "");
@@ -565,7 +617,13 @@ export function NewSession(props: {
     const resources = chosen && dflt ? machine.asked(chosen, dflt) : undefined;
     setBusy(true);
     try {
-      await api.put(props.who, id, { model, effort: effort === "none" ? null : effort, source, part, provider, ...(resources ? { resources } : {}) }, start);
+      await api.put(
+        props.who,
+        id,
+        { model, effort: effort === "none" ? null : effort, source, part, provider, ...(resources && !host ? { resources } : {}) },
+        start,
+        host || null,
+      );
       props.setOpen(false);
       props.made(id);
     } catch (err) {
@@ -703,7 +761,30 @@ export function NewSession(props: {
                 </Select>
               </Field>
             </div>
-            {chosen && dflt && machines && (
+            {hosts.length > 0 && (
+              <Field>
+                <FieldLabel>Runs on</FieldLabel>
+                <Select
+                  items={[{ value: "", label: "The cluster" }, ...hosts.map((h) => ({ value: h.name, label: api.hostLine(h) }))]}
+                  value={host}
+                  onValueChange={(v) => setHost((v as string | null) ?? "")}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="">The cluster</SelectItem>
+                    {hosts.map((h) => (
+                      <SelectItem key={h.name} value={h.name}>
+                        {api.hostLine(h)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <FieldDescription>Your machines running `dirigent host`, connected now.</FieldDescription>
+              </Field>
+            )}
+            {!host && chosen && dflt && machines && (
               <div className="flex flex-col">
                 <button
                   type="button"

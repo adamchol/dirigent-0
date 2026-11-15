@@ -30,13 +30,16 @@ pub trait Runner: Send + Sync {
     /// `kube:<namespace>/<name>`. A control restarts only those of its own runner.
     fn id(&self) -> &str;
 
-    /// Start `player` (an id) on `session`, where the lease for its `epoch` waits for it: in the
-    /// cluster's own `system` (a store path) when there's one ready, on a `machine` of that size.
+    /// Start `player` (an id) on `session`, where the lease for its `epoch` waits for it (the
+    /// player takes it with `token`): in the cluster's own `system` (a store path) when there's one
+    /// ready, on a `machine` of that size.
+    #[allow(clippy::too_many_arguments)]
     async fn start(
         &self,
         session: Uuid,
         player: &str,
         epoch: i64,
+        token: &str,
         system: Option<&str>,
         machine: Resources,
     ) -> anyhow::Result<()>;
@@ -158,6 +161,7 @@ impl Runner for Local {
         session: Uuid,
         player: &str,
         epoch: i64,
+        token: &str,
         _system: Option<&str>,
         _machine: Resources,
     ) -> anyhow::Result<()> {
@@ -186,6 +190,8 @@ impl Runner for Local {
                     .iter()
                     .filter_map(|k| Some((k, std::env::var_os(k)?))),
             )
+            // in its environment, not its command line, which others may see
+            .env("DIRIGENT_LEASE_TOKEN", token)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
@@ -545,11 +551,13 @@ impl Runner for Kube {
         session: Uuid,
         player: &str,
         epoch: i64,
+        token: &str,
         system: Option<&str>,
         machine: Resources,
     ) -> anyhow::Result<()> {
         let mut env = format!(
-            "DIRIGENT_SESSION={session}\nDIRIGENT_PLAYER_ID={player}\nDIRIGENT_EPOCH={epoch}\n"
+            "DIRIGENT_SESSION={session}\nDIRIGENT_PLAYER_ID={player}\nDIRIGENT_EPOCH={epoch}\n\
+             DIRIGENT_LEASE_TOKEN={token}\n"
         );
         let generation = self.nix(&mut env, system);
         let (session_label, epoch_label) = (session.to_string(), epoch.to_string());

@@ -108,11 +108,14 @@ pub enum TurnEndReason {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Event {
     /// From the player, before it reads the log: it holds the session's lease, as the `epoch`th
-    /// player to (see `control`); `version`, the player's (none from those before it was told).
+    /// player to (see `control`); `version`, the player's (none from those before it was told);
+    /// `environment`, where it runs, by name, when it's not the cluster's VM (a host's).
     PlayerAttached {
         epoch: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environment: Option<String>,
     },
     /// From the player, last: the session was stopped and it gives the lease back, as the
     /// `epoch`th player.
@@ -122,7 +125,9 @@ pub enum Event {
     PlayerFailed { epoch: i64, error: String },
     /// From the player, after reading the log: the workspace is in place, from `source` (as in
     /// the spec) at the commit `head`; `recreated` when the log had it ready before but the
-    /// player found it gone and made it again, without what the session had changed.
+    /// player found it gone and made it again. `files`: the log's commit ([`Event::FilesChanged`])
+    /// whose files it has over that, the session's (an import's, or what it had changed before it
+    /// was found gone); without, a recreated workspace lost what the session had changed.
     WorkspaceReady {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<control::Source>,
@@ -130,6 +135,8 @@ pub enum Event {
         head: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         recreated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        files: Option<String>,
     },
     /// From the player, after reading the log: it found the workspace gone, and restored it from
     /// the log's last [`Event::Checkpoint`], `snapshot`.
@@ -376,6 +383,7 @@ mod tests {
             Event::PlayerAttached {
                 epoch: 1,
                 version: None,
+                environment: None,
             },
             Event::PlayerDetached { epoch: 1 },
             Event::PlayerFailed {
@@ -386,6 +394,7 @@ mod tests {
                 source: None,
                 head: None,
                 recreated: false,
+                files: None,
             },
             Event::WorkspaceRestored { snapshot: s() },
             Event::Checkpoint {

@@ -353,6 +353,36 @@ impl Store {
         Ok(Import::Importing)
     }
 
+    /// Where the session `id` runs: its owner, and the host they placed it on (none, the
+    /// cluster); none, if there's no such session.
+    pub async fn placement(&self, id: Uuid) -> anyhow::Result<Option<(String, Option<String>)>> {
+        let row = self
+            .db
+            .lock()
+            .await
+            .query_opt(
+                "SELECT o.subject, s.environment FROM dirigent.sessions s \
+                 JOIN dirigent.session_access o ON o.session_id = s.id AND o.role = 'owner' \
+                 WHERE s.id = $1",
+                &[&id],
+            )
+            .await?;
+        Ok(row.map(|r| (r.get(0), r.get(1))))
+    }
+
+    /// Place the session `id` on its owner's host `host` (none: the cluster), for its next start.
+    pub async fn place(&self, id: Uuid, host: Option<&str>) -> anyhow::Result<()> {
+        self.db
+            .lock()
+            .await
+            .execute(
+                "UPDATE dirigent.sessions SET environment = $2 WHERE id = $1",
+                &[&id, &host],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// The session `id`'s importer is done: players may take it.
     pub async fn imported(&self, id: Uuid) -> anyhow::Result<()> {
         self.db
@@ -410,8 +440,9 @@ impl Store {
     }
 
     /// Delete the leases that expired (chlive's grants go with them), of players started by
-    /// `runner` or not by control at all: each one's session, and whether `runner` had started
-    /// its player. (Those of other runners are their controls' to sweep.)
+    /// `runner` or a host (hosts connect to the one control there is), or not by control at all:
+    /// each one's session, and whether control had started its player. (Those of other runners
+    /// are their controls' to sweep.)
     pub async fn sweep(&self, runner: &str) -> anyhow::Result<Vec<(Uuid, bool)>> {
         let rows = self
             .db
@@ -419,7 +450,7 @@ impl Store {
             .await
             .query(
                 "DELETE FROM dirigent.session_access WHERE role = 'player' AND expires_at < now() \
-                 AND (spawned_by IS NULL OR spawned_by = $1) \
+                 AND (spawned_by IS NULL OR spawned_by = $1 OR spawned_by LIKE 'host:%') \
                  RETURNING session_id, spawned_by IS NOT NULL",
                 &[&runner],
             )
@@ -1246,7 +1277,7 @@ const SESSIONS: &str = "SELECT s.id, s.spec, s.epoch, p.subject, p.expires_at IS
              WHERE ss.session_id = s.id \
            UNION SELECT name FROM dirigent.user_secrets us WHERE us.subject = o.subject) n \
            ORDER BY name), \
-     (extract(epoch FROM s.archived) * 1000)::bigint \
+     (extract(epoch FROM s.archived) * 1000)::bigint, s.environment \
      FROM dirigent.sessions s \
      JOIN dirigent.session_access me \
        ON me.session_id = s.id AND me.subject = $1 AND me.role IN ('owner', 'viewer') \
@@ -1270,6 +1301,7 @@ fn session_info(row: &Row) -> anyhow::Result<SessionInfo> {
         created: row.get(8),
         secrets: row.get(9),
         archived: row.get(10),
+        environment: row.get(11),
     })
 }
 

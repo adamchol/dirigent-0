@@ -320,6 +320,11 @@ impl Repo {
         self.line(&mut cmd).await
     }
 
+    /// Whether `commit` has no files.
+    pub async fn is_empty(&self, commit: &str) -> anyhow::Result<bool> {
+        Ok(self.tree(commit).await? == EMPTY_TREE)
+    }
+
     async fn tree(&self, commit: &str) -> anyhow::Result<String> {
         let mut cmd = self.git();
         cmd.args(["rev-parse", &format!("{commit}^{{tree}}")]);

@@ -1,0 +1,55 @@
+# The Homebrew formula of a release: built from its source and tested on a Mac, then put in the
+# tap (adamchol/homebrew-dirigent), with HOMEBREW_TAP_TOKEN (contents write on the tap).
+name: homebrew
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release's tag (vX.Y.Z)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  formula:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: The formula, of this release's source
+        run: |
+          version="${TAG#v}"
+          curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz" -o source.tar.gz
+          sha=$(shasum -a 256 source.tar.gz | cut -d' ' -f1)
+          sed "s/@VERSION@/${version}/; s/@SHA256@/${sha}/" nix/homebrew/dirigent.rb > dirigent.rb
+
+      - name: Built from source, and tested
+        run: |
+          brew tap-new --no-git local/dirigent
+          cp dirigent.rb "$(brew --repository)/Library/Taps/local/homebrew-dirigent/Formula/"
+          brew install --build-from-source local/dirigent/dirigent
+          brew test local/dirigent/dirigent
+          brew audit --strict local/dirigent/dirigent || echo "::warning::brew audit --strict found something (above)"
+
+      - name: Into the tap
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${TOKEN}@github.com/adamchol/homebrew-dirigent.git" tap
+          mkdir -p tap/Formula
+          cp dirigent.rb tap/Formula/dirigent.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/dirigent.rb
+          git diff --cached --quiet || git commit -m "dirigent ${TAG#v}"
+          git push

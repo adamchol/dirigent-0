@@ -9,6 +9,7 @@ mod auth;
 mod bootstrap;
 mod chatgpt;
 mod github;
+mod hosts;
 mod leases;
 mod machines;
 mod nixstore;
@@ -48,6 +49,7 @@ use uuid::Uuid;
 
 use crate::chatgpt::{ChatGpt, ChatGptArgs, LinkInfo, Model, Started as LinkStarted};
 use crate::github::{Github, GithubArgs, Repo, GITHUB_TOKEN};
+use crate::hosts::Hosts;
 use crate::leases::{Acquire, Archive, Delete, Import, Put, Reserve, Scope, Store};
 use crate::machines::{MachineArgs, Machines, Partial};
 use crate::prune::{PruneArgs, Pruner};
@@ -164,7 +166,7 @@ struct Cli {
     #[arg(long, default_value_t = 60)]
     startup: u64,
 
-    /// Lease sessions only to the players control started (who know their reserved epoch):
+    /// Lease sessions only to the players control started (with their leases' tokens):
     /// otherwise anything that reaches the gRPC service may take an idle session.
     #[arg(long, env = "DIRIGENT_RESERVED_ONLY")]
     reserved_only: bool,
@@ -264,6 +266,8 @@ struct Control {
     /// finds the connection or drops a lease no one is connected for.
     attached: Mutex<HashMap<Uuid, Attached>>,
     connections: AtomicU64,
+    /// The hosts connected now: where sessions placed on them run.
+    hosts: Hosts,
     /// How long a web sign-in lasts unused (`--session-days`).
     sign_in_ttl: Duration,
 }
@@ -375,7 +379,7 @@ async fn main() -> anyhow::Result<()> {
         pool::keep(control).await
     });
     if let Some(pruner) = pruner {
-        tokio::spawn(prune::prune(&control.store, runner, pruner));
+        tokio::spawn(prune::prune(&control.store, runner, &control.hosts, pruner));
         tokio::spawn(prune::maintain(pruner));
     }
     if let Some(kube) = kube {
@@ -434,6 +438,7 @@ fn control(
         startup,
         reserved_only,
         attached: Default::default(),
+        hosts: Default::default(),
         connections: AtomicU64::new(0),
         sign_in_ttl,
     }))
@@ -450,6 +455,10 @@ fn router(control: &'static Control) -> Router {
         .route("/sessions/{id}/stop", post(stop_session))
         .route("/sessions/{id}/archive", post(archive_session))
         .route("/sessions/{id}/unarchive", post(unarchive_session))
+        .route(
+            "/sessions/{id}/environment",
+            axum::routing::put(put_environment),
+        )
         .route(
             "/sessions/{id}/import",
             post(start_import).delete(finish_import),
@@ -487,6 +496,7 @@ fn router(control: &'static Control) -> Router {
         .route("/nix/paths", post(nix_paths))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/machines", get(get_machines))
+        .route("/environments", get(get_environments))
         .route("/session", post(open_sign_in).delete(close_sign_in))
         .route("/session/token", post(sign_in_token))
         .route("/token", post(chlive_token))
@@ -883,6 +893,43 @@ async fn get_machines(
     Json(&control.machines)
 }
 
+/// Where the caller's sessions can run: the cluster (when control runs players there, on its
+/// machines) and their hosts connected now.
+async fn get_environments(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "cluster": control.runner.map(|_| &control.machines),
+        "hosts": control.hosts.of(&caller),
+    }))
+}
+
+#[derive(Deserialize)]
+struct Placement {
+    /// One of the owner's hosts, by name; none, the cluster.
+    host: Option<String>,
+}
+
+/// Place the session, the caller's, on one of their hosts or the cluster: its next player starts
+/// there (one running now goes on where it is).
+async fn put_environment(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Placement>,
+) -> Result<StatusCode, Failed> {
+    owned(control, id, &caller).await?;
+    let host = body.host.filter(|h| !h.is_empty());
+    match control.store.place(id, host.as_deref()).await {
+        Ok(()) => {
+            info!(session = %id, host, "session placed");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) => Err(failed(&format!("placing the session {id}"), e)),
+    }
+}
+
 /// The caller's settings, defaults for those they haven't set.
 async fn get_settings(
     State(control): State<&'static Control>,
@@ -1096,6 +1143,8 @@ enum Started {
     Importing,
     /// There's no runner to start players with.
     NoRunner,
+    /// It's placed on its owner's host of that name, which isn't connected.
+    Away(String),
 }
 
 /// A lease not reserved, as a start's outcome.
@@ -1113,6 +1162,16 @@ impl From<Reserve> for Started {
 
 /// Start a player for `session`, unless one holds it.
 async fn start(control: &'static Control, session: Uuid) -> anyhow::Result<Started> {
+    match control.store.placement(session).await? {
+        None => return Ok(Started::Unknown),
+        Some((owner, Some(name))) => {
+            let Some(host) = control.hosts.get(&owner, &name) else {
+                return Ok(Started::Away(name));
+            };
+            return start_on(control, session, &*host, None).await;
+        }
+        Some((_, None)) => {}
+    }
     let Some(runner) = control.runner else {
         return Ok(Started::NoRunner);
     };
@@ -1142,8 +1201,9 @@ async fn start(control: &'static Control, session: Uuid) -> anyhow::Result<Start
             }
         };
         let player = warm.player.clone();
+        let token = control.auth.signer.lease(&session.to_string(), &subject);
         let taken = match runner.take(session, &player, epoch).await {
-            Ok(()) => warm.tell(session, epoch).await,
+            Ok(()) => warm.tell(session, epoch, token).await,
             Err(e) => {
                 warn!(session = %session, player, "taking a warm VM: {e:#}");
                 false
@@ -1160,6 +1220,16 @@ async fn start(control: &'static Control, session: Uuid) -> anyhow::Result<Start
         control.pool.wake();
         control.store.drop_lease(session).await?;
     }
+    start_on(control, session, runner, Some(machine)).await
+}
+
+/// Start a new player for `session` with `runner`: on `machine`, the cluster's.
+async fn start_on(
+    control: &'static Control,
+    session: Uuid,
+    runner: &dyn Runner,
+    machine: Option<Resources>,
+) -> anyhow::Result<Started> {
     let player = Uuid::new_v4().to_string();
     let subject = player_subject(&player);
     let epoch = match control
@@ -1176,8 +1246,10 @@ async fn start(control: &'static Control, session: Uuid) -> anyhow::Result<Start
         .as_ref()
         .filter(|_| runner.runs_systems())
         .and_then(|s| s.start(session, epoch));
+    let token = control.auth.signer.lease(&session.to_string(), &subject);
+    let machine = machine.unwrap_or(control.machines.defaults);
     if let Err(e) = runner
-        .start(session, &player, epoch, system.as_deref(), machine)
+        .start(session, &player, epoch, &token, system.as_deref(), machine)
         .await
     {
         control.store.drop_lease(session).await?;
@@ -1216,6 +1288,9 @@ struct NewSession {
     /// Start it too, as `POST …/start` does.
     #[serde(default)]
     start: bool,
+    /// Where it runs: one of the owner's hosts, by name (none: the cluster).
+    #[serde(default)]
+    environment: Option<String>,
 }
 
 type Failed = (StatusCode, String);
@@ -1295,6 +1370,13 @@ async fn put_session(
     let status = match put {
         Ok(Put::Made) => {
             info!(session = %id, owner = caller, viewers = ?body.viewers, spec = ?body.spec, "session made");
+            if let Some(host) = body.environment.as_deref() {
+                control
+                    .store
+                    .place(id, Some(host))
+                    .await
+                    .map_err(|e| failed(&format!("placing the session {id}"), e))?;
+            }
             // perhaps a user active anew, whose warm VMs there are
             if machines.per_user {
                 control.pool.wake();
@@ -1332,6 +1414,10 @@ fn started(id: Uuid, r: anyhow::Result<Started>) -> Result<(), Failed> {
         Ok(Started::Importing) => {
             Err((StatusCode::CONFLICT, "the session is being imported".into()))
         }
+        Ok(Started::Away(host)) => Err((
+            StatusCode::CONFLICT,
+            format!("the session runs on {host}, which isn't connected"),
+        )),
         Ok(Started::NoRunner) => Err((
             StatusCode::NOT_IMPLEMENTED,
             "control runs no players (no --players)".into(),
@@ -1743,6 +1829,68 @@ struct Lessor(&'static Control);
 impl Players for Lessor {
     type LeaseStream = ReceiverStream<Result<pb::ToPlayer, Status>>;
     type WaitStream = ReceiverStream<Result<pb::Assigned, Status>>;
+    type HostStream = ReceiverStream<Result<pb::ToHost, Status>>;
+
+    /// A host connects, as its user, to run players for their sessions placed on it; it's there
+    /// for as long as the call is.
+    async fn host(
+        &self,
+        request: Request<Streaming<pb::FromHost>>,
+    ) -> Result<Response<Self::HostStream>, Status> {
+        let control = self.0;
+        let headers = request.metadata().clone().into_headers();
+        let owner = control
+            .auth
+            .caller(&headers)
+            .await
+            .map_err(Status::unauthenticated)?;
+        let mut inbound = request.into_inner();
+        let first = tokio::time::timeout(ASK_TIMEOUT, inbound.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("no Hello"))??;
+        let Some(pb::FromHost {
+            msg: Some(pb::from_host::Msg::Hello(hello)),
+        }) = first
+        else {
+            return Err(Status::invalid_argument("the first message is a Hello"));
+        };
+        if hello.name.is_empty() {
+            return Err(Status::invalid_argument("a host has a name"));
+        }
+        let (tx, rx) = mpsc::channel(16);
+        let had = hello.sessions.clone();
+        let host = control.hosts.connect(&owner, hello, tx);
+        info!(
+            owner,
+            host = host.hello.name,
+            os = host.hello.os,
+            "host connected"
+        );
+        tokio::spawn(async move {
+            // what it has of sessions that are gone, or aren't its user's
+            for session in had.iter().filter_map(|s| Uuid::parse_str(s).ok()) {
+                if let Ok(None | Some(Role::Viewer)) = control.store.role(session, &owner).await {
+                    let _ = host.forget(session).await;
+                }
+            }
+            loop {
+                match inbound.message().await {
+                    Ok(Some(pb::FromHost { msg: Some(msg) })) => match msg {
+                        pb::from_host::Msg::Started(s) => host.answered(&s.player, Ok(())),
+                        pb::from_host::Msg::StartFailed(f) => {
+                            host.answered(&f.player, Err(f.error))
+                        }
+                        pb::from_host::Msg::Hello(_) => warn!(owner, "a host said Hello twice"),
+                    },
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            control.hosts.disconnect(&host);
+            info!(owner, host = host.hello.name, "host disconnected");
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
 
     /// A warm player waits to be given a session.
     async fn wait(
@@ -1775,12 +1923,19 @@ impl Players for Lessor {
         let session = Uuid::parse_str(&ask.session).map_err(|_| {
             Status::invalid_argument(format!("{:?} isn't a session id", ask.session))
         })?;
-        if control.reserved_only && ask.epoch.is_none() {
+        let subject = player_subject(&ask.player);
+        // the lease reserved for it, which its token says is its (its id is in the session's
+        // log, for anyone who reads it to see)
+        let reserved = ask.epoch.is_some()
+            && ask
+                .token
+                .as_deref()
+                .is_some_and(|t| control.auth.signer.leases(t, &ask.session, &subject));
+        if control.reserved_only && !reserved {
             return Err(Status::permission_denied(
                 "control leases sessions only to the players it started",
             ));
         }
-        let subject = player_subject(&ask.player);
         let conn = control.connections.fetch_add(1, Ordering::Relaxed);
         let mut attached = control.attached.lock().await;
         let (epoch, spec, owner) = match control.store.acquire(session, &subject, ask.epoch).await {
@@ -2218,6 +2373,17 @@ mod e2e {
 
     /// Ask for `session` as `player` in a new call; held, the call stays `conn`'s.
     async fn acquire(conn: &mut Conn, session: Uuid, player: &str, epoch: Option<i64>) -> Reply {
+        acquire_with(conn, session, player, epoch, None).await
+    }
+
+    /// The same, with the reserved lease's `token`.
+    async fn acquire_with(
+        conn: &mut Conn,
+        session: Uuid,
+        player: &str,
+        epoch: Option<i64>,
+        token: Option<String>,
+    ) -> Reply {
         let (via, proxy) = proxy(&conn.grpc).await;
         let mut client = PlayersClient::connect(format!("http://{via}"))
             .await
@@ -2228,6 +2394,7 @@ mod e2e {
                 session: session.to_string(),
                 player: player.into(),
                 epoch,
+                token,
             })),
         };
         tx.send(ask).await.unwrap();
@@ -2284,6 +2451,8 @@ mod e2e {
         warm: std::sync::Mutex<Vec<runner::Warm>>,
         taken: std::sync::Mutex<Vec<(Uuid, String, i64)>>,
         generation: std::sync::atomic::AtomicU64,
+        /// The leases' tokens, by player.
+        tokens: std::sync::Mutex<HashMap<String, String>>,
     }
 
     #[async_trait::async_trait]
@@ -2297,10 +2466,15 @@ mod e2e {
             session: Uuid,
             player: &str,
             epoch: i64,
+            token: &str,
             system: Option<&str>,
             machine: Resources,
         ) -> anyhow::Result<()> {
             anyhow::ensure!(!self.fail, "the runner fails");
+            self.tokens
+                .lock()
+                .unwrap()
+                .insert(player.into(), token.into());
             self.machines.lock().unwrap().push((session, machine));
             self.started
                 .lock()
@@ -2407,6 +2581,7 @@ mod e2e {
             warm: Default::default(),
             taken: Default::default(),
             generation: Default::default(),
+            tokens: Default::default(),
         }))
     }
 
@@ -2548,7 +2723,12 @@ mod e2e {
             pool::keep(control).await
         });
         if let Some(pruner) = pruner {
-            tokio::spawn(prune::prune(&control.store, Some(runner), pruner));
+            tokio::spawn(prune::prune(
+                &control.store,
+                Some(runner),
+                &control.hosts,
+                pruner,
+            ));
         }
         tokio::spawn(async move { axum::serve(listener, router(control)).await });
         tokio::spawn(players(control).serve_with_incoming(TcpListenerStream::new(grpc)));
@@ -2930,6 +3110,117 @@ mod e2e {
     }
 
     #[tokio::test]
+    async fn e2e_a_session_placed_on_a_host_starts_there_while_its_connected() {
+        let runner = recorder(false);
+        let Some(base) = start_recording(runner).await else {
+            return;
+        };
+        let (s, gone) = (Uuid::new_v4(), Uuid::new_v4());
+        put(&base, s).await;
+        let placed = send_json(
+            &base,
+            A,
+            reqwest::Method::PUT,
+            &format!("/sessions/{s}/environment"),
+            serde_json::json!({ "host": "mac" }),
+        )
+        .await;
+        assert_eq!(placed.0, reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(info(&base, s).await.environment.as_deref(), Some("mac"));
+        let start = format!("/sessions/{s}/start");
+        assert_eq!(
+            post(&base, &start, None).await,
+            reqwest::StatusCode::CONFLICT,
+            "its host isn't connected"
+        );
+
+        let mut client = PlayersClient::connect(format!("http://{}", base.grpc))
+            .await
+            .unwrap();
+        let hello = |sessions: Vec<String>| pb::FromHost {
+            msg: Some(pb::from_host::Msg::Hello(pb::Hello {
+                name: "mac".into(),
+                os: "macos".into(),
+                arch: "aarch64".into(),
+                slots: 1,
+                sessions,
+                ..Default::default()
+            })),
+        };
+        // only as a user
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(hello(vec![])).await.unwrap();
+        let anyone = client.host(ReceiverStream::new(rx)).await;
+        assert_eq!(anyone.unwrap_err().code(), Code::Unauthenticated);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(hello(vec![s.to_string(), gone.to_string()]))
+            .await
+            .unwrap();
+        let mut call = Request::new(ReceiverStream::new(rx));
+        call.metadata_mut().insert(auth::CALLER, A.parse().unwrap());
+        let mut inbound = client.host(call).await.unwrap().into_inner();
+        // what it has of a session that's no more goes; its user's stays
+        let Some(pb::ToHost {
+            msg: Some(pb::to_host::Msg::Forget(f)),
+        }) = inbound.message().await.unwrap()
+        else {
+            panic!("no Forget");
+        };
+        assert_eq!(f.session, gone.to_string());
+        let (_, listed) = get_json(&base, A, "/environments").await;
+        assert_eq!(listed["hosts"][0]["name"], "mac");
+        assert_eq!(listed["hosts"][0]["os"], "macos");
+        let (_, others) = get_json(&base, B, "/environments").await;
+        assert_eq!(others["hosts"], serde_json::json!([]));
+
+        // started there, and not by the cluster's runner
+        let host = async {
+            let Some(pb::ToHost {
+                msg: Some(pb::to_host::Msg::Start(asked)),
+            }) = inbound.message().await.unwrap()
+            else {
+                panic!("no Start");
+            };
+            assert_eq!(asked.session, s.to_string());
+            let started = pb::from_host::Msg::Started(pb::Started {
+                session: asked.session.clone(),
+                player: asked.player.clone(),
+            });
+            tx.send(pb::FromHost { msg: Some(started) }).await.unwrap();
+            asked
+        };
+        let (started, asked) = tokio::join!(post(&base, &start, None), host);
+        assert_eq!(started, reqwest::StatusCode::NO_CONTENT);
+        assert!(runner.of(s).is_empty());
+        // its player takes the lease with the token it was given
+        let mut conn = connect(&base).await;
+        assert_eq!(
+            acquire_with(
+                &mut conn,
+                s,
+                &asked.player,
+                Some(asked.epoch),
+                Some(asked.token)
+            )
+            .await,
+            acquired(asked.epoch)
+        );
+        conn.close().await;
+
+        // gone, it's listed no more
+        drop((tx, inbound));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let (_, listed) = get_json(&base, A, "/environments").await;
+            if listed["hosts"] == serde_json::json!([]) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{listed}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn e2e_reserved_only_control_leases_only_the_players_it_started() {
         let runner = recorder(false);
         let Some(base) =
@@ -2947,7 +3238,22 @@ mod e2e {
         );
         post(&base, &format!("/sessions/{s}/start"), None).await;
         let (p, _) = runner.of(s).remove(0);
-        assert_eq!(acquire(&mut ws, s, &p, Some(1)).await, acquired(1));
+        // its id alone, which its log shows, isn't enough
+        assert_eq!(
+            acquire(&mut ws, s, &p, Some(1)).await,
+            Reply::Refused(Code::PermissionDenied)
+        );
+        let token = runner.tokens.lock().unwrap()[&p].clone();
+        let other = Uuid::new_v4();
+        put(&base, other).await;
+        assert_eq!(
+            acquire_with(&mut ws, other, &p, Some(1), Some(token.clone())).await,
+            Reply::Refused(Code::PermissionDenied)
+        );
+        assert_eq!(
+            acquire_with(&mut ws, s, &p, Some(1), Some(token)).await,
+            acquired(1)
+        );
         ws.close().await;
     }
 
@@ -4807,11 +5113,12 @@ mod e2e {
             session: Uuid,
             player: &str,
             epoch: i64,
+            token: &str,
             system: Option<&str>,
             machine: Resources,
         ) -> anyhow::Result<()> {
             self.local
-                .start(session, player, epoch, system, machine)
+                .start(session, player, epoch, token, system, machine)
                 .await
         }
 

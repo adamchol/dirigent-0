@@ -12,6 +12,22 @@ dirigent's releases: the chart and the images, both at the chart's version (`cha
   - `--dry-run` shows what would be imported. Importing the same session again says where it went; `--again` makes another session.
   - The session isn't started: your next message starts it.
 - Codex sessions are read from Codex's rollout format, which hasn't been tried on a real Codex session yet.
+- Hosts: your own machines run your sessions (`dirigent host`).
+  - The host connects to dirigent as you, and runs a player for each session you place on it, in a directory of its own under its roots. It's listed while it's connected; nothing about it is stored.
+  - In the web: a new session's "Runs on", an idle session's "Runs on" menu, and your hosts in Settings. Through the API: `PUT /sessions/{id}/environment` and `GET /environments`.
+  - Its config is `~/.config/dirigent/host.toml`: `url`, `name`, `roots`, `slots`, `labels`, `environment` (added to the players' system prompt, which describes the host's system and user in place of the cluster's NixOS VMs).
+  - As a service: `dirigent host install` (a launchd agent on macOS, a systemd user unit on Linux), or `sudo dirigent host install --system [--user <name>]` (a launchd daemon, a systemd system unit). There are modules too: `homeManagerModules`, `nixosModules` and `darwinModules.dirigent-host`.
+  - Homebrew: `brew install adamchol/dirigent/dirigent`, built from source; `brew services start dirigent` runs the host.
+  - With `hosts.expose`, the chart routes control's players' service (gRPC) at the web's address, so a host needs only `url`. Otherwise, give hosts its address (`players`), e.g. on a tailnet.
+- A session moving between the cluster and a host keeps its files: a player that finds the workspace gone, with no checkpoint to restore, gets the files the log has (all but those .gitignore leaves out, and those over 50 MB). The conversation notes the move.
+
+### Fixed
+- On ClickHouse before 26.x, 0.1.8's ingestion dropped every event: the message times' UTC text (`2026-11-14T23:37:12.111Z`) is read only with `date_time_input_format=best_effort`, which the pipeline's inserts now set. With `ingestion.enabled: false`, add it to your connector's `clickhouseSettings`. Events lost meanwhile can be ingested again from the topic, while it has them.
+
+### Changed
+- Leases are taken with a token: control gives one to each player it starts, for that session alone. A player's id, which a session's log shows, no longer lets anything that reaches control's players' service take the lease. Players and VMs of earlier releases can't take leases from this control (`--reserved-only`, which the chart sets).
+- The player is a library too: the CLI runs players itself (`dirigent __player`), so one binary is all a host needs.
+- The player's logging target is `dirigent_player` (e.g. `RUST_LOG=dirigent_player=debug`).
 
 ### Notes
 - An imported session's rows carry the time of the import. The web marks where the imported conversation ends, with the dates it really had.
