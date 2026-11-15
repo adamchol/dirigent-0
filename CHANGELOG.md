@@ -2,7 +2,7 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
-## Unreleased
+## 0.1.13 (2026-11-15)
 
 ### Added
 - A session's model, effort and provider can be switched while it lives: **Model** in the web's session menu, the dirigent's `switch_model` tool, or `PUT /sessions/{id}/model`. A running session takes them from its next model call (the call running finishes as it began); an idle one starts with them. The conversation goes on whole, compacted first if it no longer fits the new model's window; thinking goes back only to the provider that made it. The log records it (`model_changed`, and `player_attached` now says what its player runs), and the chat shows it. The first call after a switch reads the conversation without the provider's cache, once.

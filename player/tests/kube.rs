@@ -423,7 +423,8 @@ async fn a_session_takes_a_warm_vm_and_another_is_made() {
     .await;
     let log = log_within(&stack, &session, boot, |r| turns_ended(r) == 1).await;
     let out = tool_output(&log);
-    assert!(out.contains("\nactive"), "{out}");
+    // the event's JSON: its line breaks escaped
+    assert!(out.contains(r"warm\nactive\n"), "{out}");
     assert!(
         out.contains(&format!("dirigent-{}", &session[..8])),
         "{out}"
