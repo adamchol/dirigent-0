@@ -2,7 +2,7 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
-## Unreleased
+## 0.1.9 (2026-11-15)
 
 ### Added
 - `dirigent import claude-code|codex [<id>]` makes another agent's session a dirigent session that goes on from where it was. Without an id, it takes the last session of the current directory.
