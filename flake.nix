@@ -1,6 +1,15 @@
 {
   description = "dirigent: event-driven coding agents";
 
+  # releases' CLI, built by CI (.github/workflows/cachix.yml); Nix asks before using it, unless
+  # it's trusted (--accept-flake-config, or the cache in nix.conf)
+  nixConfig = {
+    extra-substituters = [ "https://dirigent.cachix.org" ];
+    extra-trusted-public-keys = [
+      "dirigent.cachix.org-1:9st/693o4bC8VbqMDHIoYcYn6Mp4PR/zLNCJ7YSI+GQ="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";

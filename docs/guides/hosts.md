@@ -115,6 +115,8 @@ The flake has a module for each way:
 | `user` (NixOS, nix-darwin) | string or null | null (root) |
 | `credentialsFile` (NixOS, nix-darwin) | string | `/etc/dirigent/credentials.json` |
 
+Releases are built into the `dirigent.cachix.org` cache. Modules don't use the flake's own settings, so add it to your system's Nix (`nix.settings.extra-substituters = [ "https://dirigent.cachix.org" ];` and `extra-trusted-public-keys = [ "dirigent.cachix.org-1:9st/693o4bC8VbqMDHIoYcYn6Mp4PR/zLNCJ7YSI+GQ=" ];`), and use a release's tag (`github:adamchol/dirigent-0/v<version>`) without making its `nixpkgs` follow yours, or the CLI is built rather than downloaded.
+
 With home-manager, sign in once with `dirigent login`. With the system modules, copy your
 credentials: `sudo install -m 600 ~/.config/dirigent/credentials.json /etc/dirigent/credentials.json`
 (and `chown` it to `user`, if set).

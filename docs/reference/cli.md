@@ -8,7 +8,7 @@ workspaces, imports other agents' sessions, and runs your machines as hosts.
 | How | Command |
 |---|---|
 | Homebrew (macOS, Linux) | `brew install adamchol/dirigent/dirigent` (built from source; `--HEAD` for master) |
-| Nix | `nix profile install github:adamchol/dirigent-0#cli`, or `nix run github:adamchol/dirigent-0#cli -- …` |
+| Nix | `nix profile install github:adamchol/dirigent-0/v<version>#cli`, or `nix run github:adamchol/dirigent-0/v<version>#cli -- …`. Releases are in the `dirigent.cachix.org` cache, which the flake names: accept it when Nix asks (or pass `--accept-flake-config`) to download the CLI instead of building it. |
 | From source | `cargo install --path cli` in a clone (needs `git` at run time) |
 
 `dirigent --version` prints its version.

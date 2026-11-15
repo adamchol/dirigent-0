@@ -1,0 +1,43 @@
+# The CLI of a release, built with Nix for each system the flake has it on and pushed to the
+# dirigent Cachix cache (with CACHIX_AUTH_TOKEN), so `nix profile install`, `nix run` and the
+# Nix modules at that tag substitute it instead of building it. The flake's nixConfig names the
+# cache.
+name: cachix
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release's tag (vX.Y.Z)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  cli:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ github.token }}
+      # pushes what the job adds to the store: the CLI and what it's built from
+      - uses: cachix/cachix-action@v16
+        with:
+          name: dirigent
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Build
+        run: |
+          nix build --print-build-logs .#cli
+          ./result/bin/dirigent --version

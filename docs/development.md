@@ -92,5 +92,5 @@ A release is a tag `vX.Y.Z` on master:
 4. Commit `chore: release X.Y.Z`, push master, tag `vX.Y.Z` and push the tag.
 
 The tag's workflows build and push the images and the chart to `ghcr.io/adamchol` (on nixbuild.net;
-the chart's version must match the tag), and build the CLI on macOS and update the Homebrew formula
-in `adamchol/homebrew-dirigent`.
+the chart's version must match the tag), build the CLI on macOS and update the Homebrew formula in `adamchol/homebrew-dirigent`, and build the
+CLI with Nix on Linux (x86_64, aarch64) and macOS into the `dirigent.cachix.org` cache.

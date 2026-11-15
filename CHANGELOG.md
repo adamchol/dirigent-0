@@ -6,6 +6,7 @@ dirigent's releases: the chart and the images, both at the chart's version (`cha
 
 ### Added
 - Documentation: a README, and `docs/` on using dirigent (the web, sessions, the agent, dirigents, accounts and secrets, workspaces, hosts, importing), running it (installing, configuration, machines and systems, operations), references (CLI, HTTP API, events, control) and its architecture.
+- Releases' CLI is in the `dirigent.cachix.org` Nix cache (x86_64 and aarch64 Linux, Apple silicon macOS), which the flake names: `nix profile install github:adamchol/dirigent-0/v<version>#cli` downloads it.
 
 ### Fixed
 - A session that came back to a host it had run on worked on the files the host kept, without what it did elsewhere meanwhile, and mirrored them into the log as its latest. Its player now brings them up to the session's latest files.
