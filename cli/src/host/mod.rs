@@ -7,6 +7,7 @@
 //! daemon. `host install` makes the daemon a service of the system's ([`service`]).
 
 pub mod service;
+pub mod status;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -41,8 +42,7 @@ pub struct Config {
     pub players: Option<String>,
     /// The host's name, how sessions are placed on it: by default, this machine's.
     pub name: Option<String>,
-    /// Where sessions' directories go; by default `~/dirigent` (`/var/lib/dirigent` for the
-    /// system's service).
+    /// Where sessions' directories go; by default `~/dirigent`.
     pub roots: Vec<PathBuf>,
     /// How many players it runs at once (2 by default).
     pub slots: Option<u32>,
@@ -104,14 +104,14 @@ impl Config {
         })
     }
 
-    fn slots(&self) -> u32 {
+    pub fn slots(&self) -> u32 {
         self.slots.unwrap_or(2).max(1)
     }
 
-    /// The roots, `~` expanded; by default `default`.
-    fn roots(&self, default: &Path) -> Vec<PathBuf> {
+    /// The roots, `~` expanded; by default `~/dirigent`.
+    pub fn roots(&self) -> Vec<PathBuf> {
         if self.roots.is_empty() {
-            return vec![default.to_path_buf()];
+            return vec![expand(Path::new("~/dirigent"))];
         }
         self.roots.iter().map(|r| expand(r)).collect()
     }
@@ -132,6 +132,17 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
     }
     let creds = crate::credentials::path()?;
     Ok(creds.with_file_name("host.toml"))
+}
+
+/// The host's name, how sessions are placed on it: the config's, or this machine's.
+pub async fn name(config: &Config) -> String {
+    if let Some(name) = &config.name {
+        return name.clone();
+    }
+    match service::output("hostname", &["-s"]).await {
+        Ok(name) if !name.trim().is_empty() => name.trim().to_string(),
+        _ => "host".into(),
+    }
 }
 
 /// The machine, as the host says it is.
@@ -187,12 +198,7 @@ impl Machine {
                     .map_or(0, |kib| kib * 1024),
             ),
         };
-        let name = match &config.name {
-            Some(name) => name.clone(),
-            None => output("hostname", &["-s"])
-                .await
-                .unwrap_or_else(|| "host".into()),
-        };
+        let name = name(config).await;
         Machine {
             name,
             os,
@@ -238,9 +244,10 @@ impl Players {
 }
 
 /// Run the host until it's stopped: connected to control, and again when the connection breaks.
-pub async fn run(mut api: Api, config: Config, system: bool) -> anyhow::Result<()> {
+pub async fn run(mut api: Api, config: Config) -> anyhow::Result<()> {
+    service::not_root("run the host").await?;
     let endpoints = config.endpoints(&api.creds.api)?;
-    let roots = config.roots(&default_root(system));
+    let roots = config.roots();
     for root in &roots {
         std::fs::create_dir_all(root).with_context(|| format!("making {}", root.display()))?;
     }
@@ -264,13 +271,6 @@ pub async fn run(mut api: Api, config: Config, system: bool) -> anyhow::Result<(
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
-    }
-}
-
-fn default_root(system: bool) -> PathBuf {
-    match system {
-        true => PathBuf::from("/var/lib/dirigent"),
-        false => expand(Path::new("~/dirigent")),
     }
 }
 
@@ -345,6 +345,11 @@ async fn connect(
 
 /// The sessions whose directories the roots have.
 fn sessions(roots: &[PathBuf]) -> Vec<String> {
+    workspaces(roots).into_iter().map(|(id, _)| id).collect()
+}
+
+/// The sessions' directories under `roots`: by session.
+pub fn workspaces(roots: &[PathBuf]) -> Vec<(String, PathBuf)> {
     let mut found = Vec::new();
     for root in roots {
         let Ok(entries) = std::fs::read_dir(root) else {
@@ -353,10 +358,11 @@ fn sessions(roots: &[PathBuf]) -> Vec<String> {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if is_uuid(&name) && entry.path().is_dir() {
-                found.push(name);
+                found.push((name, entry.path()));
             }
         }
     }
+    found.sort();
     found
 }
 
@@ -509,12 +515,12 @@ mod tests {
         assert_eq!(c.slots(), 2);
         let home = std::env::var("HOME").unwrap();
         assert_eq!(
-            c.roots(Path::new("/x")),
+            c.roots(),
             [PathBuf::from(format!("{home}/d")), PathBuf::from("/srv/d")]
         );
         assert_eq!(
-            Config::default().roots(Path::new("/x")),
-            [PathBuf::from("/x")]
+            Config::default().roots(),
+            [PathBuf::from(format!("{home}/dirigent"))]
         );
         assert!(toml::from_str::<Config>("rooots = []").is_err());
     }

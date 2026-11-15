@@ -54,6 +54,10 @@ rules:
   - apiGroups: [""]
     resources: [events]
     verbs: [create]
+  # what the install runs (its pods' images and health), which `GET /about` tells
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
   {{- if .Values.nix.shared.enabled }}
   # the shared Nix store's writers
   - apiGroups: [batch]

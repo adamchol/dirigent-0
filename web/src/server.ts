@@ -1,5 +1,5 @@
 // The web UI's server: the app (index.html, which Bun bundles), and two proxies so the browser
-// talks to one origin: `/api` to control's HTTP API, `/live` to chlive's WebSocket.
+// talks to one origin: `/api` to control's HTTP API, `/live` to chlive's WebSocket; and its version, `/version`.
 //
 // In development the app is Bun's dev server (hot reloading), which serves only requests made to
 // it by its own address (no DNS rebinding): it runs on a port of its own, and this server
@@ -10,6 +10,8 @@ import index from "./index.html";
 const control = process.env.CONTROL ?? "http://127.0.0.1:8090";
 const chlive = process.env.CHLIVE_URL ?? "ws://127.0.0.1:8080/live";
 const development = process.env.NODE_ENV !== "production";
+// `<the chart's appVersion>+<commit>`, set at build (web/build.ts, from nix); `dev` otherwise
+const version = process.env.DIRIGENT_VERSION ?? "dev";
 
 /** A browser's WebSocket passed on: where to, as whom, and what came before it opened. */
 interface Relay {
@@ -40,6 +42,7 @@ const server = Bun.serve<Relay>({
   development: false,
   routes: {
     "/api/*": api,
+    "/version": () => Response.json({ version }),
     "/live": (req: Request, server: Bun.Server<Relay>) => relay(req, server, chlive),
     // the dev server's hot reloading socket
     ...(app && { "/_bun/hmr": (req: Request, server: Bun.Server<Relay>) => relay(req, server, wsUrl(app.url), app.url.origin) }),

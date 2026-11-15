@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { callStart, contextSize, startup, streamed, timeline, titles, type EventRow } from "./events.ts";
+import { attached, callStart, contextSize, startup, streamed, timeline, titles, type EventRow } from "./events.ts";
 
 let offset = 0;
 function row(id: string, kind: string, data?: unknown, author = "player:p"): EventRow {
@@ -301,4 +301,17 @@ test("an imported conversation is marked where it ends, shown even with the conv
     detail: "Its session cc, in /p. The times above are the import's.",
   });
   expect(t.items[0]).toMatchObject({ t: "user", author: "import:s", queued: false });
+});
+
+test("the holder's player tells its version and where it runs", () => {
+  const rows = [
+    row("a1", "player_attached", { epoch: 1, version: "0.1.11+abc", environment: "the cluster" }),
+    row("a2", "player_attached", { epoch: 2, version: "0.1.12+def", environment: "adam's MacBook" }),
+    row("t", "turn_started", { input: "m" }),
+  ];
+  expect(attached(rows, 2)).toEqual({ version: "0.1.12+def", environment: "adam's MacBook" });
+  expect(attached(rows, 1)).toEqual({ version: "0.1.11+abc", environment: "the cluster" });
+  // a holder that hasn't attached yet, or none
+  expect(attached(rows, 3)).toBeUndefined();
+  expect(attached(rows, null)).toBeUndefined();
 });

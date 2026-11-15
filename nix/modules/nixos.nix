@@ -1,7 +1,6 @@
-# `dirigent host` as the machine's service (`host install --system`'s, declared): a systemd
-# system unit, running as root or `user`, its sessions under /var/lib/dirigent. It signs in with
-# `credentialsFile`, a copy of a user's (`dirigent login`, then
-# `sudo install -m 600 ~/.config/dirigent/credentials.json /etc/dirigent/credentials.json`).
+# `dirigent host` on NixOS: a systemd system unit, started at boot, running as `user` (never
+# root), its sessions under that user's ~/dirigent (or `roots`). It signs in with the user's own
+# credentials: `dirigent login` as them (~/.config/dirigent/credentials.json), renewed in place.
 { self }:
 {
   config,
@@ -16,14 +15,9 @@ in
 {
   options.services.dirigent-host = host.options // {
     user = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      description = "The user it runs as (its players too); root when null.";
-    };
-    credentialsFile = lib.mkOption {
       type = lib.types.str;
-      default = "/etc/dirigent/credentials.json";
-      description = "The CLI's credentials it signs in with, readable by its user.";
+      example = "adam";
+      description = "The user it runs as, and its players: whose `dirigent login` it signs in with.";
     };
   };
 
@@ -36,19 +30,23 @@ in
       after = [ "network-online.target" ];
       restartTriggers = [ (host.config cfg) ];
       environment = {
-        PATH = lib.mkForce (host.path cfg [ "/run/current-system/sw/bin" ]);
+        PATH = lib.mkForce (
+          host.path cfg [
+            "/etc/profiles/per-user/${cfg.user}/bin"
+            "/run/current-system/sw/bin"
+          ]
+        );
         DIRIGENT_HOST_CONFIG = "/etc/dirigent/host.toml";
-        DIRIGENT_CREDENTIALS = cfg.credentialsFile;
       };
       serviceConfig = {
-        ExecStart = "${lib.getExe cfg.package} host run --system";
+        # its HOME is the user's: their credentials, and ~/dirigent
+        User = cfg.user;
+        ExecStart = "${lib.getExe cfg.package} host run";
         Restart = "always";
         RestartSec = 5;
         # players outlive the daemon: they hold their sessions' leases
         KillMode = "process";
-        StateDirectory = "dirigent";
-      }
-      // lib.optionalAttrs (cfg.user != null) { User = cfg.user; };
+      };
     };
   };
 }

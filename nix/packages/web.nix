@@ -6,6 +6,8 @@
   stdenvNoCC,
   bun,
   chliveClient,
+  # `<the chart's appVersion>+<commit>`, which the app shows (Settings → About)
+  version,
 }:
 let
   src = lib.fileset.toSource {
@@ -40,8 +42,8 @@ let
 in
 stdenvNoCC.mkDerivation {
   pname = "dirigent-web";
-  version = "0.1.0";
-  inherit src;
+  inherit version src;
+  env.DIRIGENT_VERSION = version;
   nativeBuildInputs = [ bun ];
   buildPhase = ''
     export HOME=$TMPDIR

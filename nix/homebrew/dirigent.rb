@@ -3,8 +3,8 @@
 #
 #   brew install adamchol/dirigent/dirigent
 #   dirigent login https://dirigent.example.com
-#   brew services start dirigent          # the host, as yours (a launchd agent)
-#   sudo dirigent host install --system   # or as the machine's (a launchd daemon)
+#   brew services start dirigent          # the host, as yours: a launchd agent (never with sudo,
+#                                         # which makes it a daemon outside your login session)
 class Dirigent < Formula
   desc "Command-line for dirigent: sign in, import sessions, and host players"
   homepage "https://github.com/adamchol/dirigent-0"

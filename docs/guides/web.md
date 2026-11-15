@@ -19,7 +19,7 @@ live, so what you see is what the player is doing right now.
   **Start** button when it's idle, and its **…** menu.
 - **The chat** is the session's log, with the composer at the bottom.
 - **The status bar** shows the connection (**Live**, **Connecting**, **Offline**), the player
-  (`Player <id> · epoch N`, with `· away` while it's disconnected, or **Idle**), what it's doing
+  (`Player <id> · epoch N · <its version>`, with `· away` while it's disconnected, or **Idle**), what it's doing
   (**Working**, **Starting**, **Workspace**, **Starting turn**), and on the right the model, effort,
   machine, and how much context the conversation uses.
 
@@ -128,6 +128,10 @@ At the bottom of the sidebar:
   - **New sessions' machines**: the default machine, or your own default when the install lets
     users set one; and which NixOS system new sessions get.
   - **Your hosts**: your machines connected now with `dirigent host`.
+- **About and debug info**: what runs, for bug reports: the web's and control's versions (control's
+  start and runner), the players' VM image and system, Postgres's and ClickHouse's versions, in
+  Kubernetes the install's pods (component, images, ready, restarts), your hosts' versions, and the
+  open session's player (its version and where it runs). **Copy debug info** copies it all as JSON.
 - **Theme**: Dark, Light or System.
 - **Sign out** (Google sign-in only).
 

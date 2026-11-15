@@ -839,6 +839,17 @@ impl Store {
         Ok(())
     }
 
+    /// Postgres's version (`server_version`).
+    pub async fn version(&self) -> anyhow::Result<String> {
+        let row = self
+            .db
+            .lock()
+            .await
+            .query_one("SHOW server_version", &[])
+            .await?;
+        Ok(row.get(0))
+    }
+
     /// The players' system built (or being built) for `hash`, if one was.
     pub async fn player_system(&self, hash: &str) -> anyhow::Result<Option<PlayerSystem>> {
         let row = self

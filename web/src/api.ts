@@ -333,3 +333,37 @@ export function hostLine(h: Host): string {
   const system = h.os === "macos" ? "macOS" : h.os === "linux" ? "Linux" : h.os;
   return [h.name, `${system} ${h.arch}`, ...h.labels].join(" · ");
 }
+
+/** One of the install's pods (in Kubernetes), as `GET /about` tells it. */
+export interface Pod {
+  name: string;
+  /** Its `app.kubernetes.io/component` (or `app.kubernetes.io/name`, or `app`) label, else its name. */
+  component: string;
+  images: string[];
+  phase: string;
+  ready: boolean;
+  restarts: number;
+  started?: string;
+}
+
+/** What runs (`GET /about`): control, the players' VM image and system, the databases' versions
+ * and, in Kubernetes, the install's pods; what control couldn't read is null, `errors` say why. */
+export interface About {
+  control: { version: string; started: string; runner: string | null };
+  players: { vm: string; system: PlayerSystem | null };
+  postgres: string | null;
+  clickhouse: string | null;
+  pods: Pod[] | null;
+  errors: string[];
+}
+
+export async function about(who: Who): Promise<About> {
+  return (await call(who, "GET", "/about")).json();
+}
+
+/** The web server's version (its `/version`): the app's, built with it. */
+export async function webVersion(): Promise<string> {
+  const res = await fetch("/version");
+  if (!res.ok) throw new Error(`${res.status}: ${res.statusText}`);
+  return ((await res.json()) as { version: string }).version;
+}

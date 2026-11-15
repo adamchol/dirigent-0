@@ -13,7 +13,7 @@ simply not there.
 A host's players run **as the host's user** (the one running `dirigent host`), as ordinary
 processes. The agent's file tools stay inside the session's workspace, but its Bash runs any
 command that user can. Run a host as a user whose files and credentials you're happy for your
-agents to reach, or give it a dedicated user (`--system --user`, below).
+agents to reach, or make a dedicated user for it and run it as them. A host never runs as root.
 
 ## Requirements
 
@@ -30,6 +30,18 @@ agents to reach, or give it a dedicated user (`--system --user`, below).
     tailnet](../operating/installing.md#on-a-tailnet)): put it in the host's config as `players`.
 
 ## Installing
+
+A host is always **a user's service**, signed in with that user's own `dirigent login`
+(`~/.config/dirigent/credentials.json`, which it renews in place), and run with `sudo` never:
+
+- **macOS**: a launchd agent, in your login session. That's where Xcode's signing identities (your
+  login keychain) and the Simulator are; a daemon outside it can't use them. A locked screen doesn't
+  stop it; logging out does, and after a restart it's back once you log in: turn on automatic login
+  (System Settings → Users & Groups) to have it back by itself. With FileVault, a restart waits for
+  your password at boot; for planned restarts, `sudo fdesetup authrestart` skips that once.
+- **Linux**: a systemd user unit, lingering, so it runs from boot whether you're logged in or not
+  (`dirigent host install` turns lingering on: `loginctl enable-linger`). On NixOS, the module is a
+  system unit running as the user you name.
 
 ### Homebrew (macOS, or Linux with Homebrew)
 
@@ -54,35 +66,43 @@ dirigent host uninstall
 | macOS | `~/Library/LaunchAgents/dev.dirigent.host.plist` | `~/Library/Logs/dirigent-host.log` |
 | Linux | `~/.config/systemd/user/dirigent-host.service` | `journalctl --user -u dirigent-host` |
 
-On Linux, a user unit stops when you log out unless lingering is on: `loginctl enable-linger`.
+On macOS, install it from a terminal on the Mac's screen, not over SSH: launchd starts agents in a
+login session.
 
-### For the whole machine (`--system`)
+### What runs, and where: `dirigent host status`
 
-```sh
-sudo dirigent host install --system [--user <name>] [--credentials <file>]
-sudo dirigent host status --system
-sudo dirigent host uninstall --system
+```
+Service
+  launchd agent dev.dirigent.host (dirigent host install): running, pid 4312
+    file ~/Library/LaunchAgents/dev.dirigent.host.plist
+    log  ~/Library/Logs/dirigent-host.log
+Connection
+  adams-macbook: connected, dirigent 0.1.12+abc1234
+Sessions running here: 1 of 2
+  3f2a…  github.com/you/app  pid 5120, 01:12:03, as adam  ~/dirigent/3f2a…/workspace
+Workspaces kept (no player running)
+  77de…  github.com/you/api  ~/dirigent/77de…
+Last warnings and errors in its log
+  2026-11-15T14:01:55Z  WARN connecting to control at …: …
 ```
 
-A launchd daemon (`/Library/LaunchDaemons/dev.dirigent.host.plist`, log
-`/var/log/dirigent-host.log`) or a systemd system unit (`/etc/systemd/system/dirigent-host.service`).
-It starts at boot, without anyone logged in.
+- **Service**: the host's service, whichever installed it (`dirigent host install`, Homebrew,
+  home-manager, NixOS's unit), as launchd or systemd tells it: running or not, its pid, the user it
+  runs as, its last exit code, its file and log. A system daemon an earlier version installed shows
+  too, with how to remove it.
+- **Connection**: whether dirigent has the host connected, under what name.
+- **Sessions running here**: its players (each is a `dirigent __player` process), with their
+  sessions' repositories, and the sessions' directories with no player running.
+- **Last warnings and errors** of its log (the file, or the journal).
 
-- It copies your CLI credentials to `/etc/dirigent/credentials.json` (from `--credentials`, or from
-  `$SUDO_USER`'s `~/.config/dirigent/credentials.json`), so the host connects as you.
-- Its config is `/etc/dirigent/host.toml` (written if missing), and its sessions go in
-  `/var/lib/dirigent` by default.
-- `--user <name>` runs it as that user (and gives them those files); otherwise it runs as root.
+`--json` gives the same for scripts.
 
 ### Nix modules
 
-The flake has a module for each way:
-
 | Module | Runs as |
 |---|---|
-| `homeManagerModules.dirigent-host` | You: a systemd user service (Linux) or a launchd agent (macOS) |
-| `nixosModules.dirigent-host` | A systemd system service, as `user` or root |
-| `darwinModules.dirigent-host` | A launchd daemon (nix-darwin), as `user` or root |
+| `homeManagerModules.dirigent-host` | You: a launchd agent (macOS) or a systemd user service (Linux) |
+| `nixosModules.dirigent-host` | A systemd system service, as `user` (required), from boot |
 
 ```nix
 {
@@ -112,14 +132,19 @@ The flake has a module for each way:
 | `environment` | lines or null | null |
 | `playerArgs` | list of strings | `[]` |
 | `path` | list of packages | `[ git bash coreutils ]`, put first on the players' `PATH` |
-| `user` (NixOS, nix-darwin) | string or null | null (root) |
-| `credentialsFile` (NixOS, nix-darwin) | string | `/etc/dirigent/credentials.json` |
+| `user` (NixOS) | string, required | the user it runs as: whose `dirigent login` it uses, whose `~/dirigent` its sessions go in |
 
 Releases are built into the `dirigent.cachix.org` cache. Modules don't use the flake's own settings, so add it to your system's Nix (`nix.settings.extra-substituters = [ "https://dirigent.cachix.org" ];` and `extra-trusted-public-keys = [ "dirigent.cachix.org-1:9st/693o4bC8VbqMDHIoYcYn6Mp4PR/zLNCJ7YSI+GQ=" ];`), and use a release's tag (`github:adamchol/dirigent-0/v<version>`) without making its `nixpkgs` follow yours, or the CLI is built rather than downloaded.
 
-With home-manager, sign in once with `dirigent login`. With the system modules, copy your
-credentials: `sudo install -m 600 ~/.config/dirigent/credentials.json /etc/dirigent/credentials.json`
-(and `chown` it to `user`, if set).
+Either way, sign in once with `dirigent login` as the host's user. The NixOS module's config is
+`/etc/dirigent/host.toml`; its credentials are the user's own (`~/.config/dirigent/credentials.json`).
+
+Earlier versions had `sudo dirigent host install --system` and a nix-darwin module, which ran the
+host as a system daemon. On a Mac that daemon can't reach your login keychain or the Simulator, so
+they're gone: remove the daemon (drop `services.dirigent-host` from your nix-darwin config, or
+`sudo launchctl bootout system/dev.dirigent.host` and delete
+`/Library/LaunchDaemons/dev.dirigent.host.plist`, `/etc/dirigent`), then install the agent as above.
+`dirigent host status` points out a daemon left behind.
 
 ### By hand
 
@@ -127,7 +152,7 @@ credentials: `sudo install -m 600 ~/.config/dirigent/credentials.json /etc/dirig
 
 ## Configuration
 
-`~/.config/dirigent/host.toml` (`/etc/dirigent/host.toml` with `--system`; `$DIRIGENT_HOST_CONFIG`
+`~/.config/dirigent/host.toml` (the NixOS module's: `/etc/dirigent/host.toml`; `$DIRIGENT_HOST_CONFIG`
 overrides). Every key is optional; unknown keys are an error.
 
 ```toml
@@ -148,7 +173,7 @@ Use the `ios` scheme to build.
 | `url` | The address you signed in to (`dirigent login`). |
 | `api`, `chlive`, `players` | From `url`: `<url>/api`, `wss://…/live`, `<url>`. Needed if you signed in with `--control`. |
 | `name` | `hostname -s`. Your hosts' names are what you pick in **Runs on**; a second host with the same name replaces the first. |
-| `roots` | `~/dirigent` (`/var/lib/dirigent` with `--system`). A session's directory is reused in whichever root has it; new ones go in the first. |
+| `roots` | `~/dirigent`. A session's directory is reused in whichever root has it; new ones go in the first. |
 | `slots` | 2. A start beyond it is refused ("the host is full"). |
 | `labels` | None. |
 | `environment` | None. The agent is always told it runs as `<user>` on `<name>`, a `<system>` machine of yours. |

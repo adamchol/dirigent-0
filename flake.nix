@@ -54,7 +54,8 @@
       ];
       imports = [ inputs.dnvr.flakeModule ];
 
-      # `dirigent host` as a service: yours (home-manager), or the machine's (NixOS, nix-darwin)
+      # `dirigent host` as a service, always a user's: home-manager's (macOS and Linux), or NixOS's
+      # system unit running as a user
       flake =
         let
           self = inputs.self;
@@ -62,7 +63,6 @@
         {
           homeManagerModules.dirigent-host = import ./nix/modules/home-manager.nix { inherit self; };
           nixosModules.dirigent-host = import ./nix/modules/nixos.nix { inherit self; };
-          darwinModules.dirigent-host = import ./nix/modules/darwin.nix { inherit self; };
         };
 
       perSystem =
@@ -92,6 +92,8 @@
               inherit (pkgs.stdenv.hostPlatform) system;
             }).eval
               ./nix/vm/defaults.nix;
+          # the commit dirigent's built from, which its parts tell with their version
+          rev = inputs.self.shortRev or inputs.self.dirtyShortRev or "dirty";
           vm =
             if pkgs.stdenv.hostPlatform.isLinux then
               lib.substring 11 32 (
@@ -104,8 +106,7 @@
           dirigent = pkgs.callPackage ./nix/packages/dirigent.nix {
             craneLib = inputs.crane.mkLib pkgs;
             version = chartVersion "appVersion";
-            rev = inputs.self.shortRev or inputs.self.dirtyShortRev or "dirty";
-            inherit vm;
+            inherit rev vm;
           };
           # the CLI alone, for its users (`nix run github:adamchol/dirigent-0#cli -- login …`)
           cli = pkgs.callPackage ./nix/packages/cli.nix { inherit dirigent; };
@@ -120,7 +121,11 @@
               inputs'.chlive.packages.chlive-wasm.override { wasm-bindgen-cli = pkgs.wasm-bindgen-cli_0_2_127; }
             } $out/wasm
           '';
-          web = pkgs.callPackage ./nix/packages/web.nix { inherit chliveClient; };
+          # it tells its version as the rest do (`<appVersion>+<rev>`)
+          web = pkgs.callPackage ./nix/packages/web.nix {
+            inherit chliveClient;
+            version = "${chartVersion "appVersion"}+${rev}";
+          };
           # the chart's `version` or `appVersion` (Chart.yaml), which a release's tag is (v<it>);
           # the images' tag here is its appVersion, which the chart pulls when images.tag is empty
           chartVersion =

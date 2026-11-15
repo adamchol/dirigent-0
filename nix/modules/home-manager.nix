@@ -1,5 +1,7 @@
-# `dirigent host` as your service: a systemd user unit on Linux, a launchd agent on macOS (while
-# you're logged in). Sign in once with `dirigent login`; its credentials are the host's.
+# `dirigent host` as your service: a launchd agent on macOS (in your login session, where Xcode's
+# keychain and the Simulator are; a locked screen doesn't stop it, logging out does), a systemd user
+# unit on Linux (for it from boot: `loginctl enable-linger`). Sign in once with `dirigent login`;
+# its credentials are the host's.
 { self }:
 {
   config,

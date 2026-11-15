@@ -2,6 +2,21 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
+## Unreleased
+
+### Added
+- Versions and debug info: the web's account menu has **About and debug info**, and the CLI `dirigent version` (`--json`). Both show the web's, control's and the CLI's versions, control's runner, the players' VM image and system, Postgres's and ClickHouse's versions, the install's pods in Kubernetes (images, readiness, restarts), and your hosts' versions; the web also shows the open session's player, and copies it all as JSON. control serves it as `GET /about` and lists its namespace's pods for it: its Role gains `list` on pods.
+- `dirigent whoami` tells the dirigent's version and the CLI's; the web's status bar, the session's player's.
+- `dirigent host status` tells what of the host runs here, and where: its service (whichever installed it: `host install`, Homebrew, home-manager, NixOS), its pid, user, last exit and log; whether dirigent has it connected; the sessions running here (pid, uptime, repository, directory) and the directories kept; the last warnings and errors in its log. `--json` too.
+
+### Changed
+- A host is always a user's, signed in with that user's own `dirigent login`, never root. On macOS it's a launchd agent in your login session, where Xcode's keychain and the Simulator are (a locked screen doesn't stop it; for restarts, automatic login); on Linux a systemd user unit that `host install` makes linger, so it runs from boot.
+  - **Removed**: `dirigent host install --system` (with `--user`, `--credentials`), `host run --system`, and the nix-darwin module (`darwinModules.dirigent-host`). A system daemon left from them shows in `host status`, with how to remove it; the hosts guide has the steps.
+  - The NixOS module needs `user` and uses their credentials and `~/dirigent`; `credentialsFile` is gone.
+
+### Fixed
+- `dirigent import`, `dirigent sync` and hosts' players panicked connecting to chlive over `wss://` ("Could not automatically determine the process-level CryptoProvider"): two TLS backends were built in. Only one is now.
+
 ## 0.1.11 (2026-11-15)
 
 ### Added

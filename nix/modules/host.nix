@@ -1,5 +1,5 @@
-# What the host's modules share (`dirigent host`: home-manager's for your user, NixOS's and
-# nix-darwin's for the machine): their options, the config they write (host.toml, as the CLI
+# What the host's modules share (`dirigent host`: home-manager's for your user, NixOS's for a
+# user of the machine): their options, the config they write (host.toml, as the CLI
 # reads it), and what the daemon runs.
 {
   lib,
@@ -42,7 +42,7 @@ in
     roots = mkOption {
       type = types.listOf types.str;
       default = [ ];
-      description = "Where sessions' directories go (`~` is your home). By default ~/dirigent, or /var/lib/dirigent for the machine's service.";
+      description = "Where sessions' directories go (`~` is your home). By default ~/dirigent.";
     };
     slots = nullOr types.ints.positive // {
       description = "How many players it runs at once (2 by default).";

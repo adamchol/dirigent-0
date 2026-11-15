@@ -27,6 +27,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import * as api from "./api.ts";
 import type { SessionInfo } from "./api.ts";
 import {
+  attached,
   callStart,
   contextSize,
   DELTAS_QUERY,
@@ -55,6 +56,9 @@ export interface LiveStatus {
   startup?: Phase;
   /** The model's context at its last call, in tokens. */
   context: number;
+  /** Its player's version and where it runs, as it said attaching. */
+  version?: string;
+  environment?: string;
 }
 
 export function Session(props: {
@@ -100,12 +104,15 @@ export function Session(props: {
   if (waiting && seen.current?.key !== key) seen.current = { key, at: Date.now() };
   const since = waiting ? Math.min(waiting.since ?? Infinity, seen.current!.at) : undefined;
 
+  const player = useMemo(() => attached(log.rows, holder), [log.rows, holder]);
+  const { version, environment } = player ?? {};
+
   const { report } = props;
   const running = openTurn !== undefined;
   const phase = waiting?.phase;
   useEffect(() => {
-    report({ log: log.status, error: log.error?.message, running, context, startup: phase });
-  }, [report, log.status, log.error?.message, running, context, phase]);
+    report({ log: log.status, error: log.error?.message, running, context, startup: phase, version, environment });
+  }, [report, log.status, log.error?.message, running, context, phase, version, environment]);
 
   // what's there when the log first comes in isn't animated in
   const first = useRef<Set<string> | null>(null);

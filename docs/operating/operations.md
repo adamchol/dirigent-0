@@ -35,6 +35,7 @@ appVersion.
 | A player | Its VM's serial console, which has the guest's journal: `kubectl -n dirigent logs <virt-launcher pod> -c guest-console-log`. More detail: `player.env: {RUST_LOG: dirigent_player=debug}`. |
 | Players' VMs | `kubectl -n dirigent get vmi` (`player-…`, `warm-…`, `build-…`) |
 | The players' system | `kubectl -n dirigent describe configmap dirigent-player-nixos` (Events), or `GET /api/system` |
+| Versions and health | The web's account menu → **About and debug info**, `dirigent version`, or `GET /api/about`: every part's version, and the install's pods with their images, readiness and restarts. |
 | The ingestion | `kubectl -n dirigent logs deploy/dirigent-ingest-connect`; the connector's state: `kubectl -n dirigent exec deploy/dirigent-ingest-connect -- curl -s localhost:8083/connectors/dirigent-ingest-session-events/status` (its task should be `RUNNING`) |
 | A session's log | In ClickHouse: `SELECT ts, kind, author, data FROM dirigent.session_events WHERE session_id = '<id>' ORDER BY offset` |
 

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Event, ObjectReference, Secret};
+use k8s_openapi::api::core::v1::{Event, ObjectReference, Pod, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 use kube::api::{
     Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
@@ -72,6 +72,12 @@ pub trait Runner: Send + Sync {
     /// Whether it keeps warm VMs ([`crate::pool`]).
     fn warms(&self) -> bool {
         false
+    }
+
+    /// What the install runs beside control, where it's in Kubernetes: its pods, for
+    /// `GET /about`; none elsewhere.
+    async fn pods(&self) -> anyhow::Result<Option<Vec<PodInfo>>> {
+        Ok(None)
     }
 
     /// The key of a warm VM on `machine` in `system` made now: one made with another isn't
@@ -286,6 +292,8 @@ pub struct Kube {
     /// Its VMs' `dirigent.dev/runner` label.
     name: String,
     vmis: Api<DynamicObject>,
+    /// Its namespace's pods: the install's (one per namespace).
+    pods: Api<Pod>,
     template: serde_json::Value,
     /// Its VMs' machine, unless a session asks for another.
     machine: Resources,
@@ -302,6 +310,61 @@ struct Builds {
     events: Api<Event>,
     /// The configuration's ConfigMap, which the builds' Events are about.
     configmap: ObjectReference,
+}
+
+/// One of the install's pods, as `GET /about` tells it.
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+pub struct PodInfo {
+    pub name: String,
+    /// Its `app.kubernetes.io/component` (or `app.kubernetes.io/name`, or `app`) label, else its
+    /// name.
+    pub component: String,
+    /// Its containers' images, as asked for.
+    pub images: Vec<String>,
+    pub phase: String,
+    /// Whether all its containers are ready.
+    pub ready: bool,
+    /// Its containers' restarts, together.
+    pub restarts: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started: Option<String>,
+}
+
+/// `pod` as [`PodInfo`], unless it's a player's VM (they're sessions') or a finished Job's.
+fn pod_info(pod: &Pod) -> Option<PodInfo> {
+    let labels = pod.metadata.labels.as_ref();
+    let label = |k: &str| labels.and_then(|l| l.get(k)).cloned();
+    if label("kubevirt.io").is_some() {
+        return None;
+    }
+    let status = pod.status.as_ref();
+    let phase = status.and_then(|s| s.phase.clone()).unwrap_or_default();
+    if phase == "Succeeded" {
+        return None;
+    }
+    let name = pod.metadata.name.clone().unwrap_or_default();
+    let containers = status
+        .and_then(|s| s.container_statuses.as_deref())
+        .unwrap_or_default();
+    Some(PodInfo {
+        component: label("app.kubernetes.io/component")
+            .or_else(|| label("app.kubernetes.io/name"))
+            .or_else(|| label("app"))
+            .unwrap_or_else(|| name.clone()),
+        name,
+        images: pod
+            .spec
+            .iter()
+            .flat_map(|s| &s.containers)
+            .filter_map(|c| c.image.clone())
+            .collect(),
+        ready: !containers.is_empty() && containers.iter().all(|c| c.ready),
+        restarts: containers.iter().map(|c| c.restart_count).sum(),
+        started: status
+            .and_then(|s| s.start_time.as_ref())
+            .map(|t| t.0.to_string()),
+        phase,
+    })
 }
 
 /// The Secret with the cache's signing key (DIRIGENT_NIX_SIGNING_KEY) and its public half
@@ -329,6 +392,7 @@ impl Kube {
             .context("connecting to Kubernetes")?;
         let namespace = namespace.unwrap_or(client.default_namespace()).to_string();
         let vmis = Api::namespaced_with(client.clone(), &namespace, &vmi_resource());
+        let pods = Api::namespaced(client.clone(), &namespace);
         let writer = match writer {
             Some(path) => Some((
                 Api::namespaced(client.clone(), &namespace),
@@ -363,6 +427,7 @@ impl Kube {
             id: format!("kube:{namespace}/{name}"),
             name: name.to_string(),
             vmis,
+            pods,
             template,
             machine,
             builds,
@@ -584,6 +649,13 @@ impl Runner for Kube {
 
     fn warms(&self) -> bool {
         true
+    }
+
+    async fn pods(&self) -> anyhow::Result<Option<Vec<PodInfo>>> {
+        let pods = self.pods.list(&ListParams::default()).await?;
+        let mut pods: Vec<PodInfo> = pods.items.iter().filter_map(pod_info).collect();
+        pods.sort_by(|a, b| (&a.component, &a.name).cmp(&(&b.component, &b.name)));
+        Ok(Some(pods))
     }
 
     fn warm_key(&self, machine: Resources, system: Option<&str>) -> String {
@@ -861,6 +933,77 @@ fn vmi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pod(labels: serde_json::Value, phase: &str, ready: &[(bool, i32)]) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "dirigent-chlive-0", "labels": labels },
+            "spec": { "containers": [
+                { "name": "chlive", "image": "ghcr.io/dialohq/chlive:sha-95ca2bca52bf" },
+                { "name": "side", "image": "busybox" },
+            ] },
+            "status": {
+                "phase": phase,
+                "startTime": "2026-11-15T12:00:00Z",
+                "containerStatuses": ready.iter().map(|(ready, restarts)| serde_json::json!({
+                    "name": "c", "image": "x", "imageID": "", "ready": ready,
+                    "restartCount": restarts,
+                })).collect::<Vec<_>>(),
+            },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_pod_tells_its_component_images_and_health() {
+        let info = pod_info(&pod(
+            serde_json::json!({ "app.kubernetes.io/component": "chlive" }),
+            "Running",
+            &[(true, 2), (false, 1)],
+        ))
+        .unwrap();
+        assert_eq!(
+            info,
+            PodInfo {
+                name: "dirigent-chlive-0".into(),
+                component: "chlive".into(),
+                images: vec![
+                    "ghcr.io/dialohq/chlive:sha-95ca2bca52bf".into(),
+                    "busybox".into()
+                ],
+                phase: "Running".into(),
+                ready: false,
+                restarts: 3,
+                started: Some("2026-11-15T12:00:00Z".into()),
+            }
+        );
+        let named = pod_info(&pod(
+            serde_json::json!({ "app.kubernetes.io/name": "garage" }),
+            "Pending",
+            &[],
+        ))
+        .unwrap();
+        assert_eq!((named.component.as_str(), named.ready), ("garage", false));
+        let app = pod_info(&pod(
+            serde_json::json!({ "app": "redpanda" }),
+            "Running",
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(app.component, "redpanda");
+        let bare = pod_info(&pod(serde_json::json!({}), "Running", &[(true, 0)])).unwrap();
+        assert_eq!(
+            (bare.component.as_str(), bare.ready),
+            ("dirigent-chlive-0", true)
+        );
+    }
+
+    #[test]
+    fn players_vms_and_finished_jobs_are_left_out() {
+        let launcher = serde_json::json!({ "kubevirt.io": "virt-launcher" });
+        assert_eq!(pod_info(&pod(launcher, "Running", &[(true, 0)])), None);
+        let job = serde_json::json!({ "job-name": "dirigent-checkpoints" });
+        assert_eq!(pod_info(&pod(job, "Succeeded", &[(false, 0)])), None);
+    }
 
     fn template() -> serde_json::Value {
         serde_json::json!({

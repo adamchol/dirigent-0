@@ -15,7 +15,11 @@ const result = await Bun.build({
   // shiki's languages and themes, loaded when first used
   splitting: true,
   plugins: [tailwind, wasmUrl],
-  define: { "process.env.NODE_ENV": JSON.stringify("production") },
+  define: {
+    "process.env.NODE_ENV": JSON.stringify("production"),
+    // its version, which the app shows (nix sets it: `<appVersion>+<commit>`)
+    "process.env.DIRIGENT_VERSION": JSON.stringify(process.env.DIRIGENT_VERSION ?? "dev"),
+  },
 });
 if (!result.success) {
   for (const log of result.logs) console.error(log);

@@ -59,6 +59,15 @@ use crate::secrets::{KeyArgs, Keys};
 use crate::system::System;
 use crate::token::{Signer, CHLIVE, CONTROL};
 
+/// control's version, as the build tells it (nix: `<the chart's appVersion>+<commit>`); `dev`
+/// from cargo.
+const VERSION: &str = match option_env!("DIRIGENT_VERSION") {
+    Some(v) => v,
+    None => "dev",
+};
+/// How long `GET /about` waits for each thing it asks.
+const ABOUT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How often a player's connection is pinged, and how long it may go unanswered before the
 /// connection (and its lease's call) counts as broken.
 const KEEPALIVE: Duration = Duration::from_secs(5);
@@ -270,6 +279,8 @@ struct Control {
     hosts: Hosts,
     /// How long a web sign-in lasts unused (`--session-days`).
     sign_in_ttl: Duration,
+    /// When it started (RFC 3339).
+    started: String,
 }
 
 struct Attached {
@@ -441,6 +452,7 @@ fn control(
         hosts: Default::default(),
         connections: AtomicU64::new(0),
         sign_in_ttl,
+        started: k8s_openapi::jiff::Timestamp::now().to_string(),
     }))
 }
 
@@ -469,6 +481,7 @@ fn router(control: &'static Control) -> Router {
         )
         .route("/auth", get(auth_mode))
         .route("/me", get(me))
+        .route("/about", get(about))
         .route(
             "/sessions/{id}/secrets/{name}",
             axum::routing::put(put_session_secret).delete(delete_session_secret),
@@ -547,6 +560,66 @@ async fn me(
         "chatgpt": chatgpt,
         "anthropic": anthropic,
     })))
+}
+
+/// What runs, for whoever debugs it: control (its version, start and runner), the players' VM
+/// image and system, Postgres's and ClickHouse's versions, and in Kubernetes the install's pods
+/// (`runner::PodInfo`). What it couldn't read (in [`ABOUT_TIMEOUT`]) is null, and `errors` say
+/// why.
+async fn about(
+    State(control): State<&'static Control>,
+    Caller(_): Caller,
+) -> Json<serde_json::Value> {
+    async fn bounded<T>(
+        what: &str,
+        f: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> Result<T, String> {
+        match tokio::time::timeout(ABOUT_TIMEOUT, f).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(format!("{what}: {e:#}")),
+            Err(_) => Err(format!(
+                "{what}: no answer in {} seconds",
+                ABOUT_TIMEOUT.as_secs()
+            )),
+        }
+    }
+    fn take<T>(r: Result<T, String>, errors: &mut Vec<String>) -> Option<T> {
+        r.map_err(|e| errors.push(e)).ok()
+    }
+    let (postgres, clickhouse, pods, system) = tokio::join!(
+        bounded("Postgres", control.store.version()),
+        async {
+            match control.pruner {
+                Some(p) => bounded("ClickHouse", p.clickhouse_version())
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        },
+        async {
+            match control.runner {
+                Some(r) => bounded("the pods", r.pods()).await,
+                None => Ok(None),
+            }
+        },
+        bounded("the players' system", system::status(control)),
+    );
+    let mut errors = vec![];
+    Json(serde_json::json!({
+        "control": {
+            "version": VERSION,
+            "started": control.started,
+            "runner": control.runner.map(|r| r.id()),
+        },
+        "players": {
+            "vm": system::VM,
+            "system": take(system, &mut errors),
+        },
+        "postgres": take(postgres, &mut errors),
+        "clickhouse": take(clickhouse, &mut errors).flatten(),
+        "pods": take(pods, &mut errors).flatten(),
+        "errors": errors,
+    }))
 }
 
 fn linking(control: &Control) -> Result<&ChatGpt, Failed> {
@@ -4769,6 +4842,24 @@ mod e2e {
             system_state(&base).await,
             serde_json::json!({ "configured": false })
         );
+    }
+
+    #[tokio::test]
+    async fn e2e_about_tells_what_runs() {
+        let Some(base) = start_recording(recorder(false)).await else {
+            return;
+        };
+        let (status, about) = get_json(&base, A, "/about").await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(about["control"]["version"], VERSION);
+        assert!(about["control"]["started"].as_str().is_some(), "{about}");
+        assert_eq!(about["players"]["vm"], system::VM);
+        assert_eq!(about["players"]["system"]["configured"], false);
+        // the stack's Postgres and ClickHouse; no pods outside Kubernetes
+        assert!(about["postgres"].as_str().is_some(), "{about}");
+        assert!(about["clickhouse"].as_str().is_some(), "{about}");
+        assert_eq!(about["pods"], serde_json::Value::Null);
+        assert_eq!(about["errors"], serde_json::json!([]));
     }
 
     #[tokio::test]

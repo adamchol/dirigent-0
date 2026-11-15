@@ -2,6 +2,7 @@
 
 control's HTTP API, as the web and the CLI use it. Through the web it's at `https://<web>/api/…`;
 control itself listens on port 8090. Bodies are JSON; errors are plain text with a status.
+The web serves one route of its own, unauthenticated: `GET /version`, `{"version"}`, the web's.
 
 ## Authentication
 
@@ -112,6 +113,7 @@ the Unix epoch. `secrets` are names: the session's own and its owner's.
 | `GET /machines` | | `{"defaults", "limits", "per_user", "warm"}` |
 | `GET /environments` | | `{"cluster": Machines \| null, "hosts": [{"name", "os", "arch", "cpus", "memory", "labels", "slots", "version", …}]}`: your connected hosts |
 | `GET /system` | | `{"configured", "state"?: "building" \| "ready" \| "failed" \| "broken", "store_path"?, "error"?}` |
+| `GET /about` | | What runs: `{"control": {"version", "started", "runner"}, "players": {"vm", "system"}, "postgres", "clickhouse", "pods": [{"name", "component", "images", "phase", "ready", "restarts", "started"}] \| null, "errors"}`. `pods` (outside players' VMs and finished Jobs) only in Kubernetes. What control couldn't read within 5 seconds is null, and `errors` say why. |
 
 ## Sign-in and tokens
 

@@ -42,7 +42,7 @@ export function useSettings(who: Who): { settings: Settings; change: (s: Partial
 }
 
 /** Which system new sessions' machines run, as the cluster has it. */
-function systemText(s: PlayerSystem): string {
+export function systemText(s: PlayerSystem): string {
   if (!s.configured) return "The stock system.";
   switch (s.state) {
     case "ready":

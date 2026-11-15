@@ -563,3 +563,16 @@ function raw(row: EventRow): string {
   }
   return [`${row.kind} at ${String(row.ts)} by ${row.author}`, data].filter(Boolean).join("\n");
 }
+
+/** What the session's `epoch`th player (its holder's) said of itself as it attached: its version
+ * and where it runs; nothing before it has. */
+export function attached(rows: readonly EventRow[], epoch: number | null): { version?: string; environment?: string } | undefined {
+  if (epoch === null) return undefined;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i]!;
+    if (row.kind !== "player_attached") continue;
+    const e = parse(row);
+    if (e.kind === "player_attached" && e.data.epoch === epoch) return { version: e.data.version, environment: e.data.environment };
+  }
+  return undefined;
+}

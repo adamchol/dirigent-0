@@ -106,6 +106,13 @@ impl Pruner {
     }
 }
 
+impl Pruner {
+    /// The version of the ClickHouse it deletes from: the log's.
+    pub async fn clickhouse_version(&self) -> anyhow::Result<String> {
+        self.clickhouse.version().await
+    }
+}
+
 /// Every 10 seconds, remove what the sessions being deleted left, the oldest first; a step that
 /// fails is tried again next time.
 pub async fn prune(
@@ -207,13 +214,13 @@ impl ClickHouse {
     async fn forget(&self, session: Uuid) -> anyhow::Result<u64> {
         self.query(
             "DELETE FROM dirigent.session_events WHERE session_id = {s:UUID}",
-            session,
+            Some(session),
         )
         .await?;
         let left = self
             .query(
                 "SELECT count() FROM dirigent.session_events WHERE session_id = {s:UUID}",
-                session,
+                Some(session),
             )
             .await?;
         left.trim()
@@ -221,13 +228,24 @@ impl ClickHouse {
             .with_context(|| format!("ClickHouse counted {left:?}"))
     }
 
-    async fn query(&self, sql: &str, session: Uuid) -> anyhow::Result<String> {
+    /// Its version (`SELECT version()`).
+    async fn version(&self) -> anyhow::Result<String> {
+        Ok(self
+            .query("SELECT version()", None)
+            .await?
+            .trim()
+            .to_string())
+    }
+
+    async fn query(&self, sql: &str, session: Option<Uuid>) -> anyhow::Result<String> {
         let mut url = reqwest::Url::parse(&self.url).context("ClickHouse's URL")?;
         // the user is control's own, whoever the URL names
         let _ = url.set_username("");
         let _ = url.set_password(None);
-        url.query_pairs_mut()
-            .append_pair("param_s", &session.to_string());
+        if let Some(session) = session {
+            url.query_pairs_mut()
+                .append_pair("param_s", &session.to_string());
+        }
         let res = self
             .http
             .post(url)

@@ -22,7 +22,8 @@ workspaces, imports other agents' sessions, and runs your machines as hosts.
 | `dirigent login <url>` | Sign in to the dirigent at `<url>` (the web's address). With Google sign-in, opens your browser (`--no-browser` prints the URL instead) and waits up to 5 minutes. |
 | `dirigent login <url> --as <subject>` | On a development install (declared auth): who you are, default `user:dev`. |
 | `dirigent login <url> --control` | `<url>` is control's own API, not the web's (`/api` isn't added). Then `sync`, `import` and `host` need chlive's and the players' addresses given explicitly. |
-| `dirigent whoami` | Who you are, where, your ChatGPT link and Anthropic key. |
+| `dirigent whoami` | Who you are, where, the dirigent's version and this CLI's, your ChatGPT link and Anthropic key. |
+| `dirigent version` | This CLI's version and what the dirigent runs: control (version, start, runner), the players' VM image and system, Postgres, ClickHouse, the install's pods in Kubernetes, and your connected hosts. `--json` for bug reports. (`dirigent --version`: the CLI's alone.) |
 | `dirigent logout` | Sign out: revokes the Google refresh token and deletes the credentials. |
 
 ### Accounts
@@ -64,11 +65,10 @@ See [Workspaces](../guides/workspaces.md#following-a-workspace-dirigent-sync).
 
 | Command | |
 |---|---|
-| `dirigent host run [--system]` | Run the host in the foreground. |
-| `dirigent host install` | Install and start it as your service: a launchd agent (macOS) or a systemd user unit (Linux). |
-| `dirigent host install --system [--user <name>] [--credentials <file>]` | As the machine's (root): a launchd daemon or a systemd system unit, running as `--user` or root. |
-| `dirigent host uninstall [--system]` | Stop and remove it. Running players go on. |
-| `dirigent host status [--system]` | Installed or not, running or not. |
+| `dirigent host run` | Run the host in the foreground. |
+| `dirigent host install` | Install and start it as your service: a launchd agent in your login session (macOS), or a lingering systemd user unit (Linux). As you, never with `sudo`. |
+| `dirigent host uninstall` | Stop and remove it. Running players go on. |
+| `dirigent host status [--json]` | What runs here: its service (whichever installed it), whether dirigent has it connected, the sessions running here and the directories kept, the last warnings and errors in its log. |
 
 See [Hosts](../guides/hosts.md).
 

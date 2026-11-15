@@ -11,6 +11,7 @@ mod import;
 mod loopback;
 mod oauth;
 mod sync;
+mod version;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -69,6 +70,14 @@ enum Command {
     Logout,
     /// Who you are to the dirigent, and the accounts you've linked.
     Whoami,
+    /// This CLI's version, and what the dirigent you're signed in to runs: control, the
+    /// players' VM image and system, Postgres, ClickHouse, the install's pods (in Kubernetes)
+    /// and your connected hosts. For bug reports.
+    Version {
+        /// As JSON: `{"cli", "about" (control's `GET /about`), "hosts"}`.
+        #[arg(long)]
+        json: bool,
+    },
     /// Link an account your sessions run on, held by dirigent: a ChatGPT plan, signed in in your
     /// browser; an Anthropic API key, typed (hidden) or on stdin.
     Link {
@@ -176,35 +185,19 @@ enum ImportProvider {
 
 #[derive(Subcommand)]
 enum HostCommand {
-    /// Run the host here, until it's stopped (what the service runs).
-    Run {
-        /// As the system's service: its roots by default under /var/lib/dirigent.
-        #[arg(long)]
-        system: bool,
-    },
-    /// Install the host as a service and start it: yours (a launchd agent on macOS, a systemd
-    /// user unit on Linux), or with --system the machine's (a launchd daemon, a systemd system
-    /// unit; as root), its credentials copied from yours to /etc/dirigent.
-    Install {
-        #[arg(long)]
-        system: bool,
-        /// The system's service runs as this user, not root.
-        #[arg(long, requires = "system")]
-        user: Option<String>,
-        /// The credentials the system's service signs in with (by default, the signed-in ones of
-        /// the user running sudo).
-        #[arg(long, requires = "system")]
-        credentials: Option<PathBuf>,
-    },
+    /// Run the host here, until it's stopped (what the service runs). As you, never root.
+    Run,
+    /// Install the host as your service and start it: a launchd agent on macOS (in your login
+    /// session, where Xcode's keychain and the Simulator are; a locked screen doesn't stop it),
+    /// a systemd user unit on Linux (lingering: from boot). As you, never with sudo.
+    Install,
     /// Stop the service and remove it (players running go on until their sessions stop).
-    Uninstall {
-        #[arg(long)]
-        system: bool,
-    },
-    /// Whether the service is installed, and running.
+    Uninstall,
+    /// What of the host runs here, and where: its service, whether control has it connected,
+    /// the sessions running here and their directories, the last problems in its log.
     Status {
         #[arg(long)]
-        system: bool,
+        json: bool,
     },
 }
 
@@ -373,6 +366,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let mut api = Api::signed_in(http)?;
             let me: Me = api.get("/me").await?;
             println!("{} at {}", me.subject, api.creds.api);
+            let about: version::About = api.get("/about").await?;
+            println!(
+                "dirigent {}, this CLI {}",
+                about.control.version,
+                dirigent_player::VERSION
+            );
             match me.chatgpt {
                 None => println!("ChatGPT: not linked (dirigent link chatgpt)"),
                 Some(Link {
@@ -463,6 +462,28 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
+        Command::Version { json } => {
+            let cli = dirigent_player::VERSION;
+            let fetched = async {
+                let mut api = Api::signed_in(http)?;
+                let (about, hosts) = version::fetch(&mut api).await?;
+                anyhow::Ok((api.creds.api, about, hosts))
+            };
+            match (fetched.await, json) {
+                (Ok((_, about, hosts)), true) => {
+                    let all = json!({ "cli": cli, "about": about, "hosts": hosts });
+                    println!("{}", serde_json::to_string_pretty(&all)?);
+                }
+                (Ok((url, about, hosts)), false) => {
+                    print!("{}", version::render(cli, &url, &about, &hosts))
+                }
+                // the CLI's own, whatever the dirigent's
+                (Err(e), _) => {
+                    println!("cli {cli}");
+                    return Err(e);
+                }
+            }
+        }
         Command::Models => {
             let mut api = Api::signed_in(http)?;
             let models: Vec<Model> = api.get("/links/chatgpt/models").await?;
@@ -477,9 +498,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             once,
         } => sync::sync(Api::signed_in(http)?, &session, dir, chlive, once).await?,
         Command::Host { command } => {
-            use host::service::{self, Service};
+            use host::service;
             match command {
-                HostCommand::Run { system } => {
+                HostCommand::Run => {
                     tracing_subscriber::fmt()
                         .with_env_filter(
                             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -488,18 +509,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
                         .init();
                     let config = host::Config::load(&host::config_path()?)?;
-                    host::run(Api::signed_in(http)?, config, system).await?
+                    host::run(Api::signed_in(http)?, config).await?
                 }
-                HostCommand::Install {
-                    system,
-                    user,
-                    credentials,
-                } => service::install(&Service { system, user }, credentials).await?,
-                HostCommand::Uninstall { system } => {
-                    service::uninstall(&Service { system, user: None }).await?
-                }
-                HostCommand::Status { system } => {
-                    service::status(&Service { system, user: None }).await?
+                HostCommand::Install => service::install().await?,
+                HostCommand::Uninstall => service::uninstall().await?,
+                HostCommand::Status { json } => {
+                    let status = host::status::status(http).await?;
+                    match json {
+                        true => println!("{}", serde_json::to_string_pretty(&status)?),
+                        false => print!("{}", host::status::render(&status)),
+                    }
                 }
             }
         }
