@@ -2,6 +2,11 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
+## Unreleased
+
+### Added
+- Documentation: a README, and `docs/` on using dirigent (the web, sessions, the agent, dirigents, accounts and secrets, workspaces, hosts, importing), running it (installing, configuration, machines and systems, operations), references (CLI, HTTP API, events, control) and its architecture.
+
 ## 0.1.9 (2026-11-15)
 
 ### Added
