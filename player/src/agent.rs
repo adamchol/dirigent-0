@@ -23,22 +23,31 @@ use crate::secrets::Secrets;
 use crate::session::Session;
 use crate::title;
 use crate::tools::{Registry, ToolCtx, ToolOutput};
+use dirigent_protocol::control::Settings;
 use dirigent_protocol::fold::Fold;
 use dirigent_protocol::{Event, TurnEndReason};
 
-#[derive(Debug, Clone, Copy)]
-pub struct AgentConfig {
-    pub model: &'static str,
-    pub system: &'static str,
-    pub effort: Option<Effort>,
+/// What the session's model calls go to, as its [`Settings`] make it: they may change while it
+/// runs, and the next call takes the new ones.
+#[derive(Clone)]
+pub struct Model {
+    pub settings: Settings,
+    pub provider: Arc<dyn Provider>,
     /// The model's context window, in tokens.
     pub context_window: u64,
     /// What names the session (see [`title`]): a small model, made to think little.
-    pub title_model: &'static str,
+    pub title_model: String,
     pub title_effort: Option<Effort>,
 }
 
-impl AgentConfig {
+/// The session's settings as control says them, and what makes a [`Model`] of them.
+pub struct Models {
+    pub settings: watch::Receiver<Settings>,
+    #[allow(clippy::type_complexity)]
+    pub make: Box<dyn Fn(&Settings) -> anyhow::Result<Model> + Send + Sync>,
+}
+
+impl Model {
     /// A call whose context is estimated at this many tokens compacts it first.
     fn trigger(&self) -> u64 {
         self.context_window / 100 * 85
@@ -52,8 +61,8 @@ impl AgentConfig {
 
 /// Program-lifetime pieces; each session gets its own history and tool context.
 pub struct Agent {
-    pub provider: Arc<dyn Provider>,
-    pub cfg: AgentConfig,
+    pub system: &'static str,
+    pub models: Models,
     pub tools: Arc<Registry>,
     pub workdir: &'static Path,
     /// Where the workspace is snapshotted after every turn; none, it isn't.
@@ -144,11 +153,14 @@ impl Agent {
             Event::UserMessage { text, .. } => Some(text.clone()),
             _ => None,
         });
+        let mut settings = self.models.settings.clone();
+        let model = (self.models.make)(&settings.borrow_and_update())?;
         let mut run = Run {
             agent: self,
             session,
+            model,
             history: History::from_events(&handled),
-            fixed: (self.cfg.system.len() + tools) as u64 / CHARS_PER_TOKEN,
+            fixed: (self.system.len() + tools) as u64 / CHARS_PER_TOKEN,
             ctx: Arc::new(ToolCtx::new(self.workdir, self.secrets.clone())),
             turn: None,
             queue: fold.queued().iter().cloned().collect(),
@@ -204,6 +216,10 @@ impl Agent {
                         info!(?names, "the session's secrets changed");
                         run.session.publish(&Event::SecretsChanged { names }).await;
                     }
+                }
+                Ok(()) = settings.changed() => {
+                    let now = settings.borrow_and_update().clone();
+                    run.switch(now).await;
                 }
                 now = told_to_detach(&mut detach.when, detaching), if detaching != Some(true) => {
                     info!(now, "detaching");
@@ -315,7 +331,8 @@ pub fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -
             | Event::FilesChanged { .. }
             | Event::SecretAnswered { .. }
             | Event::SecretsChanged { .. }
-            | Event::Imported { .. } => {}
+            | Event::Imported { .. }
+            | Event::ModelChanged { .. } => {}
         }
     }
     if !open {
@@ -342,6 +359,8 @@ pub fn close_unfinished(events: &[(String, Event)], interrupt: Option<String>) -
 struct Run<'a> {
     agent: &'a Agent,
     session: &'a mut dyn Session,
+    /// What the next model call goes to.
+    model: Model,
     history: History,
     /// Estimated tokens of the system prompt and tools.
     fixed: u64,
@@ -398,6 +417,39 @@ impl Run<'_> {
                 self.hold = hold;
             }
             other => warn!(?other, "ignoring an event users don't send"),
+        }
+    }
+
+    /// The session's model, effort or provider changed: model calls from the next one on go to
+    /// what `settings` make (one running finishes as it began). If they make nothing, the old
+    /// ones stay, and the log says why.
+    async fn switch(&mut self, settings: Settings) {
+        if settings == self.model.settings {
+            return;
+        }
+        match (self.agent.models.make)(&settings) {
+            Ok(model) => {
+                info!(
+                    ?settings,
+                    provider = model.provider.name(),
+                    "the session's model switched"
+                );
+                self.model = model;
+                self.session
+                    .publish(&Event::ModelChanged { settings })
+                    .await;
+            }
+            Err(e) => {
+                warn!(?settings, "switching the session's model: {e:#}");
+                let message = format!("can't switch to {}: {e:#}", settings.model);
+                self.session
+                    .publish(&Event::Error {
+                        message,
+                        retry_in_ms: None,
+                        compact: false,
+                    })
+                    .await;
+            }
         }
     }
 
@@ -515,7 +567,8 @@ impl Run<'_> {
             | Event::Titled { .. }
             | Event::SecretAnswered { .. }
             | Event::SecretsChanged { .. }
-            | Event::Imported { .. } => {}
+            | Event::Imported { .. }
+            | Event::ModelChanged { .. } => {}
             // the workspace, as a tool left it: in the log, never the history
             Event::FilesChanged { .. } => {
                 self.session.publish(&ev).await;
@@ -531,8 +584,8 @@ impl Run<'_> {
         }
         let token = CancellationToken::new();
         self.titling = Some(token.clone());
-        let req = title::request(&self.agent.cfg, input, self.title.as_ref());
-        let provider = self.agent.provider.clone();
+        let req = title::request(&self.model, input, self.title.as_ref());
+        let provider = self.model.provider.clone();
         let named = self.named.clone();
         tokio::spawn(async move {
             let reply = tokio::time::timeout(
@@ -612,12 +665,12 @@ impl Run<'_> {
         t.steered = false;
         let may_compact = !t.compacted;
         let token = t.token.clone();
-        if may_compact && self.history.tokens(self.fixed) >= self.agent.cfg.trigger() {
+        if may_compact && self.history.tokens(self.fixed) >= self.model.trigger() {
             self.compact();
             return;
         }
         let req = self.request();
-        let provider = self.agent.provider.clone();
+        let provider = self.model.provider.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let send = |ev: Event| {
@@ -651,8 +704,8 @@ impl Run<'_> {
         t.compacted = true;
         let token = t.token.clone();
         let tx = self.tx.clone();
-        let cfg = self.agent.cfg;
-        let Some((first_kept, dropped)) = self.history.cut(cfg.keep()) else {
+        let (keep, trigger) = (self.model.keep(), self.model.trigger());
+        let Some((first_kept, dropped)) = self.history.cut(keep) else {
             let _ = tx.send(Event::CompactionFailed {
                 message: "there is nothing to compact".into(),
             });
@@ -660,7 +713,7 @@ impl Run<'_> {
         };
         info!(dropped, "compacting the context");
         let base = self.request();
-        let provider = self.agent.provider.clone();
+        let provider = self.model.provider.clone();
         tokio::spawn(async move {
             let send = |ev: Event| {
                 let _ = tx.send(ev);
@@ -677,7 +730,7 @@ impl Run<'_> {
             let mut reply = summarize(compact::request(&base)).await;
             if matches!(reply, Err(ProviderError::ContextOverflow)) {
                 warn!("the summary call is too long too; summarizing a clipped transcript");
-                reply = summarize(compact::fallback(&base, cfg.trigger())).await;
+                reply = summarize(compact::fallback(&base, trigger)).await;
             }
             send(match reply {
                 Ok(Some(c)) => match compact::summary(&c, dropped) {
@@ -697,13 +750,12 @@ impl Run<'_> {
     }
 
     fn request(&self) -> Request {
-        let cfg = self.agent.cfg;
         Request {
-            model: cfg.model.to_string(),
-            system: Some(cfg.system.to_string()),
+            model: self.model.settings.model.clone(),
+            system: Some(self.agent.system.to_string()),
             messages: self.history.messages(),
             tools: self.agent.tools.specs().to_vec(),
-            effort: cfg.effort,
+            effort: self.model.settings.effort,
         }
     }
 
@@ -951,7 +1003,8 @@ fn log_event(ev: &Event) {
         | Event::FilesChanged { .. }
         | Event::SecretAnswered { .. }
         | Event::SecretsChanged { .. }
-        | Event::Imported { .. } => {}
+        | Event::Imported { .. }
+        | Event::ModelChanged { .. } => {}
     }
 }
 
@@ -982,14 +1035,17 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    const CFG: AgentConfig = AgentConfig {
-        model: "mock",
-        system: "sys",
-        effort: None,
-        context_window: 1_000_000,
-        title_model: "mock-small",
-        title_effort: None,
-    };
+    /// The context window of the tests' model.
+    const WINDOW: u64 = 1_000_000;
+
+    /// What the sessions start with: the mock, thinking none.
+    fn mock_settings() -> Settings {
+        Settings {
+            model: "mock".into(),
+            effort: None,
+            provider: dirigent_protocol::control::Provider::Anthropic,
+        }
+    }
 
     type Published = Arc<Mutex<Vec<(String, Event)>>>;
 
@@ -1027,6 +1083,8 @@ mod tests {
         published: Published,
         tx: mpsc::Sender<(String, Event)>,
         detach: watch::Sender<Option<bool>>,
+        /// What control says the session's model, effort and provider are.
+        settings: watch::Sender<Settings>,
         task: tokio::task::JoinHandle<anyhow::Result<()>>,
     }
 
@@ -1036,36 +1094,36 @@ mod tests {
 
     /// A harness whose session's log already has `log`.
     fn resumed(log: Vec<(String, Event)>) -> Harness {
-        resumed_with(log, CFG)
+        resumed_with(log, WINDOW)
     }
 
-    fn resumed_with(log: Vec<(String, Event)>, cfg: AgentConfig) -> Harness {
-        with_checkpoints(log, cfg, None)
+    fn resumed_with(log: Vec<(String, Event)>, window: u64) -> Harness {
+        with_checkpoints(log, window, None)
     }
 
     fn with_checkpoints(
         log: Vec<(String, Event)>,
-        cfg: AgentConfig,
+        window: u64,
         checkpoints: Option<&'static Checkpoints>,
     ) -> Harness {
-        start(log, cfg, checkpoints, None, Secrets::none())
+        start(log, window, checkpoints, None, Secrets::none())
     }
 
     /// A harness whose workspace is mirrored, its repository in `state`.
     fn mirrored(state: &Path) -> Harness {
         let state: &'static Path = Box::leak(state.to_path_buf().into_boxed_path());
-        start(Vec::new(), CFG, None, Some(state), Secrets::none())
+        start(Vec::new(), WINDOW, None, Some(state), Secrets::none())
     }
 
     /// A harness whose session has `secrets`, its workspace mirrored in `state`.
     fn with_secrets(state: &Path, secrets: Secrets) -> Harness {
         let state: &'static Path = Box::leak(state.to_path_buf().into_boxed_path());
-        start(Vec::new(), CFG, None, Some(state), secrets)
+        start(Vec::new(), WINDOW, None, Some(state), secrets)
     }
 
     fn start(
         log: Vec<(String, Event)>,
-        cfg: AgentConfig,
+        window: u64,
         checkpoints: Option<&'static Checkpoints>,
         mirror: Option<&'static Path>,
         secrets: Secrets,
@@ -1075,9 +1133,26 @@ mod tests {
             Box::leak(dir.path().canonicalize().unwrap().into_boxed_path());
         let provider = Arc::new(MockProvider::default());
         let published = Arc::new(Mutex::new(Vec::new()));
+        let mock = provider.clone();
+        let make = move |s: &Settings| -> anyhow::Result<Model> {
+            if s.model == "broken" {
+                anyhow::bail!("no such model");
+            }
+            Ok(Model {
+                settings: s.clone(),
+                provider: mock.clone(),
+                context_window: if s.model == "small" { SMALL } else { window },
+                title_model: "mock-small".into(),
+                title_effort: None,
+            })
+        };
+        let (settings, settings_rx) = watch::channel(mock_settings());
         let mut agent = Agent {
-            provider: provider.clone(),
-            cfg,
+            system: "sys",
+            models: Models {
+                settings: settings_rx,
+                make: Box::new(make),
+            },
             tools: Arc::new(Registry::default_set()),
             workdir,
             checkpoints,
@@ -1108,6 +1183,7 @@ mod tests {
             published,
             tx,
             detach,
+            settings,
             task,
         }
     }
@@ -1242,6 +1318,7 @@ mod tests {
                 Event::SecretAnswered { name, provided, .. } => format!("answer:{name}:{provided}"),
                 Event::SecretsChanged { names } => format!("secrets:{}", names.join(",")),
                 Event::Imported { from, .. } => format!("imported:{from}"),
+                Event::ModelChanged { settings } => format!("model:{}", settings.model),
                 Event::ModelDelta { .. } | Event::Titled { .. } => unreachable!("filtered"),
             })
             .collect()
@@ -1357,7 +1434,7 @@ mod tests {
         let checkpoints: &'static Checkpoints = Box::leak(Box::new(
             crate::checkpoints::tests::checkpoints(repo.path()).await,
         ));
-        let h = with_checkpoints(Vec::new(), CFG, Some(checkpoints));
+        let h = with_checkpoints(Vec::new(), WINDOW, Some(checkpoints));
         h.provider.reset([
             Script::text("one", Duration::ZERO),
             Script::text("two", Duration::ZERO),
@@ -2199,11 +2276,126 @@ mod tests {
         assert_eq!(hist, vec!["first", "r1", "one", "r2", "two"]);
     }
 
-    /// Compacts at 8.5k tokens and keeps 1k.
-    const SMALL: AgentConfig = AgentConfig {
-        context_window: 10_000,
-        ..CFG
-    };
+    impl Harness {
+        /// Wait until `n` turns have ended.
+        async fn ended(&self, n: usize) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self
+                .events()
+                .iter()
+                .filter(|e| matches!(e, Event::TurnEnded { .. }))
+                .count()
+                < n
+            {
+                assert!(Instant::now() < deadline, "{n} turns didn't end");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_switch_takes_the_next_model_call_and_one_running_finishes_as_it_began() {
+        let h = harness();
+        h.provider.reset([
+            Script::text("slow", Duration::from_millis(300)),
+            Script::text("fast", Duration::ZERO),
+        ]);
+        h.send("one").await;
+        h.started().await;
+        let other = Settings {
+            model: "other".into(),
+            effort: Some(Effort::High),
+            ..mock_settings()
+        };
+        h.settings.send_replace(other.clone());
+        h.ended(1).await;
+        // told again what it has: nothing to say
+        h.settings.send_replace(other);
+        h.send("two").await;
+        let (kinds, reqs) = h.finish(2).await;
+        assert_eq!(
+            kinds,
+            [
+                "user:one",
+                "model:other",
+                "assistant:slow",
+                "end:Completed",
+                "user:two",
+                "assistant:fast",
+                "end:Completed"
+            ]
+        );
+        assert_eq!((reqs[0].model.as_str(), reqs[0].effort), ("mock", None));
+        assert_eq!(
+            (reqs[1].model.as_str(), reqs[1].effort),
+            ("other", Some(Effort::High))
+        );
+        // the conversation goes on whole
+        let texts: Vec<_> = reqs[1].messages.iter().map(|m| m.text()).collect();
+        assert_eq!(texts, ["one", "slow", "two"]);
+    }
+
+    #[tokio::test]
+    async fn a_switch_to_a_smaller_window_compacts_before_the_next_call() {
+        let h = harness();
+        h.provider.reset([
+            Script::text("r1", Duration::ZERO),
+            Script::text("## Goal SUMMARY", Duration::ZERO),
+            Script::text("done", Duration::ZERO),
+        ]);
+        // 11k tokens: in the window it has, not in the one it switches to
+        let long = FIRST.repeat(1000);
+        h.send(&FIRST.repeat(100)).await;
+        h.ended(1).await;
+        h.settings.send_replace(Settings {
+            model: "small".into(),
+            ..mock_settings()
+        });
+        h.send(&long).await;
+        let (kinds, reqs) = h.finish(2).await;
+        assert_eq!(kinds[3], "model:small");
+        assert_eq!(
+            kinds[5..],
+            [
+                "compacted:## Goal SUMMARY",
+                "assistant:done",
+                "end:Completed"
+            ]
+        );
+        assert_eq!(reqs.len(), 3);
+        assert!(reqs.iter().skip(1).all(|r| r.model == "small"));
+        assert!(reqs[2].messages[0].text().contains("## Goal SUMMARY"));
+        assert!(!reqs[2].messages[0].text().contains("r1"));
+    }
+
+    #[tokio::test]
+    async fn a_switch_to_what_makes_no_model_keeps_the_one_there_is() {
+        let h = harness();
+        h.provider
+            .reset([Script::text("still here", Duration::ZERO)]);
+        // running already: a session whose model can't be made at the start fails
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.settings.send_replace(Settings {
+            model: "broken".into(),
+            ..mock_settings()
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.send("hi").await;
+        let (kinds, reqs) = h.finish(1).await;
+        assert_eq!(
+            kinds,
+            [
+                "error:can't switch to broken: no such model",
+                "user:hi",
+                "assistant:still here",
+                "end:Completed"
+            ]
+        );
+        assert_eq!(reqs[0].model, "mock");
+    }
+
+    /// Compacts at 8.5k tokens and keeps 1k; the window of the model `small` too.
+    const SMALL: u64 = 10_000;
 
     const FIRST: &str = "the first message, which a compaction drops. ";
 

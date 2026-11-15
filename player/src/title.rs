@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use crate::agent::AgentConfig;
+use crate::agent::Model;
 use crate::provider::{Completion, ContentBlock, Message, Request};
 
 pub const INSTRUCTION: &str = include_str!("../prompts/title.md");
@@ -14,7 +14,7 @@ const DESCRIPTION_CHARS: usize = 300;
 
 /// The call naming a session about `input` (its first message, or a compaction's summary),
 /// which `current` names now, if anything does.
-pub fn request(cfg: &AgentConfig, input: &str, current: Option<&(String, String)>) -> Request {
+pub fn request(model: &Model, input: &str, current: Option<&(String, String)>) -> Request {
     let mut text = String::new();
     if let Some((title, description)) = current {
         text.push_str(&format!(
@@ -26,11 +26,11 @@ pub fn request(cfg: &AgentConfig, input: &str, current: Option<&(String, String)
         clip(input, INPUT_CHARS)
     ));
     Request {
-        model: cfg.title_model.to_string(),
+        model: model.title_model.clone(),
         system: Some(INSTRUCTION.into()),
         messages: vec![Message::user(text)],
         tools: Vec::new(),
-        effort: cfg.title_effort,
+        effort: model.title_effort,
     }
 }
 
@@ -115,16 +115,15 @@ mod tests {
 
     #[test]
     fn a_retitle_reads_the_current_name_and_the_summary() {
-        let cfg = AgentConfig {
-            model: "m",
-            system: "s",
-            effort: None,
+        let model = Model {
+            settings: dirigent_protocol::control::SessionSpec::default().settings(),
+            provider: std::sync::Arc::new(crate::provider::mock::MockProvider::default()),
             context_window: 1000,
-            title_model: "small",
+            title_model: "small".into(),
             title_effort: None,
         };
         let current = ("Old".to_string(), "Was doing this.".to_string());
-        let req = request(&cfg, "the summary", Some(&current));
+        let req = request(&model, "the summary", Some(&current));
         assert_eq!(req.model, "small");
         assert_eq!(req.system.as_deref(), Some(INSTRUCTION));
         assert!(req.tools.is_empty());

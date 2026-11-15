@@ -8,6 +8,7 @@ import {
   ArchiveIcon,
   ArchiveRestoreIcon,
   BotIcon,
+  BrainIcon,
   ChevronRightIcon,
   CodeIcon,
   CopyIcon,
@@ -59,10 +60,10 @@ import { Switch } from "@/components/ui/switch";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import * as api from "./api.ts";
-import type { Effort, Host, Machines, Me, Model, Part, Provider, Resources, SessionInfo, Settings } from "./api.ts";
+import type { Host, Machines, Me, ModelSettings, Part, Resources, SessionInfo, Settings } from "./api.ts";
 import { RepoAccess } from "./GitHub.tsx";
-import { linked } from "./Link.tsx";
 import * as machine from "./machine.ts";
+import { DEFAULT_SETTINGS, ModelPicker } from "./ModelPicker.tsx";
 import { useTitles } from "./Rename.tsx";
 import type { Named } from "./events.ts";
 import { ACTIVITY_QUERY, millis, type ActivityRow } from "./events.ts";
@@ -241,6 +242,7 @@ export function SessionMenu(props: {
   openLocally: () => void;
   secrets: () => void;
   remove: () => void;
+  switchModel: () => void;
 }) {
   const { info, who, changed } = props;
   const owner = info?.role === "owner";
@@ -271,6 +273,11 @@ export function SessionMenu(props: {
             {owner && (
               <DropdownMenuItem onClick={props.secrets}>
                 <LockKeyholeIcon /> Secrets
+              </DropdownMenuItem>
+            )}
+            {owner && (
+              <DropdownMenuItem onClick={props.switchModel}>
+                <BrainIcon /> Model
               </DropdownMenuItem>
             )}
             <DropdownMenuItem onClick={props.openLocally}>
@@ -509,21 +516,6 @@ function SessionItems(props: {
   );
 }
 
-const EFFORTS: { value: Effort | "none"; label: string }[] = [
-  { value: "none", label: "No thinking" },
-  { value: "low", label: "Low" },
-  { value: "medium", label: "Medium" },
-  { value: "high", label: "High" },
-  { value: "max", label: "Max" },
-];
-
-const PROVIDERS: { value: Provider; label: string }[] = [
-  { value: "anthropic", label: "Anthropic API" },
-  { value: "chatgpt", label: "ChatGPT plan" },
-];
-
-const CLAUDE = "claude-sonnet-5";
-
 const MACHINE: { part: keyof Resources; label: string; unit: string }[] = [
   { part: "cpu", label: "Cores", unit: "CPU" },
   { part: "memory", label: "Memory", unit: "GiB" },
@@ -550,10 +542,7 @@ export function NewSession(props: {
   const [part, setPart] = useState<Part>("coder");
   const [git, setGit] = useState("");
   const [ref, setRef] = useState("");
-  const [provider, setProvider] = useState<Provider>("anthropic");
-  const [models, setModels] = useState<Model[] | null>(null);
-  const [model, setModel] = useState(CLAUDE);
-  const [effort, setEffort] = useState<Effort | "none">("medium");
+  const [settings, setSettings] = useState<ModelSettings>(DEFAULT_SETTINGS);
   const [start, setStart] = useState(true);
   const [busy, setBusy] = useState(false);
   const [machines, setMachines] = useState<Machines | null>(null);
@@ -563,7 +552,6 @@ export function NewSession(props: {
   const [host, setHost] = useState("");
   // as typed, until it's changed: the default one
   const [typed, setTyped] = useState<Record<keyof Resources, string> | null>(null);
-  const plan = linked(props.me);
   const { who } = props;
 
   useEffect(() => {
@@ -580,28 +568,6 @@ export function NewSession(props: {
   const chosen: Resources | null = dflt && { cpu: Number(shown("cpu")), memory: Number(shown("memory")), disk: Number(shown("disk")) };
   const type = (part: keyof Resources, value: string) =>
     setTyped((t) => ({ cpu: shown("cpu"), memory: shown("memory"), disk: shown("disk"), ...t, [part]: value }));
-
-  // the plan's models, once it's chosen: the first, unless one of them is
-  useEffect(() => {
-    if (provider !== "chatgpt" || !props.open) return;
-    let gone = false;
-    api.models(who).then(
-      (list) => {
-        if (gone) return;
-        setModels(list);
-        setModel((m) => (list.some((x) => x.slug === m) ? m : (list[0]?.slug ?? "")));
-      },
-      (err) => !gone && toast.error("The plan's models aren't listed", { description: (err as Error).message }),
-    );
-    return () => {
-      gone = true;
-    };
-  }, [provider, props.open, who]);
-
-  function choose(p: Provider) {
-    setProvider(p);
-    if (p === "anthropic") setModel(CLAUDE);
-  }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -620,7 +586,7 @@ export function NewSession(props: {
       await api.put(
         props.who,
         id,
-        { model, effort: effort === "none" ? null : effort, source, part, provider, ...(resources && !host ? { resources } : {}) },
+        { ...settings, source, part, ...(resources && !host ? { resources } : {}) },
         start,
         host || null,
       );
@@ -697,70 +663,14 @@ export function NewSession(props: {
                 </motion.div>
               )}
             </AnimatePresence>
-            <Field>
-              <FieldLabel>Paid with</FieldLabel>
-              <Select items={PROVIDERS} value={provider} onValueChange={(v) => v && choose(v as Provider)}>
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {PROVIDERS.map((p) => (
-                    <SelectItem key={p.value} value={p.value} disabled={p.value === "chatgpt" && !plan}>
-                      {p.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {!plan && (
-                <FieldDescription>
-                  {props.me?.chatgpt?.broken ? "Your ChatGPT link is broken: " : "No ChatGPT plan is linked: "}
-                  <button type="button" className="text-primary-text hover:underline" onClick={props.connect}>
-                    link it
-                  </button>
-                  .
-                </FieldDescription>
-              )}
-            </Field>
-            <div className="grid gap-4 sm:grid-cols-[1fr_10rem]">
-              <Field>
-                <FieldLabel htmlFor="model">Model</FieldLabel>
-                {provider === "chatgpt" ? (
-                  <Select
-                    items={(models ?? []).map((m) => ({ value: m.slug, label: m.display_name }))}
-                    value={model}
-                    onValueChange={(v) => v && setModel(v as string)}
-                  >
-                    <SelectTrigger className="w-full" id="model" disabled={!models}>
-                      <SelectValue placeholder={models ? "No models" : "Listing…"} />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {(models ?? []).map((m) => (
-                        <SelectItem key={m.slug} value={m.slug}>
-                          {m.display_name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                ) : (
-                  <Input id="model" value={model} onChange={(e) => setModel(e.target.value)} required />
-                )}
-              </Field>
-              <Field>
-                <FieldLabel>Thinking</FieldLabel>
-                <Select items={EFFORTS} value={effort} onValueChange={(v) => v && setEffort(v as Effort | "none")}>
-                  <SelectTrigger className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {EFFORTS.map((e) => (
-                      <SelectItem key={e.value} value={e.value}>
-                        {e.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Field>
-            </div>
+            <ModelPicker
+              who={who}
+              me={props.me}
+              open={props.open}
+              value={settings}
+              onChange={setSettings}
+              connect={props.connect}
+            />
             {hosts.length > 0 && (
               <Field>
                 <FieldLabel>Runs on</FieldLabel>
@@ -852,7 +762,7 @@ export function NewSession(props: {
           </FieldGroup>
           <DialogFooter>
             <DialogClose render={<Button type="button" variant="outline" />}>Cancel</DialogClose>
-            <Button type="submit" disabled={busy || !model}>
+            <Button type="submit" disabled={busy || !settings.model}>
               {busy ? <Spinner /> : <PlusIcon />} Make it
             </Button>
           </DialogFooter>

@@ -104,6 +104,7 @@ The **…** at the top:
 |---|---|
 | **Rename** | Title (up to 80 characters) and description (up to 300). **Keep this name** (on by default) stops the agent from renaming it; off, it names it again as the work moves on. |
 | **Secrets** | The session's own secrets, and the names it gets from yours. See [Accounts and secrets](accounts-and-secrets.md#secrets). |
+| **Model** | Its model, effort and provider; running, it takes them from its next call. See [Sessions](sessions.md#switching-model-provider-or-thinking). |
 | **Runs on** | (Idle sessions.) The cluster or one of your hosts, for its next start. A session placed on a host that isn't connected shows it as **(not connected)**. |
 | **Open locally** | The commands to follow its workspace on your machine (`dirigent login`, `dirigent sync`). |
 | **Copy ID** | The session's id. |

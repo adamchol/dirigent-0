@@ -293,6 +293,8 @@ in
     environment = {
       HOME = "/root";
       KOPIA_CHECK_FOR_UPDATES = "false";
+      # the session, handed to the system while the player holds it (below)
+      DIRIGENT_SESSION_HOOK = "/run/dirigent/session";
     };
     serviceConfig = {
       Type = "exec";
@@ -312,5 +314,13 @@ in
       mountpoint -q ${player} || mount -o ro /dev/disk/by-id/virtio-dirigent-player ${player}
       exec ${player}/player --workdir ${work}/workspace --state-dir ${work}/state
     '';
+  };
+
+  # While the player holds a session: started once it has written /run/dirigent/session (`env`,
+  # `secrets/<NAME>`) and named the VM dirigent-<the session's first 8>, stopped (and the files
+  # removed) when the session ends. The cluster's configuration hangs units on it
+  # (`wantedBy = [ "dirigent-session.target" ]`); nothing starts it at boot.
+  systemd.targets.dirigent-session = {
+    description = "a dirigent session runs in this VM";
   };
 }

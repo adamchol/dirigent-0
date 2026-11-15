@@ -166,7 +166,11 @@ impl Provider for GenaiProvider {
 /// (a ChatGPT plan's calls may have no system message).
 pub fn to_chat_request(req: &Request, openai: bool) -> (ChatRequest, ChatOptions) {
     if openai {
-        let messages = req.messages.iter().flat_map(to_chat_messages).collect();
+        let messages = req
+            .messages
+            .iter()
+            .flat_map(|m| to_chat_messages(m, true))
+            .collect();
         let mut chat = ChatRequest::new(messages);
         if let Some(system) = &req.system {
             chat = chat.with_system(system.clone());
@@ -191,7 +195,7 @@ pub fn to_chat_request(req: &Request, openai: bool) -> (ChatRequest, ChatOptions
         messages.push(ChatMessage::system(system.clone()).with_options(CacheControl::Ephemeral));
     }
     for (i, msg) in req.messages.iter().enumerate() {
-        let mut chat = to_chat_messages(msg);
+        let mut chat = to_chat_messages(msg, false);
         if Some(i) == last || Some(i) == previous {
             if let Some(m) = chat.last_mut() {
                 m.options = Some(CacheControl::Ephemeral.into());
@@ -258,8 +262,9 @@ fn always_thinks(model: &str) -> bool {
 
 /// One neutral message becomes one genai message, except that tool results
 /// inside a user message are split into a preceding `Tool`-role message
-/// (genai's shape; the Anthropic adapter folds it back into a user turn).
-fn to_chat_messages(msg: &Message) -> Vec<ChatMessage> {
+/// (genai's shape; the Anthropic adapter folds it back into a user turn). Thinking goes back only
+/// to the provider that made it (`openai` or not), or when it's not known which did.
+fn to_chat_messages(msg: &Message, openai: bool) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     match msg.role {
         Role::User => {
@@ -303,8 +308,11 @@ fn to_chat_messages(msg: &Message) -> Vec<ChatMessage> {
                         provider_data,
                     } => {
                         // Anthropic accepts a thinking block only with its
-                        // signature; an unsigned one is dropped on purpose.
-                        if let Some(sig) = provider_data.get("signature").and_then(Value::as_str) {
+                        // signature; an unsigned one is dropped on purpose, as is
+                        // one the other provider signed (the session switched)
+                        let theirs = provider_data.get(if openai { ANTHROPIC } else { OPENAI });
+                        let sig = provider_data.get("signature").and_then(Value::as_str);
+                        if let (Some(sig), None) = (sig, theirs) {
                             parts.push(ContentPart::ReasoningContent(text.clone()));
                             parts.push(ContentPart::ThoughtSignature(sig.to_string()));
                         }
@@ -354,6 +362,10 @@ pub struct MapState {
 /// A stream that ended with nothing: no stop reason, usage or content. genai ends a Responses
 /// stream so when the server's event isn't one it knows (an `error` one: a refused request), or
 /// the connection closes early; either way not a reply.
+/// Who signed a thinking block, in its `provider_data` (`true`); neither, a block from before it said.
+const ANTHROPIC: &str = "anthropic";
+const OPENAI: &str = "openai";
+
 const EMPTY_END: &str = "the model's response ended without a reply";
 
 impl MapState {
@@ -420,7 +432,7 @@ impl MapState {
                 };
                 out.push(Delta::BlockData {
                     index,
-                    provider_data: json!({ "signature": c.content }),
+                    provider_data: json!({ "signature": c.content, "anthropic": true }),
                 });
                 self.unsigned.retain(|&i| i != index);
                 self.streamed_signatures = true;
@@ -506,7 +518,7 @@ impl MapState {
                 };
                 out.push(Delta::BlockData {
                     index,
-                    provider_data: json!({ "signature": signature }),
+                    provider_data: json!({ "signature": signature, "openai": true }),
                 });
             }
         }
@@ -873,6 +885,41 @@ mod tests {
     }
 
     #[test]
+    fn thinking_goes_back_only_to_the_provider_that_signed_it() {
+        let thought = |text: &str, data: Value| ContentBlock::Thinking {
+            text: text.into(),
+            provider_data: data,
+        };
+        let req = Request {
+            model: "m".into(),
+            system: None,
+            messages: vec![
+                Message::user("go"),
+                Message::assistant(vec![
+                    thought("claude's", json!({"signature": "A", "anthropic": true})),
+                    thought("gpt's", json!({"signature": "O", "openai": true})),
+                    thought("from before", json!({"signature": "U"})),
+                    ContentBlock::Text { text: "ok".into() },
+                ]),
+                Message::user("and?"),
+            ],
+            tools: vec![],
+            effort: None,
+        };
+        let signed = |openai| {
+            let (chat, _) = to_chat_request(&req, openai);
+            let asst = chat
+                .messages
+                .iter()
+                .find(|m| m.role == ChatRole::Assistant)
+                .unwrap();
+            asst.content.thought_signatures().join(",")
+        };
+        assert_eq!(signed(false), "A,U");
+        assert_eq!(signed(true), "O,U");
+    }
+
+    #[test]
     fn request_maps_tool_turn_and_signed_thinking() {
         let req = Request {
             model: "claude-sonnet-5".into(),
@@ -1031,7 +1078,7 @@ mod tests {
             vec![
                 ContentBlock::Thinking {
                     text: "thinking".into(),
-                    provider_data: json!({"signature": "SIG"}),
+                    provider_data: json!({"signature": "SIG", "anthropic": true}),
                 },
                 ContentBlock::ToolCall {
                     id: "c1".into(),
@@ -1503,7 +1550,7 @@ mod tests {
             done.message.content[0],
             ContentBlock::Thinking {
                 text: "thinking it over".into(),
-                provider_data: json!({ "signature": "ENC1" }),
+                provider_data: json!({ "signature": "ENC1", "openai": true }),
             }
         );
         let mut next = plan_request();

@@ -71,7 +71,8 @@ impl Fold {
             | Event::Titled { .. }
             | Event::FilesChanged { .. }
             | Event::SecretsChanged { .. }
-            | Event::Imported { .. } => Some(ev.clone()),
+            | Event::Imported { .. }
+            | Event::ModelChanged { .. } => Some(ev.clone()),
         }
     }
 

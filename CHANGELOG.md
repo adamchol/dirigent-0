@@ -2,6 +2,12 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
+## Unreleased
+
+### Added
+- A session's model, effort and provider can be switched while it lives: **Model** in the web's session menu, the dirigent's `switch_model` tool, or `PUT /sessions/{id}/model`. A running session takes them from its next model call (the call running finishes as it began); an idle one starts with them. The conversation goes on whole, compacted first if it no longer fits the new model's window; thinking goes back only to the provider that made it. The log records it (`model_changed`, and `player_attached` now says what its player runs), and the chat shows it. The first call after a switch reads the conversation without the provider's cache, once.
+- A players' VM's system knows its session while it runs: `/run/dirigent/session/env` (its id, part, repository), its secrets as files in `/run/dirigent/session/secrets/` (root's, kept as they change), the hostname `dirigent-<id>`, and `dirigent-session.target`, started then and stopped when the session ends. The cluster's own configuration (`player.nixos.files`) hangs units on it; the machines guide has a recipe that puts each session on your tailnet with NixOS's Tailscale module and a `TS_AUTHKEY` secret.
+
 ## 0.1.12 (2026-11-15)
 
 ### Added

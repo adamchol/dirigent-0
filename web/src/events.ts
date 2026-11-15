@@ -1,6 +1,8 @@
 // A session's log as the UI reads it: rows of `session_events` (protocol/src/rows.rs), their
 // events (protocol/src/lib.rs, `Event`), and the timeline they make.
 
+import { settingsLine, type ModelSettings } from "./api.ts";
+
 /** One row of the log, as `LOG_QUERY` selects it. */
 export interface EventRow {
   session_id: string;
@@ -37,7 +39,9 @@ export interface Usage {
 export type Source = { git: { url: string; ref?: string } };
 
 export type Event =
-  | { kind: "player_attached"; data: { epoch: number; version?: string; environment?: string } }
+  | { kind: "player_attached"; data: { epoch: number; version?: string; environment?: string; settings?: ModelSettings } }
+  /** The player took the session's new model, effort or provider, from its next call on. */
+  | { kind: "model_changed"; data: { settings: ModelSettings } }
   | { kind: "player_detached"; data: { epoch: number } }
   | { kind: "player_failed"; data: { epoch: number; error: string } }
   | { kind: "workspace_ready"; data: { source?: Source; head?: string; recreated?: boolean; files?: string } }
@@ -156,6 +160,8 @@ export function timeline(rows: readonly EventRow[], shown: Shown = "activity"): 
   const requests = new Map<string, Extract<Item, { t: "request" }>>();
   let openTurn: string | undefined;
   let usage = NO_USAGE;
+  // the model, effort and provider the log last said, as a line
+  let settings: string | undefined;
   const note = (row: EventRow, tone: Tone, text: string, detail?: string) => {
     if (tone === "dim" && shown === "conversation") return;
     if (shown === "all") detail = [detail, raw(row)].filter(Boolean).join("\n\n");
@@ -281,6 +287,16 @@ export function timeline(rows: readonly EventRow[], shown: Shown = "activity"): 
           "dim",
           `${subject(row.author)} attached${e.data.environment ? ` on ${e.data.environment}` : ""} (epoch ${e.data.epoch}${e.data.version ? `, ${e.data.version}` : ""})`,
         );
+        if (e.data.settings) {
+          // switched while it was idle: its new player runs what it was switched to
+          const now = settingsLine(e.data.settings);
+          if (settings !== undefined && now !== settings) note({ ...row, id: `${row.id}:settings` }, "mark", `now ${now}`);
+          settings = now;
+        }
+        break;
+      case "model_changed":
+        settings = settingsLine(e.data.settings);
+        note(row, "mark", `switched to ${settings}`);
         break;
       case "player_detached":
         note(row, "dim", `${subject(row.author)} detached (epoch ${e.data.epoch})`);

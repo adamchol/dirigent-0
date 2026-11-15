@@ -45,6 +45,10 @@ in
           mount built "/var/lib/dirigent" == mount stock "/var/lib/dirigent";
         "dirigent's cache is trusted" =
           lib.hasInfix "!include /run/dirigent/nix.conf" built.config.nix.extraOptions;
+        "the player hands its session to the system" =
+          ((unit built).environment.DIRIGENT_SESSION_HOOK or null) == (unit stock)
+          .environment.DIRIGENT_SESSION_HOOK;
+        "the session's target is there" = built.config.systemd.targets ? dirigent-session;
       };
       lost = builtins.filter (n: !kept.${n}) (builtins.attrNames kept);
     in

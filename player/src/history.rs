@@ -158,7 +158,8 @@ impl Entry {
             | Event::Titled { .. }
             | Event::FilesChanged { .. }
             | Event::SecretAnswered { .. }
-            | Event::SecretsChanged { .. } => None,
+            | Event::SecretsChanged { .. }
+            | Event::ModelChanged { .. } => None,
         }
     }
 
@@ -600,6 +601,7 @@ mod tests {
             epoch: 1,
             version: None,
             environment: environment.map(Into::into),
+            settings: None,
         };
         let msgs = messages(&[
             attached(None),

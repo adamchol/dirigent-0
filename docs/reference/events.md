@@ -29,7 +29,7 @@ Who may write which kinds is enforced by chlive: owners write `user_message`, `u
 
 | Kind | Fields | |
 |---|---|---|
-| `player_attached` | `epoch`, `version`, `environment`? | A player took the session, as its `epoch`-th; on a host, `environment` names it. |
+| `player_attached` | `epoch`, `version`, `environment`?, `settings`? | A player took the session, as its `epoch`-th; on a host, `environment` names it. `settings`: the `model`, `effort` and `provider` it runs. |
 | `player_detached` | `epoch` | It stopped and gave the session back. |
 | `player_failed` | `epoch`, `error` | It failed and gave the session back. |
 
@@ -43,6 +43,7 @@ Who may write which kinds is enforced by chlive: owners write `user_message`, `u
 | `checkpoint_failed` | `turn`, `error` | |
 | `files_changed` | `commit`, `parent`?, `part`, `parts`, `bundle` | A workspace commit: a git bundle (base64) of what's new since `parent`, in parts of up to 512 KiB. |
 | `secrets_changed` | `names` | The secrets the session's tools get changed (names only). |
+| `model_changed` | `settings` (`model`, `effort`, `provider`) | The session was switched; the player takes them from its next model call. The model isn't told. |
 
 ### Inputs
 

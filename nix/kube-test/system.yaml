@@ -8,6 +8,17 @@ player:
         { pkgs, dirigent, ... }: {
           imports = [ dirigent.defaults ];
           environment.systemPackages = [ pkgs.cowsay ];
+          # a unit while a session runs, with its env
+          systemd.services.session-mark = {
+            wantedBy = [ "dirigent-session.target" ];
+            partOf = [ "dirigent-session.target" ];
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              EnvironmentFile = "/run/dirigent/session/env";
+            };
+            script = ''echo "on $DIRIGENT_SESSION" > /run/session-mark'';
+          };
         }
 nix:
   shared:

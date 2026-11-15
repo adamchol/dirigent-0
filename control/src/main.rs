@@ -38,7 +38,7 @@ use axum::{Json, Router};
 use clap::Parser;
 use dirigent_protocol::control::pb::players_server::{Players, PlayersServer};
 use dirigent_protocol::control::{
-    pb, player_subject, Part, Provider, Resources, Role, SessionInfo, SessionSpec, Source,
+    pb, player_subject, Part, Provider, Resources, Role, SessionInfo, SessionSpec, Settings, Source,
 };
 use serde::Deserialize;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
@@ -471,6 +471,7 @@ fn router(control: &'static Control) -> Router {
             "/sessions/{id}/environment",
             axum::routing::put(put_environment),
         )
+        .route("/sessions/{id}/model", axum::routing::put(put_model))
         .route(
             "/sessions/{id}/import",
             post(start_import).delete(finish_import),
@@ -1003,6 +1004,49 @@ async fn put_environment(
     }
 }
 
+/// Refused unless `caller`'s sessions can be paid with `provider`: a ChatGPT plan must be linked,
+/// and its link whole.
+async fn payable(control: &Control, provider: Provider, caller: &str) -> Result<(), Failed> {
+    if provider != Provider::Chatgpt {
+        return Ok(());
+    }
+    let link = linking(control)?
+        .info(&control.store, caller)
+        .await
+        .map_err(|e| failed("reading the ChatGPT link", e))?;
+    let why = match link {
+        None => "link a ChatGPT plan first (dirigent link chatgpt)".to_string(),
+        Some(LinkInfo {
+            broken: Some(why), ..
+        }) => format!("the ChatGPT link is broken: {why} (link it again: dirigent link chatgpt)"),
+        Some(_) => return Ok(()),
+    };
+    Err((StatusCode::UNPROCESSABLE_ENTITY, why))
+}
+
+/// Switch the session, the caller's, to a model, effort and provider: its player, if one runs,
+/// takes them before its next model call; otherwise the next one starts with them.
+async fn put_model(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path(id): Path<Uuid>,
+    Json(settings): Json<Settings>,
+) -> Result<StatusCode, Failed> {
+    owned(control, id, &caller).await?;
+    if settings.model.trim().is_empty() {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "no model".into()));
+    }
+    payable(control, settings.provider, &caller).await?;
+    match control.store.set_settings(id, &settings).await {
+        Ok(true) => {}
+        Ok(false) => return Err(not_found()),
+        Err(e) => return Err(failed(&format!("switching the session {id}'s model"), e)),
+    }
+    info!(session = %id, ?settings, "session's model switched");
+    changed(control, Changed::Settings(id));
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// The caller's settings, defaults for those they haven't set.
 async fn get_settings(
     State(control): State<&'static Control>,
@@ -1418,24 +1462,7 @@ async fn put_session(
     body.spec
         .check()
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
-    if body.spec.provider == Provider::Chatgpt {
-        let link = linking(control)?
-            .info(&control.store, &caller)
-            .await
-            .map_err(|e| failed("reading the ChatGPT link", e))?;
-        let why = match link {
-            None => Some("link a ChatGPT plan first (dirigent link chatgpt)".to_string()),
-            Some(LinkInfo {
-                broken: Some(why), ..
-            }) => Some(format!(
-                "the ChatGPT link is broken: {why} (link it again: dirigent link chatgpt)"
-            )),
-            Some(_) => None,
-        };
-        if let Some(why) = why {
-            return Err((StatusCode::UNPROCESSABLE_ENTITY, why));
-        }
-    }
+    payable(control, body.spec.provider, &caller).await?;
     let put = control
         .store
         .put_session(id, &body.spec, &caller, &body.viewers)
@@ -2051,7 +2078,7 @@ impl Players for Lessor {
             owner,
             // a dirigent acts as its owner
             delegate: spec.part == Part::Dirigent,
-            provider: spec.provider,
+            settings: spec.settings(),
             repo: match &spec.source {
                 Some(Source::Git { url, .. }) => Repo::parse(url),
                 None => None,
@@ -2080,7 +2107,7 @@ async fn tokens(control: &Control, held: &Held, rejected: bool) -> pb::Tokens {
     let signer = &control.auth.signer;
     let subject = held.subject.as_str();
     let owner = held.owner.as_str();
-    let (openai, openai_unavailable) = match (held.provider, &control.chatgpt) {
+    let (openai, openai_unavailable) = match (held.settings.provider, &control.chatgpt) {
         (Provider::Anthropic, _) => (None, None),
         (Provider::Chatgpt, None) => (None, Some("this control links no ChatGPT plans".into())),
         (Provider::Chatgpt, Some(chatgpt)) => {
@@ -2093,7 +2120,7 @@ async fn tokens(control: &Control, held: &Held, rejected: bool) -> pb::Tokens {
             }
         }
     };
-    let (anthropic, anthropic_unavailable) = match held.provider {
+    let (anthropic, anthropic_unavailable) = match held.settings.provider {
         Provider::Chatgpt => (None, None),
         Provider::Anthropic => match anthropic_key(control, owner).await {
             Ok(key) => (Some(key), None),
@@ -2180,7 +2207,8 @@ struct Held {
     owner: String,
     /// Whether it acts as its owner: a dirigent does.
     delegate: bool,
-    provider: Provider,
+    /// Its model, effort and provider, as the player was last told.
+    settings: Settings,
     /// Its repository, if it's on GitHub: the App's token for it is its `GITHUB_TOKEN`, unless it
     /// has one.
     repo: Option<Repo>,
@@ -2189,11 +2217,13 @@ struct Held {
 }
 
 /// What changed of what a lease's credentials are made of: a user's (their key, or their
-/// secrets for all their sessions), or a session's (its secrets).
+/// secrets for all their sessions), or a session's (its secrets); or a session's model,
+/// effort or provider ([`Settings`]), which its player takes too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Changed {
     Owner(String),
     Session(Uuid),
+    Settings(Uuid),
 }
 
 impl Held {
@@ -2201,6 +2231,7 @@ impl Held {
         match changed {
             Changed::Owner(owner) => *owner == self.owner,
             Changed::Session(session) => *session == self.session,
+            Changed::Settings(session) => *session == self.session,
         }
     }
 }
@@ -2212,13 +2243,14 @@ impl Held {
 /// was stopped.
 async fn hold(
     control: &'static Control,
-    held: Held,
+    mut held: Held,
     mut inbound: Streaming<pb::FromPlayer>,
     tx: mpsc::Sender<Result<pb::ToPlayer, Status>>,
     mut detached: watch::Receiver<Option<bool>>,
 ) {
     let (session, conn) = (held.session, held.conn);
-    let subject = held.subject.as_str();
+    let subject = held.subject.clone();
+    let subject = subject.as_str();
     let half = control.auth.signer.ttl / 2;
     let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + half, half);
     let mut changes = control.changed.subscribe();
@@ -2234,6 +2266,20 @@ async fn hold(
                 };
                 if !ours {
                     continue;
+                }
+                // the model switched (or may have): the player first, then credentials for its provider
+                match control.store.settings_of(session).await {
+                    Ok(Some(settings)) if settings != held.settings => {
+                        held.settings = settings.clone();
+                        let settings = pb::ToPlayer {
+                            msg: Some(pb::to_player::Msg::Settings(settings.into())),
+                        };
+                        if tx.send(Ok(settings)).await.is_err() {
+                            break false;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => error!(session = %session, "reading the session's model: {e:#}"),
                 }
                 let tokens = pb::ToPlayer {
                     msg: Some(pb::to_player::Msg::Tokens(tokens(control, &held, false).await)),
@@ -2346,6 +2392,8 @@ mod e2e {
             player: String,
             owner: Option<String>,
         },
+        /// The session's new model, effort and provider.
+        Settings(Settings),
         /// The call ended with this status.
         Refused(Code),
     }
@@ -2428,6 +2476,7 @@ mod e2e {
                 player: claims(&t.player).sub,
                 owner: t.owner.as_deref().map(|o| claims(o).sub),
             },
+            pb::to_player::Msg::Settings(s) => Reply::Settings(s.try_into().unwrap()),
         }
     }
 
@@ -4305,6 +4354,72 @@ mod e2e {
                 .status(),
             reqwest::StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn e2e_a_sessions_model_switches_and_its_player_is_told() {
+        let runner = recorder(false);
+        let Some((base, _openai, _keys)) = start_linking(runner).await else {
+            return;
+        };
+        let user = new_user();
+        let s = Uuid::new_v4();
+        assert_eq!(
+            put_json(&base, s, &user, serde_json::json!({})).await,
+            reqwest::StatusCode::CREATED
+        );
+        let mut ws = connect(&base).await;
+        acquire(&mut ws, s, &Uuid::new_v4().to_string(), None).await;
+        assert_eq!(ws.tokens.clone().unwrap().openai, None);
+        let path = format!("/sessions/{s}/model");
+        let put = reqwest::Method::PUT;
+        let gpt =
+            serde_json::json!({ "model": "gpt-test", "effort": "high", "provider": "chatgpt" });
+
+        // not theirs, no model, no plan linked: refused, and the player hears nothing
+        let (status, _) = send_json(&base, &new_user(), put.clone(), &path, gpt.clone()).await;
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+        let none = serde_json::json!({ "model": " ", "effort": null });
+        let (status, _) = send_json(&base, &user, put.clone(), &path, none).await;
+        assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, _) = send_json(&base, &user, put.clone(), &path, gpt.clone()).await;
+        assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
+        // to the plan: the player is told, then gets the plan's access token
+        link(&base, &user).await;
+        let (status, _) = send_json(&base, &user, put.clone(), &path, gpt.clone()).await;
+        assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
+        let to_gpt = Settings {
+            model: "gpt-test".into(),
+            effort: Some(dirigent_protocol::control::Effort::High),
+            provider: Provider::Chatgpt,
+        };
+        assert_eq!(next(&mut ws).await, Reply::Settings(to_gpt.clone()));
+        assert!(next_tokens(&mut ws).await.openai.is_some());
+        let (_, info) = get_json(&base, &user, &format!("/sessions/{s}")).await;
+        assert_eq!(info["spec"]["model"], "gpt-test");
+        assert_eq!(info["spec"]["provider"], "chatgpt");
+
+        // back to Claude, thinking none; the next player starts with it
+        let claude = serde_json::json!({ "model": "claude-test", "effort": null });
+        let (status, _) = send_json(&base, &user, put, &path, claude).await;
+        assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
+        let to_claude = Settings {
+            model: "claude-test".into(),
+            effort: None,
+            provider: Provider::Anthropic,
+        };
+        assert_eq!(next(&mut ws).await, Reply::Settings(to_claude.clone()));
+        assert_eq!(next_tokens(&mut ws).await.openai, None);
+        ws.close().await;
+        let mut ws = connect(&base).await;
+        let Reply::Acquired { spec, .. } =
+            acquire(&mut ws, s, &Uuid::new_v4().to_string(), None).await
+        else {
+            panic!("not acquired");
+        };
+        assert_eq!(spec.settings(), to_claude);
+        ws.close().await;
     }
 
     /// A control that keeps keys and secrets (with a link key of its own), checking keys with a

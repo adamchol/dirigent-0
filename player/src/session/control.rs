@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use dirigent_protocol::control::pb::players_client::PlayersClient;
-use dirigent_protocol::control::{pb, SessionSpec};
+use dirigent_protocol::control::{pb, SessionSpec, Settings};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -33,6 +33,8 @@ pub struct Lease {
     /// What the session runs.
     pub spec: SessionSpec,
     tokens: watch::Receiver<pb::Tokens>,
+    /// The session's model, effort and provider: the spec's, then as control switches them.
+    settings: watch::Receiver<Settings>,
     /// Asks control for credentials afresh; `true`: the access token was refused.
     refresh: mpsc::Sender<bool>,
     lost: CancellationToken,
@@ -88,6 +90,7 @@ impl Lease {
         let (release, released) = oneshot::channel();
         let (detach, detached) = watch::channel(None);
         let (tokens_tx, tokens) = watch::channel(tokens);
+        let (settings_tx, settings) = watch::channel(spec.settings());
         let (refresh, refreshes) = mpsc::channel(4);
         let task = tokio::spawn(keep(
             url.to_string(),
@@ -97,18 +100,25 @@ impl Lease {
             released,
             detach,
             tokens_tx,
+            settings_tx,
             refreshes,
         ));
         Ok(Lease {
             epoch,
             spec,
             tokens,
+            settings,
             refresh,
             lost,
             release: Some(release),
             detach: detached,
             task,
         })
+    }
+
+    /// The session's model, effort and provider, as they change.
+    pub fn settings(&self) -> watch::Receiver<Settings> {
+        self.settings.clone()
     }
 
     /// The player's latest credentials.
@@ -393,6 +403,7 @@ async fn keep(
     mut released: oneshot::Receiver<bool>,
     detach: watch::Sender<Option<bool>>,
     tokens: watch::Sender<pb::Tokens>,
+    settings: watch::Sender<Settings>,
     mut refreshes: mpsc::Receiver<bool>,
 ) {
     loop {
@@ -423,6 +434,15 @@ async fn keep(
                     Ok(Some(pb::ToPlayer { msg: Some(pb::to_player::Msg::Tokens(t)) })) => {
                         tokens.send_replace(t);
                     }
+                    Ok(Some(pb::ToPlayer { msg: Some(pb::to_player::Msg::Settings(s)) })) => {
+                        match Settings::try_from(s) {
+                            Ok(s) => {
+                                info!(?s, "control says the model switched");
+                                settings.send_replace(s);
+                            }
+                            Err(e) => warn!("control sent {e}"),
+                        }
+                    }
                     Ok(Some(other)) => warn!("control sent {other:?}"),
                     Ok(None) | Err(_) => break,
                 },
@@ -438,6 +458,13 @@ async fn keep(
             match held {
                 Ok((call, acquired)) => {
                     tokens.send_replace(acquired.tokens);
+                    // a switch while the call was broken
+                    settings.send_if_modified(|s| {
+                        let now = acquired.spec.settings();
+                        let changed = *s != now;
+                        *s = now;
+                        changed
+                    });
                     break call;
                 }
                 Err(e) if e.is::<Refused>() => {

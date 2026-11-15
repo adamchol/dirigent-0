@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use dirigent_protocol::control::{Holder, Resources, Role, SessionInfo, SessionSpec};
+use dirigent_protocol::control::{Holder, Resources, Role, SessionInfo, SessionSpec, Settings};
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls, Row};
 use tracing::error;
@@ -368,6 +368,35 @@ impl Store {
             )
             .await?;
         Ok(row.map(|r| (r.get(0), r.get(1))))
+    }
+
+    /// The session `id`'s model, effort and provider are `settings` from now on. Whether there
+    /// was such a session.
+    pub async fn set_settings(&self, id: Uuid, settings: &Settings) -> anyhow::Result<bool> {
+        let json = serde_json::to_value(settings)?;
+        let n = self
+            .db
+            .lock()
+            .await
+            .execute(
+                "UPDATE dirigent.sessions SET spec = spec || $2 WHERE id = $1",
+                &[&id, &json],
+            )
+            .await?;
+        Ok(n == 1)
+    }
+
+    /// The session `id`'s model, effort and provider, if there's such a session.
+    pub async fn settings_of(&self, id: Uuid) -> anyhow::Result<Option<Settings>> {
+        let row = self
+            .db
+            .lock()
+            .await
+            .query_opt("SELECT spec FROM dirigent.sessions WHERE id = $1", &[&id])
+            .await?;
+        let Some(row) = row else { return Ok(None) };
+        let spec: SessionSpec = serde_json::from_value(row.get(0))?;
+        Ok(Some(spec.settings()))
     }
 
     /// Place the session `id` on its owner's host `host` (none: the cluster), for its next start.

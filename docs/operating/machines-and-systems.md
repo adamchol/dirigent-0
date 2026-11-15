@@ -112,6 +112,68 @@ Where to see how it went:
 - The web's Settings, and `GET /api/system`: `building`, `ready`, `failed` or `broken`.
 - control's log.
 
+### While a session runs
+
+A VM's system knows its session while the player holds it, on the stock system and yours:
+
+- `/run/dirigent/session/env`: `DIRIGENT_SESSION` (its id), `DIRIGENT_HOSTNAME`, `DIRIGENT_PART`
+  (`coder` or `dirigent`) and `DIRIGENT_REPOSITORY` (if it has one), quoted for a shell and for a
+  unit's `EnvironmentFile`.
+- `/run/dirigent/session/secrets/<NAME>`: the session's [secrets](../guides/accounts-and-secrets.md#secrets)
+  (its own and its owner's), one file each, root's only, kept as they change.
+- The VM's hostname is `dirigent-` and the session id's first 8 characters.
+- **`dirigent-session.target`** is started once those are there, and stopped when the session ends
+  (its units get 30 seconds to stop), then the files go. A warm VM starts it when it's given its
+  session, not at boot.
+
+A unit with `wantedBy = [ "dirigent-session.target" ]` (and `partOf`, to stop with it) runs while
+there's a session, with what it is:
+
+```nix
+systemd.services.seed = {
+  wantedBy = [ "dirigent-session.target" ];
+  partOf = [ "dirigent-session.target" ];
+  serviceConfig = {
+    Type = "oneshot";
+    RemainAfterExit = true;
+    EnvironmentFile = "/run/dirigent/session/env";
+  };
+  script = ''echo "session $DIRIGENT_SESSION on $DIRIGENT_REPOSITORY"'';
+};
+```
+
+#### Each session on your tailnet
+
+With NixOS's Tailscale module, a session's VM joins your tailnet as `dirigent-<id>` while it runs,
+and leaves once it's gone:
+
+```nix
+{ lib, dirigent, ... }: {
+  imports = [ dirigent.defaults ];
+  services.tailscale = {
+    enable = true;
+    authKeyFile = "/run/dirigent/session/secrets/TS_AUTHKEY";
+    authKeyParameters = { ephemeral = true; preauthorized = true; };
+  };
+  # its login waits for the session (on its own it would try at boot, once, without the key)
+  systemd.services.tailscaled-autoconnect = {
+    wantedBy = lib.mkForce [ "dirigent-session.target" ];
+    partOf = [ "dirigent-session.target" ];
+    unitConfig.ConditionPathExists = "/run/dirigent/session/secrets/TS_AUTHKEY";
+  };
+}
+```
+
+- Make an auth key in Tailscale's admin console: **reusable**, with a tag (e.g. `tag:dirigent`, for
+  your ACLs to say what sessions may reach), and add it as your secret `TS_AUTHKEY` (web: your
+  account's **Secrets**). Every session of yours joins; one with the secret of its own instead
+  joins alone. A session without the key doesn't join.
+- Ephemeral nodes are removed soon after they go offline, so stopped sessions don't pile up.
+- `tailscale serve 3000` (in the session, or a unit) puts a dev server on
+  `https://dirigent-<id>.<your tailnet>.ts.net`.
+- The VM reaches Tailscale out through the pod network, maybe through a DERP relay rather than
+  directly; fine for SSH and dev servers.
+
 ## The shared Nix store
 
 Sessions fetch and build Nix paths as they work (`nix shell`, `nix develop`, builds). With

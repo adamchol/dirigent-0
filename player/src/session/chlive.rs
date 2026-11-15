@@ -43,6 +43,8 @@ pub struct ChliveSession {
     log: Option<Events<EventRow>>,
     /// Where the player runs, when it's not the cluster's VM.
     environment: Option<String>,
+    /// The model, effort and provider it starts with.
+    settings: Option<dirigent_protocol::control::Settings>,
 }
 
 /// A row to insert, and who waits for it to be in.
@@ -72,12 +74,18 @@ impl ChliveSession {
             own: HashSet::new(),
             log: None,
             environment: None,
+            settings: None,
         }
     }
 
     /// Running in `environment` (a host's name): its attaching says so.
     pub fn in_environment(mut self, environment: Option<String>) -> Self {
         self.environment = environment;
+        self
+    }
+
+    pub fn with_settings(mut self, settings: dirigent_protocol::control::Settings) -> Self {
+        self.settings = Some(settings);
         self
     }
 
@@ -92,6 +100,7 @@ impl ChliveSession {
                 epoch: self.epoch,
                 version: Some(crate::VERSION.into()),
                 environment: self.environment.clone(),
+                settings: self.settings.clone(),
             },
         );
         let started = Instant::now();
@@ -237,7 +246,7 @@ mod e2e {
     use tokio::task::JoinHandle;
 
     use super::*;
-    use crate::agent::{Agent, AgentConfig, Detach};
+    use crate::agent::{Agent, Detach, Model, Models};
     use crate::checkpoints::Checkpoints;
     use crate::provider::mock::{MockProvider, Script};
     use crate::provider::Message;
@@ -352,15 +361,21 @@ mod e2e {
                 (Registry::new(d.tools()), Some(tokio::spawn(follow)))
             }
         };
-        let mut agent = Agent {
-            provider: provider.clone(),
-            cfg: AgentConfig {
-                model: "mock",
-                system: "sys",
-                effort: None,
+        let mock = provider.clone();
+        let make = move |s: &dirigent_protocol::control::Settings| {
+            Ok(Model {
+                settings: s.clone(),
+                provider: mock.clone(),
                 context_window: 1_000_000,
-                title_model: "mock",
+                title_model: "mock".into(),
                 title_effort: None,
+            })
+        };
+        let mut agent = Agent {
+            system: "sys",
+            models: Models {
+                settings: lease.settings(),
+                make: Box::new(make),
             },
             tools: Arc::new(tools),
             workdir,
@@ -905,6 +920,7 @@ mod e2e {
                     epoch: 1,
                     version: None,
                     environment: None,
+                    settings: None,
                 },
             )
         };

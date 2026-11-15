@@ -1,6 +1,7 @@
 //! The session's secrets, as its lease has them (control sends them again at once when they
 //! change): put in its tools' environment, and kept out of what the player publishes, each value
-//! replaced by `[secret:NAME]`. Only in memory: never in the player's own environment, nor on disk.
+//! replaced by `[secret:NAME]`. Never in the player's own environment; on disk only in a
+//! players' VM, for its system while the session runs (`hook.rs`, on a tmpfs).
 
 use std::collections::BTreeMap;
 

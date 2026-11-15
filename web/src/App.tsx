@@ -41,6 +41,7 @@ import { RenameDialog, useTitles } from "./Rename.tsx";
 import { SyncDialog } from "./Sync.tsx";
 import { AnthropicKeyDialog } from "./Keys.tsx";
 import { connectGithub, GithubDialog, useGithubReturn } from "./GitHub.tsx";
+import { ModelDialog } from "./ModelPicker.tsx";
 import { SecretsDialog } from "./Secrets.tsx";
 import * as machine from "./machine.ts";
 import { AboutDialog } from "./About.tsx";
@@ -195,6 +196,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
   const [keying, setKeying] = useState(false);
   // the user's secrets for all sessions (`""`), or a session's (its id)
   const [secretsOf, setSecretsOf] = useState<string | null>(null);
+  const [switchingModel, setSwitchingModel] = useState<string | null>(null);
   // the name the secrets dialog starts with (GITHUB_TOKEN, asked for a private repository)
   const [secretName, setSecretName] = useState<string | undefined>();
   const [githubOpen, setGithubOpen] = useState(false);
@@ -283,6 +285,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
                 remove={() => setDeleting(selected)}
                 openLocally={() => setSyncing(selected)}
                 secrets={() => setSecretsOf(selected)}
+                switchModel={() => setSwitchingModel(selected)}
               />
             )}
           </div>
@@ -358,6 +361,14 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
       />
       <ChatGptDialog who={props.who} declared={!!props.become} open={linking} setOpen={setLinking} />
       <SyncDialog id={syncing} who={props.who} declared={!!props.become} close={() => setSyncing(null)} />
+      <ModelDialog
+        info={switchingModel ? sessions.list.find((s) => s.id === switchingModel) : undefined}
+        who={props.who}
+        me={me}
+        connect={() => setLinking(true)}
+        changed={sessions.refresh}
+        close={() => setSwitchingModel(null)}
+      />
       <AnthropicKeyDialog open={keying} who={props.who} me={me} changed={refreshMe} close={() => setKeying(false)} />
       <SettingsDialog open={settingsOpen} who={props.who} settings={settings} change={changeSettings} close={() => setSettingsOpen(false)} />
       <AboutDialog open={aboutOpen} who={props.who} session={info} status={selected ? status : null} close={() => setAboutOpen(false)} />

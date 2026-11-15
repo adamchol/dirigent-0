@@ -413,8 +413,25 @@ async fn a_session_takes_a_warm_vm_and_another_is_made() {
         vms(&session),
         [format!("virtualmachineinstance.kubevirt.io/warm-{waiting}")]
     );
-    say(&stack, &session, "!echo warm").await;
-    log_within(&stack, &session, boot, |r| turns_ended(r) == 1).await;
+    // the VM's system has the session: its target, its name, its env
+    say(
+        &stack,
+        &session,
+        "!echo warm && systemctl is-active dirigent-session.target && hostname \
+         && cat /run/dirigent/session/env",
+    )
+    .await;
+    let log = log_within(&stack, &session, boot, |r| turns_ended(r) == 1).await;
+    let out = tool_output(&log);
+    assert!(out.contains("\nactive"), "{out}");
+    assert!(
+        out.contains(&format!("dirigent-{}", &session[..8])),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("DIRIGENT_SESSION='{session}'")),
+        "{out}"
+    );
 
     let next = waiting_warm_player(boot).await;
     assert_ne!(next, waiting);
@@ -441,7 +458,9 @@ async fn a_vm_boots_into_the_clusters_system_and_shares_what_it_added() {
         &session,
         &format!(
             "!readlink /run/current-system && cowsay moo && nix shell nixpkgs#hello -c hello \
-             && echo {mark} > /tmp/{mark} && nix-store --add /tmp/{mark}"
+             && echo {mark} > /tmp/{mark} && nix-store --add /tmp/{mark} \
+             && for _ in $(seq 100); do [ -e /run/session-mark ] && break; sleep 0.1; done \
+             && cat /run/session-mark"
         ),
     )
     .await;
@@ -453,6 +472,11 @@ async fn a_vm_boots_into_the_clusters_system_and_shares_what_it_added() {
         "{out}"
     );
     assert!(out.contains(&format!("-{mark}")), "not added: {out}");
+    // the configuration's unit on the session's target ran, with the session's env
+    assert!(
+        out.contains(&format!("on {session}")),
+        "no session's unit: {out}"
+    );
     // stopped, its player tells what it added; control has it in the generation it writes next
     // (a minute apart at most, its rounds every 30 s)
     stop_and_clear(&stack, &session).await;

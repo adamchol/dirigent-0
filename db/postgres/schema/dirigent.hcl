@@ -139,7 +139,7 @@ function "dirigent.grant_insert_kinds" {
         'workspace_restored', 'checkpoint', 'checkpoint_failed', 'turn_started', 'steered',
         'model_delta', 'assistant_message', 'model_cancelled', 'error', 'compacted',
         'compaction_failed', 'tool_result', 'turn_ended', 'session_update', 'files_changed',
-        'secrets_changed', 'imported'];
+        'secrets_changed', 'imported', 'model_changed'];
       conversation text[] := ARRAY[
         'user_message', 'turn_started', 'steered', 'assistant_message', 'tool_result',
         'turn_ended', 'compacted', 'titled', 'files_changed', 'imported'];

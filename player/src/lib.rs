@@ -6,6 +6,7 @@ mod checkpoints;
 mod compact;
 mod dirigent;
 mod history;
+mod hook;
 #[cfg(test)]
 mod logs;
 mod mirror;
@@ -30,7 +31,7 @@ use clap::builder::styling::{AnsiColor, Styles};
 use clap::Parser;
 use tracing::{info, warn};
 
-use crate::agent::{Agent, AgentConfig, Detach};
+use crate::agent::{Agent, Detach, Model, Models};
 use crate::checkpoints::Checkpoints;
 use crate::dirigent::Director;
 use crate::mirror::Mirror;
@@ -40,7 +41,7 @@ use crate::session::chlive::ChliveSession;
 use crate::session::control::Lease;
 use crate::session::Session;
 use crate::tools::Registry;
-use dirigent_protocol::control::{Part, Provider as ModelProvider, SessionSpec};
+use dirigent_protocol::control::{Part, Provider as ModelProvider, SessionSpec, Settings};
 use dirigent_protocol::Event;
 
 pub use crate::session::control::channel as control_channel;
@@ -179,6 +180,11 @@ pub struct Args {
         default_value = "https://api.openai.com/v1/"
     )]
     openai_base_url: String,
+
+    /// Hand the session to the system while it runs, in this directory: its `env`, its secrets, the
+    /// VM's hostname and `dirigent-session.target` (see `hook.rs`). The players' VM sets it.
+    #[arg(long, env = "DIRIGENT_SESSION_HOOK")]
+    session_hook: Option<PathBuf>,
 }
 
 /// Run the player `args` describe, until its session is done with it: in a process of its own,
@@ -294,7 +300,14 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     );
     let spec: &'static SessionSpec = Box::leak(Box::new(lease.spec.clone()));
     let mut session = ChliveSession::new(&id, lease.epoch, &cli.chlive_url, lease.tokens())
-        .in_environment(cli.environment_name.clone());
+        .in_environment(cli.environment_name.clone())
+        .with_settings(lease.settings().borrow().clone());
+    let hook = match &cli.session_hook {
+        Some(dir) => {
+            Some(hook::Hook::start(dir, &id, &lease.spec, Secrets::new(lease.tokens())).await)
+        }
+        None => None,
+    };
     // on the shared Nix store, what this VM adds to it is told to control, now and then and at the end
     let tokens = lease.tokens();
     let reporter =
@@ -310,30 +323,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         });
     }
     let run = async {
-        // the spec's, which the lease came with
-        let provider: Arc<dyn Provider> = match spec.provider {
-            _ if cli.mock => Arc::new(provider::mock::MockProvider::long()),
-            ModelProvider::Anthropic => Arc::new(provider::genai::GenaiProvider::anthropic(
-                lease.anthropic_key(),
-                cli.base_url.clone(),
-            )?),
-            ModelProvider::Chatgpt => Arc::new(provider::genai::GenaiProvider::chatgpt(
-                lease.plan_tokens(),
-                cli.openai_base_url.clone(),
-                id.to_string(),
-            )?),
-        };
-        let context_window = cli.context_window.unwrap_or(match spec.provider {
-            ModelProvider::Anthropic => 200_000,
-            ModelProvider::Chatgpt => 272_000,
-        });
-        let (title_model, title_effort): (&'static str, _) = match spec.provider {
-            ModelProvider::Anthropic => ("claude-haiku-5-5", None),
-            ModelProvider::Chatgpt => (&spec.model, Some(Effort::Low)),
-        };
-        let title_model = match &cli.title_model {
-            Some(m) => Box::leak(m.clone().into_boxed_str()),
-            None => title_model,
+        // the spec's, which the lease came with, then as control switches them
+        let models = Models {
+            settings: lease.settings(),
+            make: model_maker(cli, &lease, id.to_string()),
         };
         let (log, mirror) = workspace::open(
             &mut session,
@@ -364,15 +357,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             }
         };
         let agent = Agent {
-            provider: provider.clone(),
-            cfg: AgentConfig {
-                model: &spec.model,
-                system,
-                effort: spec.effort,
-                context_window,
-                title_model,
-                title_effort,
-            },
+            system,
+            models,
             tools: Arc::new(tools),
             workdir,
             checkpoints,
@@ -384,7 +370,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             player,
             epoch = lease.epoch,
             chlive = cli.chlive_url,
-            provider = provider.name(),
+            provider = ?spec.provider,
             model = spec.model,
             effort = ?spec.effort,
             part = ?spec.part,
@@ -398,8 +384,14 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         agent.run(&mut session, log, detach).await
     };
     let result = tokio::select! {
-        r = run => r,
-        _ = lease.lost() => anyhow::bail!("the session's lease is lost to another player"),
+        r = run => Some(r),
+        _ = lease.lost() => None,
+    };
+    if let Some(hook) = hook {
+        hook.end().await;
+    }
+    let Some(result) = result else {
+        anyhow::bail!("the session's lease is lost to another player");
     };
     // failed: the session is given back, saying why
     if let Err(e) = &result {
@@ -422,6 +414,48 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         lease.release().await;
     }
     result
+}
+
+/// What makes the session's [`Model`] of its settings, with the lease's credentials for either
+/// provider (control sends the one the settings pay with). With `--mock`, the same mock always.
+#[allow(clippy::type_complexity)]
+fn model_maker(
+    cli: &'static Args,
+    lease: &Lease,
+    session: String,
+) -> Box<dyn Fn(&Settings) -> anyhow::Result<Model> + Send + Sync> {
+    let (key, plan) = (lease.anthropic_key(), lease.plan_tokens());
+    let mock: Option<Arc<dyn Provider>> = cli
+        .mock
+        .then(|| Arc::new(provider::mock::MockProvider::long()) as Arc<dyn Provider>);
+    Box::new(move |settings: &Settings| {
+        let provider: Arc<dyn Provider> = match (&mock, settings.provider) {
+            (Some(mock), _) => mock.clone(),
+            (None, ModelProvider::Anthropic) => Arc::new(
+                provider::genai::GenaiProvider::anthropic(key.clone(), cli.base_url.clone())?,
+            ),
+            (None, ModelProvider::Chatgpt) => Arc::new(provider::genai::GenaiProvider::chatgpt(
+                plan.clone(),
+                cli.openai_base_url.clone(),
+                session.clone(),
+            )?),
+        };
+        let context_window = cli.context_window.unwrap_or(match settings.provider {
+            ModelProvider::Anthropic => 200_000,
+            ModelProvider::Chatgpt => 272_000,
+        });
+        let (title_model, title_effort) = match settings.provider {
+            ModelProvider::Anthropic => ("claude-haiku-5-5".to_string(), None),
+            ModelProvider::Chatgpt => (settings.model.clone(), Some(Effort::Low)),
+        };
+        Ok(Model {
+            settings: settings.clone(),
+            provider,
+            context_window,
+            title_model: cli.title_model.clone().unwrap_or(title_model),
+            title_effort,
+        })
+    })
 }
 
 fn uuid(s: &str, what: &str) -> anyhow::Result<String> {

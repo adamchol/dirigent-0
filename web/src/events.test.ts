@@ -208,6 +208,25 @@ test("a dirigent's request for a secret is a card its answer settles; a refused 
   expect(t.items.some((i) => i.t === "tool")).toBe(false);
 });
 
+test("a switch of model is a note, live or between players", () => {
+  const claude = { model: "claude-sonnet-5", effort: "high", provider: "anthropic" };
+  const gpt = { model: "gpt-5.5", effort: null, provider: "chatgpt" };
+  const t = timeline([
+    row("a1", "player_attached", { epoch: 1, settings: claude }),
+    row("s", "model_changed", { settings: gpt }),
+    row("d", "player_detached", { epoch: 1 }),
+    row("a2", "player_attached", { epoch: 2, settings: gpt }),
+    row("a3", "player_attached", { epoch: 3, settings: claude }),
+  ]);
+  const marks = t.items.flatMap((i) => (i.t === "note" && i.tone === "mark" ? [i.text] : []));
+  expect(marks).toEqual([
+    "switched to gpt-5.5 · no thinking, on a ChatGPT plan",
+    "now claude-sonnet-5 · high",
+  ]);
+  const keys = t.items.map((i) => i.key);
+  expect(new Set(keys).size).toBe(keys.length);
+});
+
 test("a starting session waits on its machine, its workspace, then the turn", () => {
   const asked = [row("m", "user_message", { text: "go" }, "user:dev")];
   // control holds the lease for epoch 2's player, which hasn't attached

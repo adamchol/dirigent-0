@@ -33,6 +33,23 @@ another spec it's refused (`409`). The caller becomes the owner.
 The context window is 200k tokens on Anthropic and 272k on ChatGPT; long sessions are
 [compacted](agent.md#compaction) before they reach it.
 
+### Switching model, provider or thinking
+
+A session's model, effort and provider can change while it lives: **Model** in the session menu, the
+dirigent's `switch_model`, or `PUT /sessions/{id}/model` with `{"model", "effort", "provider"}`. The
+conversation goes on whole.
+
+- **Running**, it takes them from its next model call; a call running finishes as it began. The log
+  says so (`model_changed`), and the chat shows it. **Idle**, its next player starts with them.
+- The next call reads the whole conversation afresh, without the provider's cache, once: on a long
+  session that's one call's worth of full-price input. Changing only the effort does too on
+  Anthropic.
+- Thinking doesn't cross providers: switched from Anthropic to ChatGPT (or back), the model gets the
+  conversation without the other's reasoning. Between Claude models it all goes back.
+- A smaller context window (Anthropic's 200k after ChatGPT's 272k) compacts the conversation first
+  if it no longer fits.
+- Switching to a ChatGPT plan needs a working link, as making a session on one does.
+
 ### Source
 
 A git URL (and optionally a ref) is cloned into the workspace when the first player starts, as a

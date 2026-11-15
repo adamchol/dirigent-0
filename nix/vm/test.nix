@@ -25,6 +25,18 @@ pkgs.testers.runNixOSTest {
           sleep infinity
         '';
       };
+      # what a configuration hangs on the session's target, as the player starts and stops it
+      systemd.services.session-probe = {
+        wantedBy = [ "dirigent-session.target" ];
+        partOf = [ "dirigent-session.target" ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          EnvironmentFile = "/run/dirigent/session/env";
+        };
+        script = ''echo "$DIRIGENT_SESSION $(cat /run/dirigent/session/secrets/TS_AUTHKEY)" > /tmp/probe'';
+        preStop = "echo stopped > /tmp/probe-stopped";
+      };
     };
   testScript = ''
     machine.wait_for_file("/tmp/hello")
@@ -35,5 +47,19 @@ pkgs.testers.runNixOSTest {
     assert "python runs" in found
     hello = machine.succeed("cat /tmp/hello")
     assert hello[0].isdigit() and "failed" not in hello, hello
+
+    # the session's target: not at boot; started (as the player does, its files written), its
+    # units run with the session's env and secrets; stopped, they stop
+    machine.fail("systemctl is-active dirigent-session.target")
+    machine.succeed(
+        "mkdir -p /run/dirigent/session/secrets"
+        " && echo \"DIRIGENT_SESSION='s1'\" > /run/dirigent/session/env"
+        " && printf tskey > /run/dirigent/session/secrets/TS_AUTHKEY"
+    )
+    machine.succeed("systemctl start dirigent-session.target")
+    machine.wait_for_file("/tmp/probe")
+    assert machine.succeed("cat /tmp/probe") == "s1 tskey\n"
+    machine.succeed("systemctl stop dirigent-session.target")
+    machine.wait_for_file("/tmp/probe-stopped")
   '';
 }

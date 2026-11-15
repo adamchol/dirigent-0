@@ -37,7 +37,8 @@ plan's usage limit is reached, turns fail saying so.
 ## Secrets
 
 Secrets are values your sessions' commands need: tokens, API keys, passwords. They're environment
-variables in the agent's Bash, and nowhere else.
+variables in the agent's Bash; in the cluster's VMs, also files for the VM's system while the
+session runs (below).
 
 - **Yours**, for all your sessions: account menu → **Secrets**, or `dirigent secret set NAME`.
 - **A session's own**: session menu → **Secrets**, or `dirigent secret set NAME --session <id>`.
@@ -58,6 +59,10 @@ How they're kept safe:
 
 - control stores them encrypted and sends them to players on the lease; players hold them in memory
   only, and pass them to Bash's environment, not their own.
+- In a cluster VM, the player also writes them to `/run/dirigent/session/secrets/` (a tmpfs, root
+  only) while the session runs, for the VM's own services, e.g. [a Tailscale
+  login](../operating/machines-and-systems.md#each-session-on-your-tailnet), and removes them when it
+  ends. On hosts, never.
 - Every secret value (6 characters or longer) is replaced by `[secret:NAME]` in tool output before
   the model or the log sees it, and in workspace files mirrored into the log (they're put back when
   you `dirigent sync`).

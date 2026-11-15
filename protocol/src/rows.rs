@@ -127,6 +127,7 @@ mod tests {
                 epoch: 3,
                 version: Some("0.1.3+abc1234".into()),
                 environment: Some("adam's MacBook".into()),
+                settings: Some(crate::control::SessionSpec::default().settings()),
             },
             Event::UserInterrupt { turn: "t1".into() },
             Event::TurnStarted { input: "m1".into() },
@@ -198,6 +199,13 @@ mod tests {
             Event::TurnEnded {
                 reason: TurnEndReason::Aborted,
                 interrupt: Some("i1".into()),
+            },
+            Event::ModelChanged {
+                settings: crate::control::Settings {
+                    model: "gpt-5.5".into(),
+                    effort: None,
+                    provider: crate::control::Provider::Chatgpt,
+                },
             },
             Event::TurnEnded {
                 reason: TurnEndReason::Completed,

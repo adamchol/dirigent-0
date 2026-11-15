@@ -89,6 +89,7 @@ impl Director {
             Arc::new(InterruptSession(self.clone())),
             Arc::new(StartSession(self.clone())),
             Arc::new(StopSession(self.clone())),
+            Arc::new(SwitchModel(self.clone())),
             Arc::new(RequestSecret(self.clone())),
         ]
     }
@@ -480,6 +481,78 @@ impl Tool for StopSession {
         let body = Some(json!({ "now": now }));
         match self.0.api(reqwest::Method::POST, &path, body).await {
             Ok(_) => ToolOutput::ok("Stopping."),
+            Err(e) => ToolOutput::error(e),
+        }
+    }
+}
+
+struct SwitchModel(Arc<Director>);
+
+#[async_trait]
+impl Tool for SwitchModel {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "switch_model",
+            "Switch a session you own to another model, effort or provider; what you leave out stays as it is. A running session takes it from its next model call on, which reads its whole conversation afresh (uncached) once; an idle one starts with it.",
+            json!({
+                "session": { "type": "string", "description": SESSION },
+                "model": { "type": "string", "description": "The model." },
+                "effort": { "type": "string", "enum": ["low", "medium", "high", "max", "none"], "description": "How hard it thinks; none: no extended thinking." },
+                "provider": { "type": "string", "enum": ["anthropic", "chatgpt"], "description": "Who its model calls are paid to: Anthropic, or its owner's ChatGPT plan." }
+            }),
+            &["session"],
+        )
+    }
+
+    fn read_only(&self) -> bool {
+        false
+    }
+
+    async fn call(&self, input: Value, _: &ToolCtx, _: CancellationToken) -> ToolOutput {
+        let session = match session_id(&input) {
+            Ok(s) => s,
+            Err(e) => return ToolOutput::error(e),
+        };
+        let path = format!("/sessions/{session}");
+        let info: SessionInfo = match self.0.api(reqwest::Method::GET, &path, None).await {
+            Ok(r) => match r.json().await {
+                Ok(info) => info,
+                Err(e) => return ToolOutput::error(format!("reading the session: {e}")),
+            },
+            Err(e) => return ToolOutput::error(e),
+        };
+        let mut settings = info.spec.settings();
+        if let Some(m) = opt_str(&input, "model") {
+            settings.model = m.to_string();
+        }
+        match opt_str(&input, "effort") {
+            Some("none") => settings.effort = None,
+            Some(e) => match serde_json::from_value::<Effort>(json!(e)) {
+                Ok(e) => settings.effort = Some(e),
+                Err(_) => return ToolOutput::error(format!("{e:?} isn't an effort")),
+            },
+            None => {}
+        }
+        if let Some(p) = opt_str(&input, "provider") {
+            match serde_json::from_value(json!(p)) {
+                Ok(p) => settings.provider = p,
+                Err(_) => return ToolOutput::error(format!("{p:?} isn't a provider")),
+            }
+        }
+        let body = Some(json!(settings));
+        let path = format!("/sessions/{session}/model");
+        match self.0.api(reqwest::Method::PUT, &path, body).await {
+            Ok(_) => ToolOutput::ok(format!(
+                "Switched: {}, effort {}, on {}.",
+                settings.model,
+                settings
+                    .effort
+                    .map_or("none".into(), |e| format!("{e:?}").to_lowercase()),
+                match settings.provider {
+                    dirigent_protocol::control::Provider::Anthropic => "Anthropic",
+                    dirigent_protocol::control::Provider::Chatgpt => "a ChatGPT plan",
+                }
+            )),
             Err(e) => ToolOutput::error(e),
         }
     }

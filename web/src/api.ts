@@ -141,6 +141,28 @@ export async function put(who: Who, id: string, spec: Partial<SessionSpec>, star
   await call(who, "PUT", `/sessions/${id}`, { ...spec, start, ...(environment ? { environment } : {}) });
 }
 
+/** A session's model, effort and provider: what of its spec can change while it lives. */
+export interface ModelSettings {
+  model: string;
+  effort: Effort | null;
+  provider: Provider;
+}
+
+export function settingsOf(s: SessionInfo): ModelSettings {
+  return { model: s.spec.model, effort: s.spec.effort, provider: provider(s) };
+}
+
+/** One line of them: "claude-sonnet-5 · high, on a ChatGPT plan". */
+export function settingsLine(s: ModelSettings): string {
+  const on = s.provider === "chatgpt" ? ", on a ChatGPT plan" : "";
+  return `${s.model}${s.effort ? ` · ${s.effort}` : " · no thinking"}${on}`;
+}
+
+/** Switch the session to `settings`: a running player takes them before its next model call. */
+export async function setModel(who: Who, id: string, settings: ModelSettings) {
+  await call(who, "PUT", `/sessions/${id}/model`, settings);
+}
+
 /** Place the session on `who`'s host `host` (none: the cluster), for its next start. */
 export async function placeOn(who: Who, id: string, host: string | null) {
   await call(who, "PUT", `/sessions/${id}/environment`, { host });

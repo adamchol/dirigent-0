@@ -5,7 +5,8 @@ The handful of ideas the rest of the docs build on.
 ## Sessions
 
 A **session** is one agent's work: a conversation and a workspace. It has an id (a UUID) and a
-**spec**, set when it's made and fixed after:
+**spec**, set when it's made. Its model, effort and provider can be [switched](guides/sessions.md#switching-model-provider-or-thinking)
+any time; the rest is fixed:
 
 | Spec | What | Default |
 |---|---|---|

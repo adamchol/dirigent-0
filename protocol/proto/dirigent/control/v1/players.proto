@@ -89,6 +89,7 @@ message ToPlayer {
     Acquired acquired = 1;
     Detach detach = 2;
     Tokens tokens = 3;
+    Settings settings = 4;
   }
 }
 
@@ -126,7 +127,7 @@ message Detach {
   bool now = 1;
 }
 
-// What a session runs, set when it's made and fixed from then on.
+// What a session runs, set when it's made; its model, effort and provider can change (Settings).
 message SessionSpec {
   string model = 1;
   // Absent: no extended thinking.
@@ -239,4 +240,14 @@ message Start {
 // Remove what the host has of `session`, which is gone (or never its user's).
 message Forget {
   string session = 1;
+}
+
+// Any time after `Acquired`: the session's model, effort or provider changed. The player takes them
+// before its next model call (a model call running finishes as it began). A new provider's
+// credential comes in the `Tokens` sent right after.
+message Settings {
+  string model = 1;
+  // Absent: no extended thinking.
+  optional Effort effort = 2;
+  Provider provider = 3;
 }

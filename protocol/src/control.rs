@@ -15,7 +15,8 @@ pub fn player_subject(player: &str) -> String {
     format!("player:{player}")
 }
 
-/// What a session runs, set when it's made (`PUT /sessions/{id}`) and fixed from then on.
+/// What a session runs, set when it's made (`PUT /sessions/{id}`). Its model, effort and
+/// provider ([`Settings`]) change with `PUT /sessions/{id}/model`; the rest is fixed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSpec {
     #[serde(default = "default_model")]
@@ -98,7 +99,26 @@ impl Default for SessionSpec {
     }
 }
 
+/// What of a session's spec can change while it lives: its model, how hard it thinks, and who
+/// its model calls are paid to. A running player takes a change before its next model call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settings {
+    pub model: String,
+    /// `None`: no extended thinking.
+    pub effort: Option<Effort>,
+    #[serde(default)]
+    pub provider: Provider,
+}
+
 impl SessionSpec {
+    pub fn settings(&self) -> Settings {
+        Settings {
+            model: self.model.clone(),
+            effort: self.effort,
+            provider: self.provider,
+        }
+    }
+
     /// Why it can't run, if it can't: a dirigent has no source, and a machine has some of each.
     pub fn check(&self) -> Result<(), String> {
         if self.part == Part::Dirigent && self.source.is_some() {
@@ -151,10 +171,7 @@ impl From<SessionSpec> for pb::SessionSpec {
                 Part::Coder => pb::Part::Coder,
                 Part::Dirigent => pb::Part::Dirigent,
             } as i32,
-            provider: match spec.provider {
-                Provider::Anthropic => pb::Provider::Anthropic,
-                Provider::Chatgpt => pb::Provider::Chatgpt,
-            } as i32,
+            provider: pb::Provider::from(spec.provider) as i32,
             resources: spec.resources.map(|r| pb::Resources {
                 cpu: r.cpu,
                 memory: r.memory,
@@ -171,21 +188,9 @@ impl TryFrom<pb::SessionSpec> for SessionSpec {
         if spec.model.is_empty() {
             return Err("a spec without a model".into());
         }
-        let effort = match spec.effort {
-            None => None,
-            Some(e) => Some(match pb::Effort::try_from(e) {
-                Ok(pb::Effort::Low) => Effort::Low,
-                Ok(pb::Effort::Medium) => Effort::Medium,
-                Ok(pb::Effort::High) => Effort::High,
-                Ok(pb::Effort::Max) => Effort::Max,
-                Ok(pb::Effort::Unspecified) | Err(_) => {
-                    return Err(format!("a spec with effort {e}, not one there is"))
-                }
-            }),
-        };
         Ok(SessionSpec {
             model: spec.model,
-            effort,
+            effort: effort(spec.effort).map_err(|e| format!("a spec with {e}"))?,
             source: spec.source.map(|s| match s {
                 pb::session_spec::Source::Git(g) => Source::Git {
                     url: g.url,
@@ -197,22 +202,68 @@ impl TryFrom<pb::SessionSpec> for SessionSpec {
                 Ok(pb::Part::Dirigent) => Part::Dirigent,
                 Err(_) => return Err(format!("a spec with part {}, not one there is", spec.part)),
             },
-            provider: match pb::Provider::try_from(spec.provider) {
-                Ok(pb::Provider::Anthropic | pb::Provider::Unspecified) => Provider::Anthropic,
-                Ok(pb::Provider::Chatgpt) => Provider::Chatgpt,
-                Err(_) => {
-                    return Err(format!(
-                        "a spec with provider {}, not one there is",
-                        spec.provider
-                    ))
-                }
-            },
+            provider: provider(spec.provider).map_err(|e| format!("a spec with {e}"))?,
             resources: spec.resources.map(|r| Resources {
                 cpu: r.cpu,
                 memory: r.memory,
                 disk: r.disk,
             }),
         })
+    }
+}
+
+impl From<Settings> for pb::Settings {
+    fn from(s: Settings) -> Self {
+        pb::Settings {
+            model: s.model,
+            effort: s.effort.map(|e| pb::Effort::from(e) as i32),
+            provider: pb::Provider::from(s.provider) as i32,
+        }
+    }
+}
+
+impl TryFrom<pb::Settings> for Settings {
+    type Error = String;
+
+    fn try_from(s: pb::Settings) -> Result<Self, String> {
+        if s.model.is_empty() {
+            return Err("settings without a model".into());
+        }
+        Ok(Settings {
+            model: s.model,
+            effort: effort(s.effort)?,
+            provider: provider(s.provider)?,
+        })
+    }
+}
+
+fn effort(e: Option<i32>) -> Result<Option<Effort>, String> {
+    let Some(e) = e else { return Ok(None) };
+    Ok(Some(match pb::Effort::try_from(e) {
+        Ok(pb::Effort::Low) => Effort::Low,
+        Ok(pb::Effort::Medium) => Effort::Medium,
+        Ok(pb::Effort::High) => Effort::High,
+        Ok(pb::Effort::Max) => Effort::Max,
+        Ok(pb::Effort::Unspecified) | Err(_) => {
+            return Err(format!("effort {e}, not one there is"))
+        }
+    }))
+}
+
+fn provider(p: i32) -> Result<Provider, String> {
+    match pb::Provider::try_from(p) {
+        Ok(pb::Provider::Anthropic | pb::Provider::Unspecified) => Ok(Provider::Anthropic),
+        Ok(pb::Provider::Chatgpt) => Ok(Provider::Chatgpt),
+        Err(_) => Err(format!("provider {p}, not one there is")),
+    }
+}
+
+impl From<Provider> for pb::Provider {
+    fn from(p: Provider) -> Self {
+        match p {
+            Provider::Anthropic => pb::Provider::Anthropic,
+            Provider::Chatgpt => pb::Provider::Chatgpt,
+        }
     }
 }
 

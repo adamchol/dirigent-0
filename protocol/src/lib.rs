@@ -116,6 +116,9 @@ pub enum Event {
         version: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         environment: Option<String>,
+        /// The model, effort and provider it runs (none from those before it was told).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settings: Option<control::Settings>,
     },
     /// From the player, last: the session was stopped and it gives the lease back, as the
     /// `epoch`th player.
@@ -248,6 +251,10 @@ pub enum Event {
     /// From the player: the names of the secrets the session now has (its tools' environment),
     /// as they changed while it held the session. Never their values.
     SecretsChanged { names: Vec<String> },
+    /// From the player: it takes the session's new model, effort or provider (`PUT
+    /// /sessions/{id}/model`) from its next model call on. Not part of the conversation: the model
+    /// isn't told.
+    ModelChanged { settings: control::Settings },
     /// From an importer, after the conversation it wrote before any player held the session:
     /// it was `from` another agent's session `session` (`claude-code`, `codex`), which worked in
     /// `cwd` from `first` to `last` (RFC 3339), the times the rows before don't have.
@@ -288,6 +295,7 @@ impl Event {
         "secret_answered",
         "secrets_changed",
         "imported",
+        "model_changed",
     ];
 
     /// An input's text, as the model reads it: a user's message, a session update, or an answer
@@ -375,7 +383,8 @@ mod tests {
             | Event::FilesChanged { .. }
             | Event::SecretAnswered { .. }
             | Event::SecretsChanged { .. }
-            | Event::Imported { .. } => e.kind(),
+            | Event::Imported { .. }
+            | Event::ModelChanged { .. } => e.kind(),
         };
         let s = String::new;
         let usage = Usage::default();
@@ -384,6 +393,7 @@ mod tests {
                 epoch: 1,
                 version: None,
                 environment: None,
+                settings: None,
             },
             Event::PlayerDetached { epoch: 1 },
             Event::PlayerFailed {
@@ -474,6 +484,9 @@ mod tests {
                 cwd: s(),
                 first: s(),
                 last: s(),
+            },
+            Event::ModelChanged {
+                settings: control::SessionSpec::default().settings(),
             },
         ];
         let kinds: Vec<String> = events.iter().map(one).collect();
