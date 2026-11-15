@@ -1346,7 +1346,8 @@ mod e2e {
         })
         .await;
         assert!(place(None).await.unwrap().status().is_success());
-        user.say("!cat notes.txt").await;
+        user.say("!cat notes.txt && echo from the cluster > notes.txt")
+            .await;
         assert!(start().await.unwrap().status().is_success());
         let log = log_until(&stack, &session, |r| turns_ended(r) == 2).await;
         let ready = log
@@ -1373,12 +1374,37 @@ mod e2e {
             results.last().unwrap().contains("from the host"),
             "{results:?}"
         );
-        let stop = api(
-            &stack,
-            reqwest::Method::POST,
-            &format!("/sessions/{session}/stop"),
+
+        // and back on the host, whose directory it left there: with what it did on the cluster
+        let stop = || {
+            api(
+                &stack,
+                reqwest::Method::POST,
+                &format!("/sessions/{session}/stop"),
+            )
+            .send()
+        };
+        assert!(stop().await.unwrap().status().is_success());
+        log_until(&stack, &session, |r| {
+            r.iter().filter(|r| r.kind == "player_detached").count() == 2
+        })
+        .await;
+        assert!(place(Some(&name)).await.unwrap().status().is_success());
+        user.say("!cat notes.txt").await;
+        assert!(start().await.unwrap().status().is_success());
+        let log = log_until(&stack, &session, |r| turns_ended(r) == 3).await;
+        let results: Vec<String> = log
+            .iter()
+            .filter_map(|r| match r.event() {
+                Ok(Event::ToolResult { content, .. }) => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            results.last().unwrap().contains("from the cluster"),
+            "{results:?}"
         );
-        stop.send().await.unwrap();
+        stop().await.unwrap();
     }
 
     #[tokio::test]

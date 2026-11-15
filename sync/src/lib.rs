@@ -84,6 +84,19 @@ impl Repo {
         Ok(repo)
     }
 
+    /// The last commit made or fetched here, if any: before a [`Repo::replay`], what this
+    /// repository's workspace was last mirrored as.
+    pub async fn live(&self) -> Option<String> {
+        self.resolve(LIVE).await
+    }
+
+    /// Whether `ancestor` is `commit` or comes before it.
+    pub async fn is_ancestor(&self, ancestor: &str, commit: &str) -> bool {
+        let mut cmd = self.git();
+        cmd.args(["merge-base", "--is-ancestor", ancestor, commit]);
+        self.run(&mut cmd).await.is_ok()
+    }
+
     /// Whether the repository has `commit`.
     pub async fn has(&self, commit: &str) -> bool {
         let mut cmd = self.git();

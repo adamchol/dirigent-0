@@ -22,6 +22,9 @@ pub struct Mirror {
     files: Workspace,
     /// The last commit in the log, which the next is made on.
     last: Option<String>,
+    /// What the repository had mirrored before it fetched the log: where a player before this
+    /// one, in this state, left the workspace.
+    found: Option<String>,
     /// What's replaced by `[secret:NAME]` in the commits, and put back on restore.
     secrets: Secrets,
 }
@@ -36,6 +39,7 @@ impl Mirror {
         secrets: Secrets,
     ) -> anyhow::Result<Self> {
         let repo = Repo::open(dir).await?;
+        let found = repo.live().await;
         let mut bundles = Bundles::default();
         let whole: Vec<_> = files.iter().filter_map(|e| bundles.push(e)).collect();
         let (last, error) = repo.replay(whole).await;
@@ -47,8 +51,19 @@ impl Mirror {
             workdir,
             files: Workspace::new(workdir),
             last,
+            found,
             secrets,
         })
+    }
+
+    /// Whether the log went on from where a player before this one left the workspace, here: the
+    /// session ran elsewhere since (a host keeps a session's workspace and state while it's
+    /// away), so the workspace kept here is behind the session's.
+    pub async fn behind(&self) -> bool {
+        match (&self.found, &self.last) {
+            (Some(found), Some(last)) => found != last && self.repo.is_ancestor(found, last).await,
+            _ => false,
+        }
     }
 
     /// Make the workspace the last commit's, over what was restored from a checkpoint (which

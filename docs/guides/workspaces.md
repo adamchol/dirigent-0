@@ -70,6 +70,10 @@ A player starting where the workspace isn't (a new VM, a different host) makes i
 | No checkpoint, but files in the log | Clones the source (or makes it empty), then checks out the log's latest files: **workspace made again, with the session's files**. |
 | Neither | Clones the source again. |
 
+A workspace a [host](hosts.md) kept while the session ran elsewhere is brought up to the log's latest
+files in the same way: what changed or was deleted elsewhere is changed or deleted here; ignored
+files stay as they were.
+
 What the mirror doesn't keep (ignored files, files over 50 MB) comes back only from a checkpoint.
 The agent is told when its workspace was made again, and what may be missing (for example, build
 outputs and installed dependencies, which are usually ignored).

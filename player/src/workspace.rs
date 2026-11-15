@@ -22,10 +22,10 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
 /// The session's log, once the workspace in `workdir` is made from `source`: with the event that
 /// says so appended, if there's one; or why it can't be made (which the player reports as it
 /// fails). And the workspace's mirror (its repository in `mirror`), made from the log and
-/// brought up to date: a workspace restored from a checkpoint, or made here (the first time,
-/// as an import's is, or again, found gone with no checkpoint to restore), becomes the log's
-/// last commit, and what's changed since is committed. Without git, the workspace isn't
-/// mirrored.
+/// brought up to date: a workspace restored from a checkpoint, made here (the first time, as an
+/// import's is, or again, found gone with no checkpoint to restore), or kept here while the
+/// session went on elsewhere, becomes the log's last commit, and what's changed since is
+/// committed. Without git, the workspace isn't mirrored.
 pub async fn open(
     session: &mut dyn Session,
     workdir: &'static Path,
@@ -55,6 +55,8 @@ pub async fn open(
     let gone = made.is_none() && empty && ready;
     let restore = match &mirror {
         Some(m) if gone => m.has_files().await,
+        // kept here while the session ran elsewhere (a host's), and changed there since
+        Some(m) if made.is_none() => m.behind().await,
         _ => made.is_some(),
     };
     if let Some(m) = mirror.as_ref().filter(|_| restore) {
@@ -62,7 +64,7 @@ pub async fn open(
             Ok(Some(commit)) => match &mut made {
                 Some(Event::WorkspaceReady { files, .. }) => *files = Some(commit),
                 Some(_) => {}
-                None => {
+                None if gone => {
                     made = Some(Event::WorkspaceReady {
                         source: None,
                         head: None,
@@ -70,6 +72,8 @@ pub async fn open(
                         files: Some(commit),
                     })
                 }
+                // brought up to date where it was: the session's move is in the log already
+                None => {}
             },
             Ok(None) => {}
             Err(e) => warn!("the workspace stays as it was made: {e:#}"),
@@ -734,5 +738,83 @@ pub(crate) mod tests {
                 "n"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_workspace_kept_while_the_session_ran_elsewhere_gets_what_it_did_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (here, there) = (tmp.path().join("here"), tmp.path().join("there"));
+        std::fs::create_dir(&here).unwrap();
+        std::fs::create_dir(&there).unwrap();
+        let (here, there) = (leak(&here), leak(&there));
+        let read = |dir: &Path, name: &str| std::fs::read_to_string(dir.join(name)).ok();
+        let mut files = Vec::new();
+        // runs here (a host), starting from what's there; its player mirrors it, then leaves
+        std::fs::write(here.join("file"), "here\n").unwrap();
+        std::fs::write(here.join("deleted"), "d").unwrap();
+        let mut session = Logged {
+            log: ready(false),
+            files: files.clone(),
+            published: Vec::new(),
+        };
+        let mirror = tmp.path().join("mirror-here");
+        open(&mut session, here, None, None, &mirror, Secrets::none())
+            .await
+            .unwrap();
+        files.append(&mut session.published);
+        assert!(!files.is_empty());
+
+        // runs elsewhere: its workspace from the log, then changed there
+        let mut session = Logged {
+            log: ready(false),
+            files: files.clone(),
+            published: Vec::new(),
+        };
+        let (_, m) = open(
+            &mut session,
+            there,
+            None,
+            None,
+            &tmp.path().join("mirror-there"),
+            Secrets::none(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(there, "file").as_deref(), Some("here\n"));
+        std::fs::write(there.join("file"), "there\n").unwrap();
+        std::fs::remove_file(there.join("deleted")).unwrap();
+        std::fs::write(there.join("new"), "n").unwrap();
+        files.extend(m.unwrap().snapshot("Write").await);
+
+        // back here, where the workspace stayed as this host's player left it
+        let mut session = Logged {
+            log: ready(false),
+            files: files.clone(),
+            published: Vec::new(),
+        };
+        open(&mut session, here, None, None, &mirror, Secrets::none())
+            .await
+            .unwrap();
+        assert_eq!(read(here, "file").as_deref(), Some("there\n"));
+        assert_eq!(read(here, "deleted"), None);
+        assert_eq!(read(here, "new").as_deref(), Some("n"));
+        // it's the log's last commit: nothing new to mirror, and no event says it was made
+        assert!(session.published.is_empty(), "{:?}", session.published);
+
+        // and when nothing happened elsewhere, what's here (not mirrored yet) stays
+        std::fs::write(here.join("file"), "changed here\n").unwrap();
+        let mut session = Logged {
+            log: ready(false),
+            files: files.clone(),
+            published: Vec::new(),
+        };
+        open(&mut session, here, None, None, &mirror, Secrets::none())
+            .await
+            .unwrap();
+        assert_eq!(read(here, "file").as_deref(), Some("changed here\n"));
+        assert!(matches!(
+            &session.published[..],
+            [Event::FilesChanged { .. }, ..]
+        ));
     }
 }

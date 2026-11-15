@@ -191,9 +191,9 @@ checks out the session's latest files; moved back, the same happens in a VM. Ign
 over 50 MB don't move. The agent is told the session moved, and where it runs now (its environment
 in the system prompt changes too).
 
+A session that comes back to a host it ran on before finds its old directory there; its player
+brings the files up to the session's latest, so what changed elsewhere meanwhile is there, and what
+was deleted is gone. Ignored files (build outputs, dependencies) are as the host left them.
+
 Sessions on hosts aren't checkpointed: their workspace is the host's directory, kept as long as the
 session is there.
-
-> **Known issue (0.1.9):** a session that comes back to a host it ran on before finds its old
-> directory there and works in it as it was, without the changes made elsewhere since. Until this
-> is fixed, delete `<root>/<session-id>` on the host before moving a session back to it.
