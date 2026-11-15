@@ -2,7 +2,7 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
-## Unreleased
+## 0.1.12 (2026-11-15)
 
 ### Added
 - Versions and debug info: the web's account menu has **About and debug info**, and the CLI `dirigent version` (`--json`). Both show the web's, control's and the CLI's versions, control's runner, the players' VM image and system, Postgres's and ClickHouse's versions, the install's pods in Kubernetes (images, readiness, restarts), and your hosts' versions; the web also shows the open session's player, and copies it all as JSON. control serves it as `GET /about` and lists its namespace's pods for it: its Role gains `list` on pods.
