@@ -2,7 +2,7 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
-## Unreleased
+## 0.1.11 (2026-11-15)
 
 ### Added
 - The chart's Services take annotations: `control.service.annotations`, `chlive.service.annotations`, `web.service.annotations`, e.g. to put control's players' service (for hosts) and the web on a tailnet with the Tailscale operator. The installing guide has the recipe.
