@@ -4,6 +4,9 @@ dirigent's releases: the chart and the images, both at the chart's version (`cha
 
 ## Unreleased
 
+### Added
+- The chart's Services take annotations: `control.service.annotations`, `chlive.service.annotations`, `web.service.annotations`, e.g. to put control's players' service (for hosts) and the web on a tailnet with the Tailscale operator. The installing guide has the recipe.
+
 ### Fixed
 - The web's chat opened sessions partway up their history, and jumped while a reply streamed. It now keeps to the bottom while you're there, and stays where you scroll to otherwise.
 

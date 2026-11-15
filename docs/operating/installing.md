@@ -158,23 +158,63 @@ WebSocket) to chlive. Expose it with:
   WebSockets on `/live` (add its annotation through `web.ingress.annotations`).
 - **A Gateway API HTTPRoute**: `web.httpRoute.enabled`, with `parentRefs` to your Gateway,
   `hostnames`, and `timeouts` if your Gateway cuts long requests.
-- Anything else that reaches the Service (a Tailscale operator, a port-forward).
+- Anything else that reaches the Service: its annotations are `web.service.annotations`, e.g. for
+  the Tailscale operator ([below](#on-a-tailnet)), or a port-forward.
 
 ## Letting users' hosts in
 
-Users' own machines running [`dirigent host`](../guides/hosts.md) need control's players' service
-(gRPC, port 8091), which isn't exposed by default:
+Users' own machines running [`dirigent host`](../guides/hosts.md) reach dirigent's API and chlive
+through the web (`/api`, `/live`), and need control's players' service too (gRPC, port 8091), which
+isn't exposed by default:
 
 - `hosts.expose: true` routes its two paths (`/dirigent.control.v1.Players/Lease` and `/Host`) at
   the web's address: as rules on the HTTPRoute, or as a second Ingress (`dirigent-players`) on the
   web's host, whose annotations (`hosts.ingress.annotations`) must make your controller speak gRPC
   to it, e.g. `nginx.ingress.kubernetes.io/backend-protocol: GRPC`. Hosts then need only the web's
   address.
-- Or reach the `dirigent-control` Service's `grpc` port privately (for instance annotate it for the
-  Tailscale operator), and have hosts set `players` to that address.
+- Or reach the `dirigent-control` Service's `grpc` port privately, for instance on a tailnet
+  (below), and have hosts set `players` to that address.
 
 Callers of that service must sign in as a user (hosts) or hold a lease token control gave them
 (players), so exposing it doesn't let anyone take a session.
+
+### On a tailnet
+
+With the [Tailscale Kubernetes operator](https://tailscale.com/kb/1236/kubernetes-operator),
+annotations on the chart's Services put them on your tailnet, with nothing public:
+
+```yaml
+# the players' service, for hosts (it brings control's HTTP API along, which needs a signed-in user)
+control:
+  service:
+    annotations:
+      tailscale.com/expose: "true"
+      tailscale.com/hostname: dirigent-control
+# the web, if it isn't reachable already: the UI, the API and chlive, for browsers and hosts
+web:
+  service:
+    annotations:
+      tailscale.com/expose: "true"
+      tailscale.com/hostname: dirigent
+```
+
+Hosts on the tailnet then sign in at the web's address and name control's in their `host.toml`:
+
+```sh
+dirigent login http://dirigent.<tailnet>.ts.net       # or the web's public address
+```
+
+```toml
+players = "http://dirigent-control.<tailnet>.ts.net:8091"
+```
+
+Plain `http://` is fine: tailnet traffic is encrypted. With tailnet ACLs, let users' machines reach
+`dirigent-control` on port 8091 (and `dirigent` on port 80). A web only on the tailnet needs your
+Google web client's JavaScript origin to be that address, which Google accepts only over `https`
+(a Service annotation gives plain TCP): serve the web through the operator's Ingress instead
+(`web.ingress` with `className: tailscale`, after turning on [HTTPS for the
+tailnet](https://tailscale.com/kb/1153/enabling-https)), or keep the web public and put only
+control on the tailnet.
 
 ## GitHub App
 

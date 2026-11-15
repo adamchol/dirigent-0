@@ -144,6 +144,7 @@ fit together.
 | `control.resources` | `{requests: {cpu: 100m, memory: 128Mi}}` | |
 | `control.startup` | `600` | Seconds a started player has to take its lease (VM boot and image pulls included) before control gives up on it and starts another. |
 | `control.env` | `{}` | More environment variables, e.g. `{RUST_LOG: control=debug}`. See [Control](../reference/control.md) for those it reads. |
+| `control.service.annotations` | `{}` | The `dirigent-control` Service's annotations (its ports: HTTP 8090, the players' gRPC 8091), e.g. for the Tailscale operator ([recipe](installing.md#on-a-tailnet)). |
 
 ## chlive
 
@@ -152,11 +153,13 @@ fit together.
 | `chlive.image` | `ghcr.io/dialohq/chlive`, tag pinned by the chart |
 | `chlive.resources` | `{requests: {cpu: 250m, memory: 512Mi}}` |
 | `chlive.cacheSize` | `10Gi` (an `emptyDir`'s limit) |
+| `chlive.service.annotations` | `{}` (the `dirigent-chlive` Service's; browsers and hosts reach chlive through the web) |
 
 ## web
 
 | Value | Default | |
 |---|---|---|
+| `web.service.annotations` | `{}` | The `dirigent-web` Service's annotations (port 80: the UI, `/api`, `/live`), e.g. for the Tailscale operator. |
 | `web.ingress.enabled` | `false` | An Ingress `dirigent-web` for `/`. |
 | `web.ingress.className` | `""` | |
 | `web.ingress.host` | `""` | Required when enabled. |

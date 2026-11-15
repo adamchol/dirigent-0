@@ -4,6 +4,10 @@ metadata:
   name: dirigent-chlive
   labels:
     {{- include "dirigent.labels" . | nindent 4 }}
+  {{- with .Values.chlive.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   selector:
     {{- include "dirigent.selector" . | nindent 4 }}

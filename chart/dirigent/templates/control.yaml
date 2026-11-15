@@ -81,6 +81,10 @@ metadata:
   name: dirigent-control
   labels:
     {{- include "dirigent.labels" . | nindent 4 }}
+  {{- with .Values.control.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   selector:
     {{- include "dirigent.selector" . | nindent 4 }}

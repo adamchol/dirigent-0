@@ -202,6 +202,10 @@ control:
   startup: 600
   # more of control's environment, e.g. {RUST_LOG: "control=debug", NO_COLOR: "1"}
   env: {}
+  # its Service's annotations (http 8090, and the players' gRPC 8091), e.g. to put it on a
+  # tailnet for users' hosts: {tailscale.com/expose: "true", tailscale.com/hostname: dirigent-control}
+  service:
+    annotations: {}
 
 chlive:
   # the published image of the flake's chlive (sha-<12 chars of its commit>; `nix flake check`
@@ -210,8 +214,15 @@ chlive:
   resources:
     requests: { cpu: 250m, memory: 512Mi }
   cacheSize: 10Gi
+  # its Service's annotations (8080); hosts and browsers reach chlive through the web's /live
+  service:
+    annotations: {}
 
 web:
+  # its Service's annotations (80: the UI, /api and /live), e.g. to put it on a tailnet:
+  # {tailscale.com/expose: "true", tailscale.com/hostname: dirigent}
+  service:
+    annotations: {}
   ingress:
     enabled: false
     className: ""
@@ -233,8 +244,8 @@ web:
 # connect to control's players' service (gRPC) as their user. With `expose`, the web's Ingress or
 # HTTPRoute routes that service's `Lease` and `Host` calls to control too, so a host reaches
 # dirigent at the web's address alone (`url` in its host.toml). Otherwise, reach control's `grpc`
-# port another way (e.g. on a tailnet, the control Service annotated for the Tailscale
-# operator: `tailscale.com/expose: "true"`) and give hosts its address (`players` in host.toml).
+# port another way (e.g. on a tailnet, with control.service.annotations for the Tailscale
+# operator) and give hosts its address (`players` in host.toml).
 hosts:
   expose: false
   # The players' own Ingress (beside the web's, at its host and TLS), for an Ingress controller

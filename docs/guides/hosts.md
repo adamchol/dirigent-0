@@ -26,8 +26,8 @@ agents to reach, or give it a dedicated user (`--system --user`, below).
   - **`hosts.expose: true`** in the chart: it's routed at the web's address, and the host needs only
     the web's address. Ask your operator (see
     [Configuration](../operating/configuration.md#hosts)).
-  - **A private address**, for instance control's Service on your tailnet: put it in the host's
-    config as `players`.
+  - **A private address**, for instance control's Service on your tailnet (see [On a
+    tailnet](../operating/installing.md#on-a-tailnet)): put it in the host's config as `players`.
 
 ## Installing
 
