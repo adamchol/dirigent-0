@@ -164,8 +164,9 @@ fn is_name(name: &str) -> bool {
 }
 
 fn set_hostname(name: &str) -> std::io::Result<()> {
-    // SAFETY: a pointer and length of a live buffer, which the kernel only reads
-    let r = unsafe { libc::sethostname(name.as_ptr().cast(), name.len()) };
+    // SAFETY: a pointer and length of a live buffer, which the kernel only reads (the length a
+    // size_t on Linux, an int on macOS, where the CLI builds this too)
+    let r = unsafe { libc::sethostname(name.as_ptr().cast(), name.len() as _) };
     if r == 0 {
         Ok(())
     } else {
