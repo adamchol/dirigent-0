@@ -2,6 +2,11 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
+## Unreleased
+
+### Fixed
+- The web's chat opened sessions partway up their history, and jumped while a reply streamed. It now keeps to the bottom while you're there, and stays where you scroll to otherwise.
+
 ## 0.1.10 (2026-11-15)
 
 ### Added

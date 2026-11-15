@@ -90,7 +90,7 @@ export function Timeline(props: {
   return (
     <>
       {list.map((block) => (
-        <MessageScrollerItem key={block.key} scrollAnchor={block.t === "user"}>
+        <MessageScrollerItem key={block.key}>
           <motion.div
             initial={props.first.has(block.key) ? false : ARRIVE}
             animate={SETTLED}

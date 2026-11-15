@@ -197,7 +197,7 @@ export function Session(props: {
         </div>
       )}
 
-      <MessageScrollerProvider>
+      <MessageScrollerProvider key={props.id}>
         <MessageScroller className="flex-1">
           <MessageScrollerViewport>
             <MessageScrollerContent className="mx-auto w-full max-w-185 gap-5 px-6 py-6">
