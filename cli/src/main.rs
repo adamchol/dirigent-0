@@ -185,7 +185,7 @@ enum ImportProvider {
 
 #[derive(Subcommand)]
 enum HostCommand {
-    /// Run the host here, until it's stopped (what the service runs). As you, never root.
+    /// Run the host here, until it's stopped (what the service runs).
     Run,
     /// Install the host as your service and start it: a launchd agent on macOS (in your login
     /// session, where Xcode's keychain and the Simulator are; a locked screen doesn't stop it),

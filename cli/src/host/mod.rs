@@ -245,7 +245,6 @@ impl Players {
 
 /// Run the host until it's stopped: connected to control, and again when the connection breaks.
 pub async fn run(mut api: Api, config: Config) -> anyhow::Result<()> {
-    service::not_root("run the host").await?;
     let endpoints = config.endpoints(&api.creds.api)?;
     let roots = config.roots();
     for root in &roots {
