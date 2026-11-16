@@ -41,6 +41,7 @@ import { RenameDialog, useTitles } from "./Rename.tsx";
 import { SyncDialog } from "./Sync.tsx";
 import { AnthropicKeyDialog } from "./Keys.tsx";
 import { connectGithub, GithubDialog, useGithubReturn } from "./GitHub.tsx";
+import { MachineDialog } from "./MachineDialog.tsx";
 import { ModelDialog } from "./ModelPicker.tsx";
 import { SecretsDialog } from "./Secrets.tsx";
 import * as machine from "./machine.ts";
@@ -197,6 +198,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
   // the user's secrets for all sessions (`""`), or a session's (its id)
   const [secretsOf, setSecretsOf] = useState<string | null>(null);
   const [switchingModel, setSwitchingModel] = useState<string | null>(null);
+  const [machineOf, setMachineOf] = useState<string | null>(null);
   // the name the secrets dialog starts with (GITHUB_TOKEN, asked for a private repository)
   const [secretName, setSecretName] = useState<string | undefined>();
   const [githubOpen, setGithubOpen] = useState(false);
@@ -286,6 +288,7 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
                 openLocally={() => setSyncing(selected)}
                 secrets={() => setSecretsOf(selected)}
                 switchModel={() => setSwitchingModel(selected)}
+                changeMachine={() => setMachineOf(selected)}
               />
             )}
           </div>
@@ -368,6 +371,12 @@ function Page(props: { who: Who; become?: (user: string) => void; signOut?: () =
         connect={() => setLinking(true)}
         changed={sessions.refresh}
         close={() => setSwitchingModel(null)}
+      />
+      <MachineDialog
+        info={machineOf ? sessions.list.find((s) => s.id === machineOf) : undefined}
+        who={props.who}
+        changed={sessions.refresh}
+        close={() => setMachineOf(null)}
       />
       <AnthropicKeyDialog open={keying} who={props.who} me={me} changed={refreshMe} close={() => setKeying(false)} />
       <SettingsDialog open={settingsOpen} who={props.who} settings={settings} change={changeSettings} close={() => setSettingsOpen(false)} />

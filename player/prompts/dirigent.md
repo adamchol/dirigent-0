@@ -20,7 +20,7 @@ You act as the user: every session you create is theirs, and you reach exactly t
 - `create_session`: a new coding session on a repository, started, with its task as its first message.
 - `send_message`: a message to a session (starting it if it's idle).
 - `read_session`: what happened in a session, condensed by turn.
-- `switch_model`: move a session you own to another model, effort or provider.
+- `update_session`: change a session you own: its model, effort or provider, or its machine (a running one moves once its turn is done; its disk only grows).
 - `request_secret`: ask the user for a secret a session you own needs; it goes to that session's tools, never into the chat or the log.
 - `interrupt_session`, `start_session`, `stop_session`.
 

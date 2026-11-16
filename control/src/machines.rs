@@ -2,7 +2,7 @@
 //! local players), the most a session may ask for (`--max-*`), and whether each user has
 //! defaults of their own (`--defaults-per-user`, in their settings). A session's machine is
 //! chosen when it's made and kept in its spec: none there, it's the default one as it is when
-//! the session starts.
+//! the session starts. Its owner may change it later ([`Machines::change`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -142,6 +142,28 @@ impl Machines {
     }
 }
 
+impl Machines {
+    /// The machine a session on `current` changes to, asked for `asked` (what's left out kept):
+    /// refused if a part is none or over the limits, or its disk is smaller, which the workspace
+    /// restored from its checkpoint might not fit.
+    pub fn change(&self, current: Resources, asked: Partial) -> Result<Resources, String> {
+        let new = asked.over(current);
+        if new.cpu == 0 || new.memory == 0 || new.disk == 0 {
+            return Err("a machine has at least 1 core, 1 GiB of memory and 1 GiB of disk".into());
+        }
+        if let Some(why) = self.over(new) {
+            return Err(why);
+        }
+        if new.disk < current.disk {
+            return Err(format!(
+                "its disk only grows: {} GiB now, which the workspace may fill",
+                current.disk
+            ));
+        }
+        Ok(new)
+    }
+}
+
 /// A Kubernetes quantity (`4Gi`, `4096Mi`, `20G`…) in whole GiB; what isn't one is an error.
 pub fn gib(quantity: &str) -> anyhow::Result<u32> {
     const GIB: u128 = 1 << 30;
@@ -239,5 +261,31 @@ mod tests {
         let why = m.over(r(9, 4, 200)).unwrap();
         assert!(why.contains("9 cores, at most 8"), "{why}");
         assert!(why.contains("200 GiB of disk, at most 100 GiB"), "{why}");
+    }
+
+    #[test]
+    fn a_change_keeps_what_is_left_out_and_never_shrinks_the_disk() {
+        let m = machines(
+            false,
+            Partial {
+                cpu: Some(8),
+                memory: None,
+                disk: Some(100),
+            },
+        );
+        let now = r(2, 4, 20);
+        let asked = |cpu, memory, disk| Partial { cpu, memory, disk };
+        assert_eq!(m.change(now, asked(Some(4), None, None)), Ok(r(4, 4, 20)));
+        assert_eq!(
+            m.change(now, asked(Some(1), Some(64), Some(40))),
+            Ok(r(1, 64, 40))
+        );
+        assert_eq!(m.change(now, Partial::default()), Ok(now));
+        let why = m.change(now, asked(Some(9), None, None)).unwrap_err();
+        assert!(why.contains("at most 8"), "{why}");
+        let why = m.change(now, asked(None, Some(0), None)).unwrap_err();
+        assert!(why.contains("at least"), "{why}");
+        let why = m.change(now, asked(None, None, Some(10))).unwrap_err();
+        assert!(why.contains("only grows"), "{why}");
     }
 }

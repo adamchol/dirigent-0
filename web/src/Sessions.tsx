@@ -12,6 +12,7 @@ import {
   ChevronRightIcon,
   CodeIcon,
   CopyIcon,
+  CpuIcon,
   EllipsisIcon,
   FolderDownIcon,
   GitBranchIcon,
@@ -62,6 +63,7 @@ import { cn } from "@/lib/utils";
 import * as api from "./api.ts";
 import type { Host, Machines, Me, ModelSettings, Part, Resources, SessionInfo, Settings } from "./api.ts";
 import { RepoAccess } from "./GitHub.tsx";
+import { MachineFields } from "./MachineDialog.tsx";
 import * as machine from "./machine.ts";
 import { DEFAULT_SETTINGS, ModelPicker } from "./ModelPicker.tsx";
 import { useTitles } from "./Rename.tsx";
@@ -243,6 +245,7 @@ export function SessionMenu(props: {
   secrets: () => void;
   remove: () => void;
   switchModel: () => void;
+  changeMachine: () => void;
 }) {
   const { info, who, changed } = props;
   const owner = info?.role === "owner";
@@ -278,6 +281,11 @@ export function SessionMenu(props: {
             {owner && (
               <DropdownMenuItem onClick={props.switchModel}>
                 <BrainIcon /> Model
+              </DropdownMenuItem>
+            )}
+            {owner && info && !info.environment && !info.archived && (
+              <DropdownMenuItem onClick={props.changeMachine}>
+                <CpuIcon /> Machine
               </DropdownMenuItem>
             )}
             <DropdownMenuItem onClick={props.openLocally}>
@@ -516,12 +524,6 @@ function SessionItems(props: {
   );
 }
 
-const MACHINE: { part: keyof Resources; label: string; unit: string }[] = [
-  { part: "cpu", label: "Cores", unit: "CPU" },
-  { part: "memory", label: "Memory", unit: "GiB" },
-  { part: "disk", label: "Disk", unit: "GiB" },
-];
-
 /** Making a session, `who`'s: a coder on a repository, or a dirigent; paid to Anthropic, or with
  * their ChatGPT plan (`connect` links one). */
 export function NewSession(props: {
@@ -718,24 +720,8 @@ export function NewSession(props: {
                       transition={{ duration: 0.25, ease: [0.23, 1, 0.32, 1] }}
                       className="overflow-hidden"
                     >
-                      <div className="grid grid-cols-3 gap-4 pt-3">
-                        {MACHINE.map((m) => (
-                          <Field key={m.part}>
-                            <FieldLabel htmlFor={`machine-${m.part}`}>{m.label}</FieldLabel>
-                            <InputGroup>
-                              <InputGroupInput
-                                id={`machine-${m.part}`}
-                                type="number"
-                                inputMode="numeric"
-                                min={1}
-                                max={machines.limits[m.part]}
-                                value={shown(m.part)}
-                                onChange={(e) => type(m.part, e.target.value)}
-                              />
-                              <InputGroupAddon align="inline-end">{m.unit}</InputGroupAddon>
-                            </InputGroup>
-                          </Field>
-                        ))}
+                      <div className="pt-3">
+                        <MachineFields shown={shown} type={type} limits={machines.limits} />
                       </div>
                       <FieldDescription className="pt-2">
                         {!machine.same(chosen, dflt) && machines.warm > 0

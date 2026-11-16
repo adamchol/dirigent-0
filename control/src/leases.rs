@@ -370,10 +370,10 @@ impl Store {
         Ok(row.map(|r| (r.get(0), r.get(1))))
     }
 
-    /// The session `id`'s model, effort and provider are `settings` from now on. Whether there
-    /// was such a session.
-    pub async fn set_settings(&self, id: Uuid, settings: &Settings) -> anyhow::Result<bool> {
-        let json = serde_json::to_value(settings)?;
+    /// The session `id`'s spec has `fields` (an object: its model, effort and provider, or its
+    /// machine) from now on. Whether there was such a session.
+    pub async fn amend(&self, id: Uuid, fields: impl serde::Serialize) -> anyhow::Result<bool> {
+        let json = serde_json::to_value(fields)?;
         let n = self
             .db
             .lock()

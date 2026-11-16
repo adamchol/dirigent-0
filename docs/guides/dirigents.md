@@ -23,7 +23,7 @@ messages are marked as coming from it (`Dirigent <id>` in the chat).
 | `send_message` | Messages a session you own, starting it if idle; a running session takes it as steering. |
 | `interrupt_session` | Interrupts a session's running turn. |
 | `start_session` / `stop_session` | Starts a session, or stops it (`now` to cancel the turn). |
-| `switch_model` | Switches a session you own to another model, effort or provider, from its next model call. |
+| `update_session` | Changes a session you own: its model, effort or provider (from its next model call), and its machine (an idle one starts on it next; a running one moves once its turn is done; the disk only grows). Reports each part, one refused not undoing the other. |
 | `request_secret` | Asks you for a secret a session you own needs (below). |
 
 It has no Bash and no files: it learns what coders did by reading their sessions, and changes code

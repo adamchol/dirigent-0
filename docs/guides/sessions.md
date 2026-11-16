@@ -36,7 +36,7 @@ The context window is 200k tokens on Anthropic and 272k on ChatGPT; long session
 ### Switching model, provider or thinking
 
 A session's model, effort and provider can change while it lives: **Model** in the session menu, the
-dirigent's `switch_model`, or `PUT /sessions/{id}/model` with `{"model", "effort", "provider"}`. The
+dirigent's `update_session`, or `PUT /sessions/{id}/model` with `{"model", "effort", "provider"}`. The
 conversation goes on whole.
 
 - **Running**, it takes them from its next model call; a call running finishes as it began. The log
@@ -64,6 +64,13 @@ On the cluster, a session runs on the **default machine** (the install's, or you
 the install lets users set one) as it is *when the session starts*, unless it asks for its own:
 cores, memory (GiB) and workspace disk (GiB), within the install's limits. A session that asked for a
 machine keeps it. See [Machines and systems](../operating/machines-and-systems.md).
+
+Its owner can change it later (**Machine** in the web's session menu, the dirigent's `update_session`, or `PUT /sessions/{id}/machine`
+with the parts to change). An idle session's next start runs on the new machine. An active one
+moves: its player stops once the turn running is done, and the next starts on the new machine at
+once, its workspace restored from its last checkpoint (taken after each turn). A stop meanwhile keeps it
+stopped. The disk only grows: each VM's workspace disk is new, filled from the checkpoint, which a
+smaller one might not hold. A session placed on a host has that host's machine and can't change it.
 
 ## Talking to it
 

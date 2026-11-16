@@ -78,6 +78,9 @@ The chat shows your messages, the replies as they stream, thinking (collapsed: *
 **Searched for**, **Found files**…), expandable to their input and output. Each turn ends with a
 marker (**Done**, **Interrupted**, **Aborted**, **Failed**) and its token usage.
 
+A session opens on its last 20 turns; scrolling to the top loads 20 more at a time (**Earlier
+turns…**), so a long session (an imported one, say) opens as fast as a short one.
+
 While a session starts, a line says what it's waiting on: **Starting a machine…**, **Restoring the
 workspace from its checkpoint…**, **Cloning owner/repo…**, **Preparing the workspace…**, **Starting
 the turn…**.
@@ -105,6 +108,7 @@ The **…** at the top:
 | **Rename** | Title (up to 80 characters) and description (up to 300). **Keep this name** (on by default) stops the agent from renaming it; off, it names it again as the work moves on. |
 | **Secrets** | The session's own secrets, and the names it gets from yours. See [Accounts and secrets](accounts-and-secrets.md#secrets). |
 | **Model** | Its model, effort and provider; running, it takes them from its next call. See [Sessions](sessions.md#switching-model-provider-or-thinking). |
+| **Machine** | Its cores, memory and disk, on the cluster. Idle, its next start runs on them; running, it moves once its turn is done. See [Sessions](sessions.md#machine). |
 | **Runs on** | (Idle sessions.) The cluster or one of your hosts, for its next start. A session placed on a host that isn't connected shows it as **(not connected)**. |
 | **Open locally** | The commands to follow its workspace on your machine (`dirigent login`, `dirigent sync`). |
 | **Copy ID** | The session's id. |

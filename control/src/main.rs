@@ -287,8 +287,17 @@ struct Attached {
     /// Which connection, so that one a player left for a new one doesn't end the lease when it
     /// drops.
     conn: u64,
-    /// Set when the session is stopped: whether its player should stop now.
-    detach: watch::Sender<Option<bool>>,
+    /// Set when the session is stopped, or moves to another machine.
+    detach: watch::Sender<Option<Detaching>>,
+}
+
+/// Why a player is told to detach.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Detaching {
+    /// Whether it stops now, cancelling the turn running, or once it's done.
+    now: bool,
+    /// Whether the next player starts once it's gone: the session moves to another machine.
+    again: bool,
 }
 
 #[tokio::main]
@@ -472,6 +481,7 @@ fn router(control: &'static Control) -> Router {
             axum::routing::put(put_environment),
         )
         .route("/sessions/{id}/model", axum::routing::put(put_model))
+        .route("/sessions/{id}/machine", axum::routing::put(put_machine))
         .route(
             "/sessions/{id}/import",
             post(start_import).delete(finish_import),
@@ -1037,7 +1047,7 @@ async fn put_model(
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "no model".into()));
     }
     payable(control, settings.provider, &caller).await?;
-    match control.store.set_settings(id, &settings).await {
+    match control.store.amend(id, &settings).await {
         Ok(true) => {}
         Ok(false) => return Err(not_found()),
         Err(e) => return Err(failed(&format!("switching the session {id}'s model"), e)),
@@ -1045,6 +1055,82 @@ async fn put_model(
     info!(session = %id, ?settings, "session's model switched");
     changed(control, Changed::Settings(id));
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The session's machine is another (what's left out kept as it is): idle, its next player
+/// starts on it (`204`); active, its player is told to detach once its turn is done, and the next
+/// one starts on it then (`202`). Its disk only grows, and a session on a host has that host's.
+async fn put_machine(
+    State(control): State<&'static Control>,
+    Caller(caller): Caller,
+    Path(id): Path<Uuid>,
+    Json(asked): Json<Partial>,
+) -> Result<StatusCode, Failed> {
+    owned(control, id, &caller).await?;
+    match control.store.placement(id).await {
+        Ok(Some((_, Some(host)))) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("the session runs on your host {host}, whose machine it has"),
+            ))
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(not_found()),
+        Err(e) => return Err(failed(&format!("reading the session {id}"), e)),
+    }
+    let current = match control.store.machine(id).await {
+        Ok(m) => m.unwrap_or(control.machines.defaults),
+        Err(e) => return Err(failed(&format!("reading the session {id}'s machine"), e)),
+    };
+    let machine = control.machines.change(current, asked).map_err(|why| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("not that machine: {why}"),
+        )
+    })?;
+    if machine == current {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let attached = control.attached.lock().await;
+    match control
+        .store
+        .amend(id, serde_json::json!({ "resources": machine }))
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return Err(not_found()),
+        Err(e) => return Err(failed(&format!("changing the session {id}'s machine"), e)),
+    }
+    if let Some(a) = attached.get(&id) {
+        // stopping already: it stays stopped, on the new machine when it starts again
+        a.detach.send_if_modified(|d| {
+            let move_ = d.is_none();
+            if move_ {
+                *d = Some(Detaching {
+                    now: false,
+                    again: true,
+                });
+            }
+            move_
+        });
+        info!(session = %id, ?machine, "session moving to another machine");
+        return Ok(StatusCode::ACCEPTED);
+    }
+    // a player on its way (on the old machine), or away: the lease is taken from it
+    let dropped = control.store.drop_lease(id).await;
+    drop(attached);
+    match dropped {
+        Ok(false) => {
+            info!(session = %id, ?machine, "session's machine changed");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(true) => {
+            info!(session = %id, ?machine, "session moving to another machine; its player wasn't connected");
+            started(id, start(control, id).await)?;
+            Ok(StatusCode::ACCEPTED)
+        }
+        Err(e) => Err(failed(&format!("moving the session {id}"), e)),
+    }
 }
 
 /// The caller's settings, defaults for those they haven't set.
@@ -1579,9 +1665,13 @@ async fn stop_session(
     let now = body.map(|b| b.0).unwrap_or_default().now;
     let attached = control.attached.lock().await;
     if let Some(a) = attached.get(&id) {
-        // a stop that's now stays so
-        a.detach
-            .send_modify(|d| *d = Some(now || d.unwrap_or(false)));
+        // a stop that's now stays so; a stop ends a move
+        a.detach.send_modify(|d| {
+            *d = Some(Detaching {
+                now: now || d.is_some_and(|d| d.now),
+                again: false,
+            })
+        });
         info!(session = %id, now, "session stopping");
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -2239,14 +2329,14 @@ impl Held {
 /// A held lease, until its call ends: then given back (the player ended its stream) or kept
 /// for the grace period (the call broke). Meanwhile the player's credentials are sent afresh
 /// halfway through their life, and at once when what they're made of changes (a key, a
-/// secret). Given back after a `Handoff`, the next player is started at once, unless the session
-/// was stopped.
+/// secret). Given back after a `Handoff`, or once it's detached to move to another machine, the
+/// next player is started at once, unless the session was stopped.
 async fn hold(
     control: &'static Control,
     mut held: Held,
     mut inbound: Streaming<pb::FromPlayer>,
     tx: mpsc::Sender<Result<pb::ToPlayer, Status>>,
-    mut detached: watch::Receiver<Option<bool>>,
+    mut detached: watch::Receiver<Option<Detaching>>,
 ) {
     let (session, conn) = (held.session, held.conn);
     let subject = held.subject.clone();
@@ -2313,7 +2403,7 @@ async fn hold(
                 Err(_) => break false,
             },
             Ok(()) = detached.changed() => {
-                let Some(now) = *detached.borrow_and_update() else { continue };
+                let Some(Detaching { now, .. }) = *detached.borrow_and_update() else { continue };
                 let detach = pb::ToPlayer {
                     msg: Some(pb::to_player::Msg::Detach(pb::Detach { now })),
                 };
@@ -2343,9 +2433,11 @@ async fn hold(
             return;
         }
     }
-    if closed && handoff && detached.borrow().is_none() {
+    // handed over, unless it was stopped meanwhile; or moving to another machine
+    let again = detached.borrow().map_or(handoff, |d| d.again);
+    if closed && again {
         match start(control, session).await {
-            Ok(started) => info!(session = %session, ?started, "handed over"),
+            Ok(started) => info!(session = %session, ?started, handoff, "started again"),
             Err(e) => error!(session = %session, "starting the next player: {e:#}"),
         }
     }
@@ -3229,6 +3321,124 @@ mod e2e {
         info_until(&base, s, |i| i.player.is_none()).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(runner.of(s).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn e2e_a_sessions_machine_changes_for_its_next_player_and_an_active_one_moves() {
+        let runner = recorder(false);
+        let machines = Machines {
+            limits: Partial {
+                cpu: Some(8),
+                ..Default::default()
+            },
+            ..test_machines()
+        };
+        let Some(base) = start_all(
+            None,
+            Duration::from_secs(600),
+            false,
+            None,
+            None,
+            no_github(),
+            STARTUP,
+            None,
+            Some(machines),
+            |_| runner,
+        )
+        .await
+        else {
+            return;
+        };
+        async fn change(base: &Ctl, s: Uuid, to: serde_json::Value) -> reqwest::StatusCode {
+            let path = format!("/sessions/{s}/machine");
+            let (status, why) = send_json(base, A, reqwest::Method::PUT, &path, to).await;
+            assert!(status.as_u16() < 500, "{status}: {why}");
+            status
+        }
+        let machine = |cpu, memory, disk| Resources { cpu, memory, disk };
+        let on = |m: Resources| Some(m);
+        let last = |s: Uuid| {
+            let got = runner.machines.lock().unwrap();
+            got.iter().rev().find(|(of, _)| *of == s).map(|(_, m)| *m)
+        };
+        let acquired_on = |epoch, m| Reply::Acquired {
+            epoch,
+            spec: SessionSpec {
+                resources: Some(m),
+                ..SessionSpec::default()
+            },
+        };
+        let s = Uuid::new_v4();
+        put(&base, s).await;
+
+        // idle: kept for the next player, what's left out as it was (the cluster's 2, 4, 20)
+        let to = serde_json::json!({ "cpu": 4 });
+        assert_eq!(change(&base, s, to).await, reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(info(&base, s).await.spec.resources, on(machine(4, 4, 20)));
+        assert!(runner.of(s).is_empty());
+        post(&base, &format!("/sessions/{s}/start"), None).await;
+        assert_eq!(last(s), on(machine(4, 4, 20)));
+
+        // its player on its way, on the old one: the lease is taken from it, another started
+        let to = serde_json::json!({ "memory": 8 });
+        assert_eq!(change(&base, s, to).await, reqwest::StatusCode::ACCEPTED);
+        let got = started_n(runner, s, 2).await;
+        assert_eq!(last(s), on(machine(4, 8, 20)));
+
+        // its player connected: told to detach, and the next started once it's gone
+        let mut ws = connect(&base).await;
+        let reply = acquire(&mut ws, s, &got[1].0, Some(got[1].1)).await;
+        assert_eq!(reply, acquired_on(got[1].1, machine(4, 8, 20)));
+        let to = serde_json::json!({ "disk": 40 });
+        assert_eq!(change(&base, s, to).await, reqwest::StatusCode::ACCEPTED);
+        assert_eq!(next(&mut ws).await, Reply::Detach { now: false });
+        ws.close().await;
+        let got = started_n(runner, s, 3).await;
+        assert_eq!(last(s), on(machine(4, 8, 40)));
+
+        // stopped while it moves, it stays stopped
+        let mut ws = connect(&base).await;
+        let reply = acquire(&mut ws, s, &got[2].0, Some(got[2].1)).await;
+        assert_eq!(reply, acquired_on(got[2].1, machine(4, 8, 40)));
+        let to = serde_json::json!({ "cpu": 6 });
+        assert_eq!(change(&base, s, to).await, reqwest::StatusCode::ACCEPTED);
+        assert_eq!(next(&mut ws).await, Reply::Detach { now: false });
+        post(&base, &format!("/sessions/{s}/stop"), None).await;
+        assert_eq!(next(&mut ws).await, Reply::Detach { now: false });
+        ws.close().await;
+        info_until(&base, s, |i| i.player.is_none()).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(runner.of(s).len(), 3);
+
+        // the same machine: nothing; a smaller disk, over the limits, none: refused
+        let to = serde_json::json!({ "cpu": 6 });
+        assert_eq!(change(&base, s, to).await, reqwest::StatusCode::NO_CONTENT);
+        for to in [
+            serde_json::json!({ "disk": 20 }),
+            serde_json::json!({ "cpu": 9 }),
+            serde_json::json!({ "memory": 0 }),
+        ] {
+            let status = change(&base, s, to).await;
+            assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        assert_eq!(info(&base, s).await.spec.resources, on(machine(6, 8, 40)));
+        // a session on a host has the host's
+        let placed = send_json(
+            &base,
+            A,
+            reqwest::Method::PUT,
+            &format!("/sessions/{s}/environment"),
+            serde_json::json!({ "host": "mac" }),
+        )
+        .await;
+        assert_eq!(placed.0, reqwest::StatusCode::NO_CONTENT);
+        let to = serde_json::json!({ "cpu": 8 });
+        assert_eq!(change(&base, s, to).await, reqwest::StatusCode::CONFLICT);
+        // only its owner's
+        let path = format!("/sessions/{s}/machine");
+        let to = serde_json::json!({ "cpu": 8 });
+        let (status, _) = send_json(&base, B, reqwest::Method::PUT, &path, to).await;
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

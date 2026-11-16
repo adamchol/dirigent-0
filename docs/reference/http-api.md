@@ -37,6 +37,7 @@ they're rows written into the session's log through chlive. See [Events](events.
 | `POST /sessions/{id}/unarchive` | | `204` | owner |
 | `PUT /sessions/{id}/environment` | `{"host": "<name>" \| null}` | `204`: where it runs from its next start (`null`, the cluster) | owner |
 | `PUT /sessions/{id}/model` | `{"model", "effort", "provider"}` (`effort` `null`: no thinking; `provider` default `anthropic`) | `204`: its player, if one runs, takes them before its next model call; otherwise its next one starts with them. `422` no model, or no working ChatGPT link | owner |
+| `PUT /sessions/{id}/machine` | `{"cpu", "memory", "disk"}` (each optional: what's left out stays) | `204`: idle, its next start runs on it (or it's the same machine). `202`: active, it moves: its player stops once its turn is done and the next starts on the new machine. `409` placed on a host; `422` over the limits, a part under 1, or a smaller disk | owner |
 | `PUT /sessions/{id}/viewers/{subject}` | | `204` | owner |
 | `DELETE /sessions/{id}/viewers/{subject}` | | `204` | owner |
 | `POST /sessions/{id}/import` | | `{"token"}`: a chlive token to write an imported conversation. `409` once the session has run. | owner |

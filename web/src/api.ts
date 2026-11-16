@@ -163,6 +163,12 @@ export async function setModel(who: Who, id: string, settings: ModelSettings) {
   await call(who, "PUT", `/sessions/${id}/model`, settings);
 }
 
+/** The session's machine is `resources` from now on: whether it moves to it (an active one,
+ * once its turn is done), or just starts on it next. */
+export async function setMachine(who: Who, id: string, resources: Partial<Resources>): Promise<boolean> {
+  return (await call(who, "PUT", `/sessions/${id}/machine`, resources)).status === 202;
+}
+
 /** Place the session on `who`'s host `host` (none: the cluster), for its next start. */
 export async function placeOn(who: Who, id: string, host: string | null) {
   await call(who, "PUT", `/sessions/${id}/environment`, { host });

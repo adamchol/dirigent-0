@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use async_trait::async_trait;
 use chlive_client::{ClientOptions, LiveClient};
-use dirigent_protocol::control::{pb, Effort, Role, SessionInfo};
+use dirigent_protocol::control::{pb, Effort, Provider, Role, SessionInfo, Settings};
 use dirigent_protocol::fold::Fold;
 use dirigent_protocol::rows::{EventRow, EVENTS, LOG_QUERY};
 use dirigent_protocol::{ContentBlock, Event, Update};
@@ -89,7 +89,7 @@ impl Director {
             Arc::new(InterruptSession(self.clone())),
             Arc::new(StartSession(self.clone())),
             Arc::new(StopSession(self.clone())),
-            Arc::new(SwitchModel(self.clone())),
+            Arc::new(UpdateSession(self.clone())),
             Arc::new(RequestSecret(self.clone())),
         ]
     }
@@ -197,6 +197,70 @@ fn spec(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 
 const SESSION: &str = "The session's id (a UUID).";
 
+const EFFORT: &str = "How hard it thinks; none: no extended thinking.";
+const PROVIDER: &str = "Who its model calls are paid to: Anthropic, or its owner's ChatGPT plan.";
+
+/// `input`'s `effort`, if it has one: `Some(None)` for none (no extended thinking).
+fn effort_of(input: &Value) -> Result<Option<Option<Effort>>, String> {
+    match opt_str(input, "effort") {
+        None => Ok(None),
+        Some("none") => Ok(Some(None)),
+        Some(e) => serde_json::from_value::<Effort>(json!(e))
+            .map(|e| Some(Some(e)))
+            .map_err(|_| format!("{e:?} isn't an effort")),
+    }
+}
+
+/// The machine's parts `input` gives (`cpu`, `memory`, `disk`), as control takes them; `None`
+/// with none.
+fn machine_of(input: &Value) -> Result<Option<Value>, String> {
+    let mut machine = serde_json::Map::new();
+    for part in ["cpu", "memory", "disk"] {
+        match input.get(part) {
+            None | Some(Value::Null) => {}
+            Some(n) if n.as_u64().is_some_and(|n| n > 0) => {
+                machine.insert(part.into(), n.clone());
+            }
+            Some(n) => return Err(format!("{part}: {n} isn't a positive integer")),
+        }
+    }
+    Ok((!machine.is_empty()).then_some(Value::Object(machine)))
+}
+
+/// The settings `current` changes to as `input` asks (`model`, `effort`, `provider`), if it asks
+/// for any.
+fn settings_of(input: &Value, current: Settings) -> Result<Option<Settings>, String> {
+    let mut settings = current;
+    let mut asked = false;
+    if let Some(m) = opt_str(input, "model") {
+        settings.model = m.to_string();
+        asked = true;
+    }
+    if let Some(e) = effort_of(input)? {
+        settings.effort = e;
+        asked = true;
+    }
+    if let Some(p) = opt_str(input, "provider") {
+        settings.provider =
+            serde_json::from_value(json!(p)).map_err(|_| format!("{p:?} isn't a provider"))?;
+        asked = true;
+    }
+    Ok(asked.then_some(settings))
+}
+
+fn settings_line(s: &Settings) -> String {
+    format!(
+        "{}, effort {}, on {}",
+        s.model,
+        s.effort
+            .map_or("none".into(), |e| format!("{e:?}").to_lowercase()),
+        match s.provider {
+            Provider::Anthropic => "Anthropic",
+            Provider::Chatgpt => "a ChatGPT plan",
+        }
+    )
+}
+
 struct ListSessions(Arc<Director>);
 
 #[async_trait]
@@ -277,7 +341,7 @@ impl Tool for CreateSession {
                 "git": { "type": "string", "description": "The repository's URL (public)." },
                 "ref": { "type": "string", "description": "A branch or tag." },
                 "model": { "type": "string", "description": "The model; by default the default one." },
-                "effort": { "type": "string", "enum": ["low", "medium", "high", "max", "none"], "description": "How hard it thinks; none: no extended thinking." },
+                "effort": { "type": "string", "enum": ["low", "medium", "high", "max", "none"], "description": EFFORT },
                 "cpu": { "type": "integer", "minimum": 1, "description": "Its machine's cores; by default the default machine's (your user's, or the cluster's)." },
                 "memory": { "type": "integer", "minimum": 1, "description": "Its machine's memory, in GiB; by default the default machine's." },
                 "disk": { "type": "integer", "minimum": 1, "description": "Its workspace's disk, in GiB; by default the default machine's." },
@@ -307,22 +371,15 @@ impl Tool for CreateSession {
         if let Some(m) = opt_str(&input, "model") {
             body["model"] = json!(m);
         }
-        match opt_str(&input, "effort") {
-            Some("none") => body["effort"] = Value::Null,
-            Some(e) => match serde_json::from_value::<Effort>(json!(e)) {
-                Ok(_) => body["effort"] = json!(e),
-                Err(_) => return ToolOutput::error(format!("{e:?} isn't an effort")),
-            },
-            None => {}
+        match effort_of(&input) {
+            Ok(Some(e)) => body["effort"] = json!(e),
+            Ok(None) => {}
+            Err(e) => return ToolOutput::error(e),
         }
-        for part in ["cpu", "memory", "disk"] {
-            match input.get(part) {
-                None | Some(Value::Null) => {}
-                Some(n) if n.as_u64().is_some_and(|n| n > 0) => body["resources"][part] = n.clone(),
-                Some(n) => {
-                    return ToolOutput::error(format!("{part}: {n} isn't a positive integer"))
-                }
-            }
+        match machine_of(&input) {
+            Ok(Some(m)) => body["resources"] = m,
+            Ok(None) => {}
+            Err(e) => return ToolOutput::error(e),
         }
         let id = uuid::Uuid::new_v4().to_string();
         let path = format!("/sessions/{id}");
@@ -486,19 +543,22 @@ impl Tool for StopSession {
     }
 }
 
-struct SwitchModel(Arc<Director>);
+struct UpdateSession(Arc<Director>);
 
 #[async_trait]
-impl Tool for SwitchModel {
+impl Tool for UpdateSession {
     fn spec(&self) -> ToolSpec {
         spec(
-            "switch_model",
-            "Switch a session you own to another model, effort or provider; what you leave out stays as it is. A running session takes it from its next model call on, which reads its whole conversation afresh (uncached) once; an idle one starts with it.",
+            "update_session",
+            "Change a session you own: its model, effort or provider, and its machine; what you leave out stays as it is. A running session takes a new model from its next model call on, which reads its whole conversation afresh (uncached) once. A new machine: an idle session starts on it next; a running one moves, its player stopping once the turn running is done and the next starting on the new machine at once, its workspace as it was after its last turn. The disk only grows.",
             json!({
                 "session": { "type": "string", "description": SESSION },
                 "model": { "type": "string", "description": "The model." },
-                "effort": { "type": "string", "enum": ["low", "medium", "high", "max", "none"], "description": "How hard it thinks; none: no extended thinking." },
-                "provider": { "type": "string", "enum": ["anthropic", "chatgpt"], "description": "Who its model calls are paid to: Anthropic, or its owner's ChatGPT plan." }
+                "effort": { "type": "string", "enum": ["low", "medium", "high", "max", "none"], "description": EFFORT },
+                "provider": { "type": "string", "enum": ["anthropic", "chatgpt"], "description": PROVIDER },
+                "cpu": { "type": "integer", "minimum": 1, "description": "Its machine's cores." },
+                "memory": { "type": "integer", "minimum": 1, "description": "Its machine's memory, in GiB." },
+                "disk": { "type": "integer", "minimum": 1, "description": "Its workspace's disk, in GiB: no less than now." }
             }),
             &["session"],
         )
@@ -513,6 +573,10 @@ impl Tool for SwitchModel {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(e),
         };
+        let machine = match machine_of(&input) {
+            Ok(m) => m,
+            Err(e) => return ToolOutput::error(e),
+        };
         let path = format!("/sessions/{session}");
         let info: SessionInfo = match self.0.api(reqwest::Method::GET, &path, None).await {
             Ok(r) => match r.json().await {
@@ -521,39 +585,49 @@ impl Tool for SwitchModel {
             },
             Err(e) => return ToolOutput::error(e),
         };
-        let mut settings = info.spec.settings();
-        if let Some(m) = opt_str(&input, "model") {
-            settings.model = m.to_string();
+        let settings = match settings_of(&input, info.spec.settings()) {
+            Ok(s) => s,
+            Err(e) => return ToolOutput::error(e),
+        };
+        if settings.is_none() && machine.is_none() {
+            return ToolOutput::error(
+                "nothing to change: give a model, effort, provider or machine",
+            );
         }
-        match opt_str(&input, "effort") {
-            Some("none") => settings.effort = None,
-            Some(e) => match serde_json::from_value::<Effort>(json!(e)) {
-                Ok(e) => settings.effort = Some(e),
-                Err(_) => return ToolOutput::error(format!("{e:?} isn't an effort")),
-            },
-            None => {}
-        }
-        if let Some(p) = opt_str(&input, "provider") {
-            match serde_json::from_value(json!(p)) {
-                Ok(p) => settings.provider = p,
-                Err(_) => return ToolOutput::error(format!("{p:?} isn't a provider")),
+        // each part as control answered it; one refused doesn't undo the other
+        let mut done = Vec::new();
+        let mut refused = Vec::new();
+        if let Some(settings) = settings {
+            let path = format!("/sessions/{session}/model");
+            match self
+                .0
+                .api(reqwest::Method::PUT, &path, Some(json!(settings)))
+                .await
+            {
+                Ok(_) => done.push(format!("Model: now {}.", settings_line(&settings))),
+                Err(e) => refused.push(format!("Model: not switched, {e}.")),
             }
         }
-        let body = Some(json!(settings));
-        let path = format!("/sessions/{session}/model");
-        match self.0.api(reqwest::Method::PUT, &path, body).await {
-            Ok(_) => ToolOutput::ok(format!(
-                "Switched: {}, effort {}, on {}.",
-                settings.model,
-                settings
-                    .effort
-                    .map_or("none".into(), |e| format!("{e:?}").to_lowercase()),
-                match settings.provider {
-                    dirigent_protocol::control::Provider::Anthropic => "Anthropic",
-                    dirigent_protocol::control::Provider::Chatgpt => "a ChatGPT plan",
+        if let Some(machine) = machine {
+            let path = format!("/sessions/{session}/machine");
+            match self.0.api(reqwest::Method::PUT, &path, Some(machine)).await {
+                Ok(r) if r.status() == reqwest::StatusCode::ACCEPTED => {
+                    done.push("Machine: changed; it moves to it once its turn is done.".into())
                 }
-            )),
-            Err(e) => ToolOutput::error(e),
+                Ok(_) => done.push("Machine: changed; it starts on it next.".into()),
+                Err(e) => refused.push(format!("Machine: not changed, {e}.")),
+            }
+        }
+        let text = done
+            .iter()
+            .chain(&refused)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if done.is_empty() {
+            ToolOutput::error(text)
+        } else {
+            ToolOutput::ok(text)
         }
     }
 }
@@ -960,6 +1034,34 @@ mod tests {
         let mut r = EventRow::new("s", id.into(), ev);
         r.offset = offset;
         r
+    }
+
+    #[test]
+    fn an_update_changes_what_it_gives_and_keeps_the_rest() {
+        let now = Settings {
+            model: "claude-sonnet-5".into(),
+            effort: Some(Effort::High),
+            provider: Default::default(),
+        };
+        // nothing asked of either
+        let none = json!({ "session": "s" });
+        assert_eq!(settings_of(&none, now.clone()), Ok(None));
+        assert_eq!(machine_of(&none), Ok(None));
+        // the model only, its effort kept; none, no thinking
+        let to = settings_of(&json!({ "model": "claude-opus-5-5" }), now.clone()).unwrap();
+        assert_eq!(to.as_ref().map(|s| s.effort), Some(Some(Effort::High)));
+        assert_eq!(to.unwrap().model, "claude-opus-5-5");
+        let to = settings_of(&json!({ "effort": "none" }), now.clone()).unwrap();
+        assert_eq!(to.unwrap().effort, None);
+        assert!(settings_of(&json!({ "effort": "huge" }), now.clone()).is_err());
+        assert!(settings_of(&json!({ "provider": "x" }), now).is_err());
+        // the parts of the machine given, as control takes them
+        assert_eq!(
+            machine_of(&json!({ "cpu": 8, "disk": 40, "memory": null })),
+            Ok(Some(json!({ "cpu": 8, "disk": 40 })))
+        );
+        assert!(machine_of(&json!({ "cpu": 0 })).is_err());
+        assert!(machine_of(&json!({ "memory": "16" })).is_err());
     }
 
     #[test]
