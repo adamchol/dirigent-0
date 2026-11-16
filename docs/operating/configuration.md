@@ -136,6 +136,7 @@ fit together.
 | `nix.shared.every` | `3600` | At most one new generation this often (seconds). |
 | `nix.shared.keep` | `3` | Generations kept besides those in use. |
 | `nix.shared.promote` | `upstream` | What goes in: `upstream` (only paths cache.nixos.org signed) or `all` (everything sessions build or fetch: shared between all users' sessions, for mutually trusting users only). |
+| `nix.shared.virtiofs.resources` | 64Mi, 10m; at most 1Gi, 1 core | Each VM's virtiofsd, serving it the store (KubeVirt's own 80M is too little for big builds: killed, it hangs what reads the store in its VM). |
 
 ## control
 

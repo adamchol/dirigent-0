@@ -194,6 +194,13 @@ nix:
     # session can put what it likes in paths every later session uses. Only for a cluster whose
     # sessions trust each other.
     promote: upstream
+    # Each VM's virtiofsd, which serves it this store: KubeVirt gives it 80M and a tenth of a
+    # core, which a build reading much of the store goes over. Killed, it doesn't come back, and
+    # whatever reads the store in the VM hangs, unkillable, until the VM is gone.
+    virtiofs:
+      resources:
+        requests: { cpu: 10m, memory: 64Mi }
+        limits: { cpu: "1", memory: 1Gi }
 
 control:
   resources:

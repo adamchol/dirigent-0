@@ -22,7 +22,9 @@ spec:
 {{- /* KubeVirt runs each VM's virtiofsd as a plain container of its pod, which gets SIGTERM as
 soon as the VM is deleted or evicted, while the VM still has its grace period: the shared store
 would go from under it, and whatever runs from it (the player's tools, the VM's own shutdown)
-hang. This holds virtiofsd until its VM is gone: it stops by itself once QEMU lets go of it. */}}
+hang. This holds virtiofsd until its VM is gone: it stops by itself once QEMU lets go of it. It
+also gives virtiofsd more than KubeVirt's 80M: killed, it doesn't come back, and the same hangs
+follow. */}}
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicy
@@ -60,6 +62,17 @@ spec:
                   }
                 }
               }
+            })
+    # and gives virtiofsd what a build reading much of the store needs (nix.shared.virtiofs)
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          lists.range(size(object.spec.containers))
+            .filter(i, object.spec.containers[i].name.startsWith('virtiofs-'))
+            .map(i, JSONPatch{
+              op: 'add',
+              path: '/spec/containers/' + string(i) + '/resources',
+              value: {{ .Values.nix.shared.virtiofs.resources | toJson }}
             })
 ---
 apiVersion: admissionregistration.k8s.io/v1

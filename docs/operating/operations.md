@@ -117,6 +117,15 @@ a valid lease token tried to take a session: an older release's player (0.1.9 ch
 VM booted into a players' system built with an older player. Upgrading replaces them as sessions
 restart.
 
+**A session's command hangs, and the VM won't stop.** With the shared Nix store, the VM's
+virtiofsd (its pod's `virtiofs-dirigent-nix` container) may have run out of memory:
+`kubectl -n dirigent get pod <virt-launcher pod>` shows `OOMKilled`, and the VM's console
+`task … blocked for more than … seconds`. Whatever reads the store in that VM then hangs for good,
+and can't be killed. A stop still ends the turn (the command is left behind), but the VM's own
+shutdown hangs too, until `player.stopGrace` is up. Delete its launcher pod with
+`--grace-period=0 --force`, and give virtiofsd more (`nix.shared.virtiofs.resources`): new VMs
+get it.
+
 **The players' system is broken.** See [Machines and
 systems](machines-and-systems.md#the-clusters-own-system): the Events say why, and the stock system
 runs until the configuration changes.
