@@ -940,10 +940,22 @@ async fn run_one(
             _ = token.cancelled() => ToolOutput::error(ABORTED_TOOL_RESULT),
         }
     } else {
-        // Mutating tools (Bash) honour the token themselves and report how far they got.
-        tool.call(call.input.clone(), ctx, token).await
+        // Mutating tools (Bash) honour the token themselves and report how far they got, given
+        // a moment for it: one that doesn't report by then doesn't hold the turn.
+        let out = tool.call(call.input.clone(), ctx, token.clone());
+        tokio::pin!(out);
+        tokio::select! {
+            out = &mut out => out,
+            _ = token.cancelled() => tokio::time::timeout(TO_REPORT, out)
+                .await
+                .unwrap_or_else(|_| ToolOutput::error(ABORTED_TOOL_RESULT)),
+        }
     }
 }
+
+/// How long a mutating tool has to report once its turn is interrupted (Bash's own waits, for a
+/// command's shell and its output, fit in it).
+const TO_REPORT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn log_event(ev: &Event) {
     match ev {
@@ -1029,7 +1041,7 @@ mod tests {
     use super::*;
     use crate::history::ABORT_MARKER;
     use crate::provider::mock::{MockProvider, Script};
-    use crate::provider::{Delta, ProviderError, Role, Usage};
+    use crate::provider::{Delta, ProviderError, Role, ToolSpec, Usage};
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::Mutex;
@@ -1037,6 +1049,47 @@ mod tests {
 
     /// The context window of the tests' model.
     const WINDOW: u64 = 1_000_000;
+
+    /// A mutating tool that never ends, whatever the token says.
+    struct Stuck;
+
+    #[async_trait]
+    impl crate::tools::Tool for Stuck {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "Stuck".into(),
+                description: String::new(),
+                input_schema: json!({}),
+            }
+        }
+        fn read_only(&self) -> bool {
+            false
+        }
+        async fn call(&self, _: Value, _: &ToolCtx, _: CancellationToken) -> ToolOutput {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupt_ends_a_mutating_tool_that_ignores_it() {
+        let (_d, ctx) = crate::tools::testing::ctx();
+        let call = Call {
+            id: "c".into(),
+            name: "Stuck".into(),
+            input: json!({}),
+        };
+        let token = CancellationToken::new();
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            t2.cancel();
+        });
+        let started = tokio::time::Instant::now();
+        let out = run_one(&Stuck, &call, &ctx, token).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(60) + TO_REPORT);
+        assert!(out.is_error);
+        assert_eq!(out.content, ABORTED_TOOL_RESULT);
+    }
 
     /// What the sessions start with: the mock, thinking none.
     fn mock_settings() -> Settings {

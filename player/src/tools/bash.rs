@@ -15,6 +15,8 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 pub const MAX_OUTPUT_CHARS: usize = 30_000;
 pub const HEAD_CHARS: usize = 20_000;
+/// How long the output may take to end once the command has, or has been cut.
+const DRAIN: Duration = Duration::from_secs(2);
 
 /// The player's variables a command gets: what a shell and the usual tools need, never its
 /// own (its credentials, the stack's addresses).
@@ -102,21 +104,33 @@ impl Tool for Bash {
         let mut output = String::new();
         let mut timed_out = false;
         let mut cancelled = false;
-        let status = tokio::select! {
+        let mut status = tokio::select! {
             s = child.wait() => s.ok(),
             _ = tokio::time::sleep(timeout) => {
                 timed_out = true;
-                if let Some(pid) = pid { kill_group(pid); }
-                child.wait().await.ok()
+                None
             }
             _ = cancel.cancelled() => {
                 cancelled = true;
-                if let Some(pid) = pid { kill_group(pid); }
-                child.wait().await.ok()
+                None
             }
         };
-        // Pumps finish once the pipes close (the group kill closes them).
-        while pumps.join_next().await.is_some() {}
+        // Cut, its group is killed and the shell has a moment to go: one that can't (stuck in
+        // the kernel, say on a store gone from under it) is left behind, not waited for.
+        if timed_out || cancelled {
+            if let Some(pid) = pid {
+                kill_group(pid);
+            }
+            status = tokio::time::timeout(DRAIN, child.wait())
+                .await
+                .ok()
+                .and_then(|s| s.ok());
+        }
+        // The pipes close once nothing has them, which is at once but for what the command
+        // left running (in the background, or unkillable): that doesn't keep it.
+        let drained = async { while pumps.join_next().await.is_some() {} };
+        let _ = tokio::time::timeout(DRAIN, drained).await;
+        drop(pumps);
         while let Ok(chunk) = rx.try_recv() {
             output.push_str(&chunk);
         }
@@ -298,6 +312,45 @@ mod tests {
         assert!(out.is_error);
         assert_eq!(out.content, "started\nCommand aborted by user interrupt");
         assert_eq!(out.meta["cancelled"], true);
+    }
+
+    /// What a command leaves outside its group (here in a session of its own; on a player, also
+    /// a process the kernel won't let die) keeps its output open, which no wait may hang on.
+    #[tokio::test]
+    async fn output_held_by_what_the_command_left_doesnt_hold_the_call() {
+        let (_d, ctx) = ctx();
+        let held = "setsid sleep 30 & echo started";
+        let started = Instant::now();
+        let out = bash(&ctx, json!({ "command": held })).await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(out.content, "started");
+        assert_eq!(out.meta["exit_code"], 0);
+
+        let started = Instant::now();
+        let out = bash(
+            &ctx,
+            json!({ "command": format!("{held}; sleep 30"), "timeout": 300 }),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(out.content, "started\nCommand timed out after 0.3s");
+
+        let token = CancellationToken::new();
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            t2.cancel();
+        });
+        let started = Instant::now();
+        let out = Bash
+            .call(
+                json!({ "command": format!("{held}; sleep 30") }),
+                &ctx,
+                token,
+            )
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(out.content, "started\nCommand aborted by user interrupt");
     }
 
     #[tokio::test]
