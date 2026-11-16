@@ -2,6 +2,18 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
+## 0.1.15 (2026-11-16)
+
+### Added
+- A session's machine (cores, memory, disk) can be changed after it's made: **Machine** in the web's session menu, or `PUT /sessions/{id}/machine`. An idle session starts on it next; an active one moves, its player stopping once its turn is done and the next starting on the new machine at once. The disk only grows. A session on a host keeps the host's.
+
+### Changed
+- The dirigent's `switch_model` is now `update_session`, which also changes a session's machine: a model, effort, provider, cores, memory and disk, each optional, and it reports each part (one refused doesn't undo the other).
+
+### Fixed
+- The web was slow on a long session (an imported one, say): it read and drew the whole log. A session now opens on its last 20 turns, and scrolling to the top loads 20 more at a time.
+- A session on Anthropic could fail every call after a release changed its tools (or its system prompt): newer models bind thinking to the conversation it was made in, and accounts made since 2026-08-31 have calls replaying older thinking refused. Refused so, the player goes on without the thinking so far, once and from then on; what it thinks afterwards goes back as before.
+
 ## 0.1.14 (2026-11-16)
 
 ### Fixed
