@@ -2,6 +2,11 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
+## 0.1.14 (2026-11-16)
+
+### Fixed
+- The CLI didn't build on macOS (Homebrew, and the Cachix build of its Nix package): the player's new VM hook called `sethostname` with Linux's length type. 0.1.13's images are fine; its CLI wasn't published.
+
 ## 0.1.13 (2026-11-15)
 
 ### Added
