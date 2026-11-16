@@ -2,6 +2,12 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
+## 0.1.16 (2026-11-16)
+
+### Fixed
+- With the shared Nix store, a build reading much of it could kill the VM's virtiofsd (KubeVirt gives it 80M), after which anything reading the store in that VM hung for good, the session's turn with it. The chart now gives it 1Gi and a core (`nix.shared.virtiofs.resources`).
+- A command that left a process holding its output (in the background, or one that couldn't be killed) kept its Bash call, and so its turn, from ever ending: an interrupt or a stop was taken but did nothing. Once a command ends, times out or is cut, Bash waits for its output a moment only, and an interrupted turn ends within seconds whatever its tools do.
+
 ## 0.1.15 (2026-11-16)
 
 ### Added
