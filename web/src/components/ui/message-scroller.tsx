@@ -19,7 +19,11 @@ type Scroller = {
   /** Whether you're away from the bottom (the button shows). */
   away: boolean
   setAway: (away: boolean) => void
+  /** While earlier content comes in above: what was first, and where it was in view, kept. */
+  held: React.RefObject<Held | null>
 }
+
+type Held = { el: Element; top: number }
 
 const Context = React.createContext<Scroller | null>(null)
 
@@ -37,9 +41,10 @@ function MessageScrollerProvider({ children }: { children?: React.ReactNode }) {
   const viewport = React.useRef<HTMLDivElement | null>(null)
   const content = React.useRef<HTMLDivElement | null>(null)
   const following = React.useRef(true)
+  const held = React.useRef<Held | null>(null)
   const [away, setAway] = React.useState(false)
   const scroller = React.useMemo(
-    () => ({ viewport, content, following, away, setAway }),
+    () => ({ viewport, content, following, away, setAway, held }),
     [away]
   )
   return <Context.Provider value={scroller}>{children}</Context.Provider>
@@ -56,24 +61,38 @@ function MessageScroller({ className, ...props }: React.ComponentProps<"div">) {
 }
 
 function MessageScrollerViewport({ className, onScroll, ...props }: React.ComponentProps<"div">) {
-  const { viewport, content, following, setAway } = useScroller()
+  const { viewport, content, following, setAway, held } = useScroller()
   const lastTop = React.useRef(0)
 
   // whatever changes size (the log, a streamed reply, the window), the bottom stays in view
-  // while it's followed
+  // while it's followed; while earlier content comes in above, what was in view stays
   React.useLayoutEffect(() => {
     const view = viewport.current
     const inner = content.current
     if (!view || !inner) return
     const follow = () => {
       if (following.current) toBottom(view)
+      else if (held.current) {
+        const { el, top } = held.current
+        const moved = el.getBoundingClientRect().top - view.getBoundingClientRect().top - top
+        if (moved) view.scrollTop += moved
+      }
     }
     follow()
     const observer = new ResizeObserver(follow)
     observer.observe(inner)
     observer.observe(view)
-    return () => observer.disconnect()
-  }, [viewport, content, following])
+    // scrolled by you, it's yours again
+    const release = () => {
+      held.current = null
+    }
+    const events = ["wheel", "touchmove", "keydown", "pointerdown"] as const
+    for (const e of events) view.addEventListener(e, release, { passive: true })
+    return () => {
+      observer.disconnect()
+      for (const e of events) view.removeEventListener(e, release)
+    }
+  }, [viewport, content, following, held])
 
   return (
     <div
@@ -115,6 +134,38 @@ function MessageScrollerItem({ className, ...props }: React.ComponentProps<"div"
   return <div data-slot="message-scroller-item" className={cn("min-w-0 shrink-0", className)} {...props} />
 }
 
+/** The top of what's shown, when there's more above: in view (scrolled up to, or the content's
+ * too short to scroll), it asks for `more`, and what's in view stays put as it comes in. It asks
+ * again each time `shown` changes (what came) while it's still in view. */
+function MessageScrollerTop({
+  more,
+  shown,
+  className,
+  ...props
+}: React.ComponentProps<"div"> & { more: () => void; shown: unknown }) {
+  const { viewport, held } = useScroller()
+  const top = React.useRef<HTMLDivElement | null>(null)
+  const ask = React.useRef(more)
+  ask.current = more
+  React.useEffect(() => {
+    const view = viewport.current
+    const el = top.current
+    if (!view || !el) return
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (!entry?.isIntersecting) return
+        const first = el.nextElementSibling
+        if (first) held.current = { el: first, top: first.getBoundingClientRect().top - view.getBoundingClientRect().top }
+        ask.current()
+      },
+      { root: view, rootMargin: "400px 0px 0px 0px" }
+    )
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [viewport, held, shown])
+  return <div ref={top} data-slot="message-scroller-top" className={cn("min-w-0 shrink-0", className)} {...props} />
+}
+
 /** Back to the bottom, which is then followed again; shown while you're away from it. */
 function MessageScrollerButton({ className, ...props }: React.ComponentProps<typeof Button>) {
   const { viewport, following, away, setAway } = useScroller()
@@ -148,5 +199,6 @@ export {
   MessageScrollerViewport,
   MessageScrollerContent,
   MessageScrollerItem,
+  MessageScrollerTop,
   MessageScrollerButton,
 }

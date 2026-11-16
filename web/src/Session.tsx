@@ -19,6 +19,7 @@ import {
   MessageScrollerButton,
   MessageScrollerContent,
   MessageScrollerProvider,
+  MessageScrollerTop,
   MessageScrollerViewport,
 } from "@/components/ui/message-scroller";
 import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
@@ -28,10 +29,15 @@ import * as api from "./api.ts";
 import type { SessionInfo } from "./api.ts";
 import {
   attached,
+  ATTACHED_QUERY,
+  attachedBefore,
   callStart,
   contextSize,
   DELTAS_QUERY,
+  EARLIER_QUERY,
   LOG_QUERY,
+  logStart,
+  TURN_ENDS_QUERY,
   startup,
   streamed,
   timeline,
@@ -61,6 +67,9 @@ export interface LiveStatus {
   environment?: string;
 }
 
+/** A row of the log, as chlive gives it. */
+type Row = EventRow & Record<string, unknown>;
+
 export function Session(props: {
   id: string;
   client: LiveClient;
@@ -80,23 +89,52 @@ export function Session(props: {
 }) {
   // only its owner writes to it; chlive shows anyone else without access an empty log
   const owner = props.info?.role === "owner";
-  const log = useLiveQuery<EventRow & Record<string, unknown>>(LOG_QUERY, { params: { session: props.id } });
-  const { items, openTurn } = useMemo(() => timeline(log.rows, props.shown), [log.rows, props.shown]);
-  const context = useMemo(() => contextSize(log.rows), [log.rows]);
+  // the latest turns, live, and pages of earlier ones as the chat's scrolled up to them: a long
+  // log is neither read nor shown whole
+  const params = { session: props.id };
+  const ends = useLiveQuery<{ offset: string | number }>(TURN_ENDS_QUERY, { params });
+  // where the turns had ended as it opened, as chlive has it now (a cached list can be far behind):
+  // the pages start after them, and a turn ending since doesn't move them
+  const [opened, setOpened] = useState<number[] | null>(null);
+  if (opened === null && (ends.status === "live" || ends.status === "error")) setOpened(ends.rows.map((r) => Number(r.offset)));
+  const from = opened && logStart(opened, 0);
+  const [pages, setPages] = useState(0);
+  const top = opened ? logStart(opened, pages) : 0;
+  const latest = useLiveQuery<Row>(LOG_QUERY, { params: { ...params, from: from ?? 0 }, enabled: from !== null });
+  const earlier = useLiveQuery<Row>(EARLIER_QUERY, { params: { ...params, from: top, to: from ?? 0 }, enabled: pages > 0 });
+  // the pages shown, while more of them load
+  const shownEarlier = useRef<Row[]>([]);
+  if (earlier.status === "live" || earlier.status === "cached") shownEarlier.current = earlier.rows;
+  const earlierRows = shownEarlier.current;
+  const loadingEarlier = pages > 0 && earlier.status === "loading";
+  const more = () => {
+    if (!loadingEarlier && earlier.status !== "error") setPages((n) => n + 1);
+  };
+  const log = { ...latest, status: from === null ? "loading" : latest.status };
+  const rows = useMemo(() => (earlierRows.length ? [...earlierRows, ...latest.rows] : latest.rows), [earlierRows, latest.rows]);
+
+  const { items, openTurn } = useMemo(() => timeline(rows, props.shown), [rows, props.shown]);
+  const context = useMemo(() => contextSize(rows), [rows]);
   // the user's own messages, shown before chlive has them
   const sending = useMemo(() => new Set([...(log.pending ?? [])].map((r) => r.id)), [log.pending]);
   // the reply being written: the running model call's deltas, while a turn is open
-  const after = useMemo(() => callStart(log.rows), [log.rows]);
+  const after = useMemo(() => callStart(rows), [rows]);
   const deltas = useLiveQuery<DeltaRow & Record<string, unknown>>(DELTAS_QUERY, {
     params: { session: props.id, after },
     enabled: openTurn !== undefined,
   });
   const writing = useMemo(() => (openTurn !== undefined ? streamed(deltas.rows) : []), [deltas.rows, openTurn]);
 
-  // what it waits on before its turn: its machine, its workspace, the turn's start
+  // what it waits on before its turn: its machine, its workspace, the turn's start; its player
+  // may have attached before the turns shown
   const git = props.info?.spec.source?.git;
   const holder = props.info?.player ? props.info.epoch : null;
-  const waiting = useMemo(() => startup(log.rows, holder, git ? api.repo(git.url) : undefined), [log.rows, holder, git]);
+  const attaches = useLiveQuery<Row>(ATTACHED_QUERY, { params });
+  const before = useMemo(() => attachedBefore(attaches.rows, holder, top), [attaches.rows, holder, top]);
+  const waiting = useMemo(
+    () => (attaches.status === "loading" ? null : startup(rows, holder, git ? api.repo(git.url) : undefined, before)),
+    [attaches.status, rows, holder, git, before],
+  );
   // since when: when the log says, or, earlier, when it was seen here (the log doesn't say for
   // the machine, and a log's time can be off)
   const seen = useRef<{ key: string; at: number } | null>(null);
@@ -104,7 +142,7 @@ export function Session(props: {
   if (waiting && seen.current?.key !== key) seen.current = { key, at: Date.now() };
   const since = waiting ? Math.min(waiting.since ?? Infinity, seen.current!.at) : undefined;
 
-  const player = useMemo(() => attached(log.rows, holder), [log.rows, holder]);
+  const player = useMemo(() => attached(attaches.rows, holder), [attaches.rows, holder]);
   const { version, environment } = player ?? {};
 
   const { report } = props;
@@ -121,6 +159,10 @@ export function Session(props: {
   const wasWriting = useRef(false);
   if (wasWriting.current) for (const i of items) first.current?.add(i.key);
   wasWriting.current = writing.length > 0;
+  // nor are earlier turns, coming in above
+  const lastEarlier = useRef(earlierRows);
+  if (lastEarlier.current !== earlierRows) for (const i of items) first.current?.add(i.key);
+  lastEarlier.current = earlierRows;
 
   async function write(kind: string, data: unknown) {
     try {
@@ -229,15 +271,22 @@ export function Session(props: {
                   </EmptyHeader>
                 </Empty>
               ) : (
-                <Timeline
-                  items={items}
-                  running={running}
-                  sending={sending}
-                  me={props.who.user}
-                  first={first.current ?? new Set()}
-                  streaming={writing}
-                  answer={owner ? answer : undefined}
-                />
+                <>
+                  {top > 0 && (
+                    <MessageScrollerTop more={more} shown={earlierRows} className="text-center text-xs text-muted-foreground">
+                      {earlier.status === "error" ? `Earlier turns didn't load: ${earlier.error?.message}` : "Earlier turns…"}
+                    </MessageScrollerTop>
+                  )}
+                  <Timeline
+                    items={items}
+                    running={running}
+                    sending={sending}
+                    me={props.who.user}
+                    first={first.current ?? new Set()}
+                    streaming={writing}
+                    answer={owner ? answer : undefined}
+                  />
+                </>
               )}
               {log.status !== "loading" && log.status !== "error" && waiting && <Startup label={waiting.label} since={since} />}
             </MessageScrollerContent>

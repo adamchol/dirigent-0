@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { attached, callStart, contextSize, startup, streamed, timeline, titles, type EventRow } from "./events.ts";
+import { attached, attachedBefore, callStart, contextSize, logStart, PAGE, startup, streamed, timeline, titles, type EventRow } from "./events.ts";
 
 let offset = 0;
 function row(id: string, kind: string, data?: unknown, author = "player:p"): EventRow {
@@ -333,4 +333,28 @@ test("the holder's player tells its version and where it runs", () => {
   // a holder that hasn't attached yet, or none
   expect(attached(rows, 3)).toBeUndefined();
   expect(attached(rows, null)).toBeUndefined();
+});
+
+test("the chat's pages start just after a turn ended, a page of turns apart", () => {
+  const ends = Array.from({ length: 2 * PAGE + 5 }, (_, i) => 10 * (i + 1));
+  // the latest page: its last PAGE turns, from after the one before them ended
+  expect(logStart(ends, 0)).toBe(ends[ends.length - 1 - PAGE]! + 1);
+  expect(logStart(ends, 1)).toBe(ends[ends.length - 1 - 2 * PAGE]! + 1);
+  // past the first turn, the log's start
+  expect(logStart(ends, 2)).toBe(0);
+  expect(logStart(ends.slice(0, PAGE), 0)).toBe(0);
+  expect(logStart([], 0)).toBe(0);
+});
+
+test("a player that attached before the turns shown has its workspace: it waits only on a turn", () => {
+  const attaches = [row("a1", "player_attached", { epoch: 1 }), row("a2", "player_attached", { epoch: 2 })];
+  const start = Number(attaches[1]!.offset) + 1;
+  expect(attachedBefore(attaches, 2, start)).toBe(true);
+  expect(attachedBefore(attaches, 2, start - 1)).toBe(false);
+  expect(attachedBefore(attaches, 3, start)).toBe(false);
+  expect(attachedBefore(attaches, null, start)).toBe(false);
+  const shown = [row("e", "turn_ended", { reason: "completed" })];
+  expect(startup(shown, 2, undefined, true)).toBeNull();
+  const queued = [...shown, row("m", "user_message", { text: "go" }, "user:dev")];
+  expect(startup(queued, 2, undefined, true)?.phase).toBe("turn");
 });

@@ -16,12 +16,40 @@ export interface EventRow {
   data: string;
 }
 
-/** `LOG_QUERY` (protocol/src/rows.rs): the log without its streaming deltas or its workspace's files
- * (`files_changed`, which `dirigent sync` reads), in order. */
+/** The log without its streaming deltas or its workspace's files (`files_changed`, which `dirigent
+ * sync` reads), in order: `protocol/src/rows.rs`'s `LOG_QUERY`, from offset `from` on (the chat
+ * shows the latest turns, `logStart`). */
 export const LOG_QUERY =
   "select session_id, offset, partition, ts, id, author, kind, data " +
   "from session_events where session_id = {session:UUID} " +
-  "and kind not in ('model_delta', 'files_changed') order by offset";
+  "and kind not in ('model_delta', 'files_changed') and offset >= {from:UInt64} order by offset";
+
+/** The log's rows from `from` to before `to`: earlier turns, which never change. */
+export const EARLIER_QUERY =
+  "select session_id, offset, partition, ts, id, author, kind, data " +
+  "from session_events where session_id = {session:UUID} " +
+  "and kind not in ('model_delta', 'files_changed') and offset >= {from:UInt64} and offset < {to:UInt64} order by offset";
+
+/** Where the session's turns ended: the chat's pages of the log start after them. */
+export const TURN_ENDS_QUERY =
+  "select offset from session_events where session_id = {session:UUID} and kind = 'turn_ended' order by offset";
+
+/** The session's players as they attached, the whole log's: the one holding it may have come
+ * before the turns the chat shows. */
+export const ATTACHED_QUERY =
+  "select session_id, offset, partition, ts, id, author, kind, data " +
+  "from session_events where session_id = {session:UUID} and kind = 'player_attached' order by offset";
+
+/** How many turns the chat shows at first, and adds each time it's scrolled to the top. */
+export const PAGE = 20;
+
+/** Where the chat's rows start with `pages` pages of turns before the latest page, as offsets:
+ * just after a turn ended, so a page has its turns whole; 0 for the log's start. `ends` are
+ * where the session's turns ended, in order. */
+export function logStart(ends: readonly number[], pages: number): number {
+  const i = ends.length - 1 - PAGE * (pages + 1);
+  return i < 0 ? 0 : ends[i]! + 1;
+}
 
 export type ContentBlock =
   | { type: "text"; text: string }
@@ -361,11 +389,13 @@ export interface Startup {
 }
 
 /** What the session waits on, as its log `rows` say, for the player of `epoch` that holds it
- * (none, the session's idle: it waits on nothing); `repo`, what its workspace is cloned from. */
-export function startup(rows: readonly EventRow[], epoch: number | null, repo?: string): Startup | null {
+ * (none, the session's idle: it waits on nothing); `repo`, what its workspace is cloned from.
+ * `before`: the player attached before `rows` start, a page of turns (`PAGE`) earlier, so it has
+ * its workspace. */
+export function startup(rows: readonly EventRow[], epoch: number | null, repo?: string, before = false): Startup | null {
   if (epoch === null) return null;
-  let attached: number | undefined;
-  let workspace: number | undefined;
+  let attached: number | undefined = before ? 0 : undefined;
+  let workspace: number | undefined = before ? 0 : undefined;
   let checkpoint = false;
   let open = false;
   const queued = new Map<string, number>();
@@ -591,4 +621,14 @@ export function attached(rows: readonly EventRow[], epoch: number | null): { ver
     if (e.kind === "player_attached" && e.data.epoch === epoch) return { version: e.data.version, environment: e.data.environment };
   }
   return undefined;
+}
+
+/** Whether the session's `epoch`th player (its holder's) attached before offset `start`, by the
+ * `rows` of its attaching (`ATTACHED_QUERY`). */
+export function attachedBefore(rows: readonly EventRow[], epoch: number | null, start: number): boolean {
+  if (epoch === null) return false;
+  return rows.some((row) => {
+    const e = parse(row);
+    return e.kind === "player_attached" && e.data.epoch === epoch && Number(row.offset) < start;
+  });
 }
