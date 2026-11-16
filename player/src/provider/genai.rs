@@ -11,6 +11,7 @@ use ::genai::{Client, ServiceTarget};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
+use tracing::warn;
 
 use super::{
     ContentBlock, Delta, DeltaStream, Effort, Message, Provider, ProviderError, Request, Role,
@@ -29,6 +30,41 @@ pub struct GenaiProvider {
     /// session. Without one, genai asks GPT-5.6 and later for explicit caching
     /// (`prompt_cache_options`), which a plan's calls are refused with.
     cache_key: Option<String>,
+    /// Anthropic's: the conversation's first messages that go without their thinking, since the
+    /// API refused it as bound to another conversation (thinking is bound to the system prompt
+    /// and tools it was made under, and a release may change the tools): how many, and the last.
+    unbound: std::sync::Mutex<Option<(usize, Message)>>,
+}
+
+/// Whether Anthropic refused the call for a thinking block's signature: bound to a conversation
+/// whose system prompt or tools have since changed (or not valid at all). Without the thinking
+/// blocks, the call goes through.
+fn bad_thinking(e: &ProviderError) -> bool {
+    matches!(e, ProviderError::Api { status: 400, message, .. }
+        if message.contains("`signature` in `thinking` block"))
+}
+
+/// `req` with the thinking of its first `n` messages left out (a message left with nothing,
+/// left out too). Leaving out a leading run of thinking keeps what's after it valid.
+fn without_thinking(req: &Request, n: usize) -> Request {
+    let mut req = req.clone();
+    let n = n.min(req.messages.len());
+    let (old, _) = req.messages.split_at_mut(n);
+    for msg in old {
+        msg.content
+            .retain(|b| !matches!(b, ContentBlock::Thinking { .. }));
+    }
+    req.messages.retain(|m| !m.content.is_empty());
+    req
+}
+
+/// The stream, or the error it begins with: a refused call comes as the stream's first item.
+async fn opened(open: Result<DeltaStream, ProviderError>) -> Result<DeltaStream, ProviderError> {
+    let mut stream = open?;
+    match stream.next().await {
+        Some(Err(e)) => Err(e),
+        first => Ok(futures::stream::iter(first).chain(stream).boxed()),
+    }
 }
 
 impl GenaiProvider {
@@ -49,6 +85,7 @@ impl GenaiProvider {
             plan: None,
             key: Some(key),
             cache_key: None,
+            unbound: Default::default(),
         })
     }
 
@@ -69,6 +106,7 @@ impl GenaiProvider {
             plan: Some(plan),
             key: None,
             cache_key: Some(cache_key),
+            unbound: Default::default(),
         })
     }
 
@@ -133,22 +171,44 @@ impl Provider for GenaiProvider {
 
     /// On a ChatGPT plan, an access token OpenAI refuses (expired early, revoked) is renewed by
     /// control, and the call made once more with the new one.
+    ///
+    /// On Anthropic, a call refused for its thinking (bound to the conversation as it was before
+    /// its tools or system prompt changed) is made once more without the thinking so far, and
+    /// that thinking is left out of the calls after it too.
     async fn stream(&self, req: &Request) -> Result<DeltaStream, ProviderError> {
         if let Some(key) = &self.key {
             key.current().map_err(no_key)?;
+            let n = {
+                let mut unbound = self.unbound.lock().unwrap();
+                match &*unbound {
+                    Some((n, last)) if req.messages.get(n - 1) == Some(last) => *n,
+                    // another conversation (compacted since): its thinking is its own
+                    _ => {
+                        *unbound = None;
+                        0
+                    }
+                }
+            };
+            let sent = without_thinking(req, n);
+            return match opened(self.open(&sent).await).await {
+                Err(e) if bad_thinking(&e) => {
+                    warn!(
+                        "Anthropic refused the conversation's thinking ({e}): going on without it"
+                    );
+                    let all = req.messages.len();
+                    *self.unbound.lock().unwrap() = req.messages.last().map(|m| (all, m.clone()));
+                    self.open(&without_thinking(req, all)).await
+                }
+                r => r,
+            };
         }
         let Some(plan) = &self.plan else {
             return self.open(req).await;
         };
         let token = plan.current().map_err(unavailable)?;
-        match self.open(req).await {
+        match opened(self.open(req).await).await {
             Err(e) if refused(&e) => {}
-            Err(e) => return Err(e),
-            // a refusal comes as the stream's first item
-            Ok(mut stream) => match stream.next().await {
-                Some(Err(e)) if refused(&e) => {}
-                first => return Ok(futures::stream::iter(first).chain(stream).boxed()),
-            },
+            r => return r,
         }
         plan.renewed(&token).await.map_err(unavailable)?;
         self.open(req).await
@@ -1602,5 +1662,159 @@ mod tests {
         let e = complete(&p, &plan_request()).await.unwrap_err();
         assert!(!e.retryable() && e.to_string().contains("revoked"), "{e}");
         assert_eq!(api.requests.lock().unwrap().len(), 1);
+    }
+
+    /// Anthropic's Messages API, as one that binds thinking to its conversation: a call with a
+    /// thinking block signed `OLD` (made before the tools changed) is refused; any other is
+    /// answered with a short reply, its thinking signed `NEW`. Each call's body is kept.
+    async fn binding_anthropic() -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let kept: Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let bodies = kept.clone();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |body: axum::Json<Value>| {
+                let bodies = bodies.clone();
+                async move {
+                    let stale = body.0["messages"].to_string().contains("\"OLD\"");
+                    bodies.lock().unwrap().push(body.0);
+                    if stale {
+                        let error = json!({ "type": "error", "error": { "type": "invalid_request_error",
+                            "message": "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation." } });
+                        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+                    }
+                    let events = [
+                        json!({ "type": "message_start", "message": { "id": "m", "type": "message",
+                            "role": "assistant", "model": "claude-test", "content": [],
+                            "stop_reason": null, "usage": { "input_tokens": 10, "output_tokens": 0 } } }),
+                        json!({ "type": "content_block_start", "index": 0,
+                            "content_block": { "type": "thinking", "thinking": "", "signature": "" } }),
+                        json!({ "type": "content_block_delta", "index": 0,
+                            "delta": { "type": "thinking_delta", "thinking": "hm" } }),
+                        json!({ "type": "content_block_delta", "index": 0,
+                            "delta": { "type": "signature_delta", "signature": "NEW" } }),
+                        json!({ "type": "content_block_stop", "index": 0 }),
+                        json!({ "type": "content_block_start", "index": 1,
+                            "content_block": { "type": "text", "text": "" } }),
+                        json!({ "type": "content_block_delta", "index": 1,
+                            "delta": { "type": "text_delta", "text": "done" } }),
+                        json!({ "type": "content_block_stop", "index": 1 }),
+                        json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" },
+                            "usage": { "output_tokens": 5 } }),
+                        json!({ "type": "message_stop" }),
+                    ];
+                    let sse: String = events
+                        .iter()
+                        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+                        .collect();
+                    ([("content-type", "text/event-stream")], sse).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (url, kept)
+    }
+
+    #[tokio::test]
+    async fn thinking_bound_to_the_conversation_before_its_tools_changed_is_left_out_from_then_on()
+    {
+        let (url, bodies) = binding_anthropic().await;
+        let key = AnthropicKey::of(dirigent_protocol::control::pb::Tokens {
+            anthropic: Some("k".into()),
+            ..Default::default()
+        });
+        let p = GenaiProvider::anthropic(key, Some(format!("{url}/v1/"))).unwrap();
+        let thought = |sig: &str| ContentBlock::Thinking {
+            text: "earlier".into(),
+            provider_data: json!({ "signature": sig, "anthropic": true }),
+        };
+        // a conversation from before a release changed the tools
+        let mut req = plan_request();
+        req.model = "claude-test".into();
+        req.messages = vec![
+            Message::user("hi"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    thought("OLD"),
+                    ContentBlock::Text {
+                        text: "hello".into(),
+                    },
+                ],
+            },
+            Message::user("go on"),
+        ];
+        let done = complete(&p, &req).await.unwrap();
+        assert_eq!(done.message.text(), "done");
+        let sent = |n: usize| bodies.lock().unwrap()[n]["messages"].to_string();
+        assert!(
+            sent(0).contains("OLD") && !sent(1).contains("OLD"),
+            "{}",
+            sent(1)
+        );
+        assert!(sent(1).contains("hello"), "{}", sent(1));
+
+        // from then on, the old thinking stays out (no refused call first), the new goes back
+        req.messages
+            .extend([done.message.clone(), Message::user("and?")]);
+        complete(&p, &req).await.unwrap();
+        assert_eq!(bodies.lock().unwrap().len(), 3);
+        assert!(
+            !sent(2).contains("OLD") && sent(2).contains("NEW"),
+            "{}",
+            sent(2)
+        );
+
+        // compacted: a conversation of its own, its thinking all sent
+        req.messages = vec![
+            Message::user("summary"),
+            done.message,
+            Message::user("next"),
+        ];
+        complete(&p, &req).await.unwrap();
+        assert!(sent(3).contains("NEW"), "{}", sent(3));
+    }
+
+    #[test]
+    fn leaving_out_thinking_keeps_the_rest_of_each_message() {
+        let req = Request {
+            messages: vec![
+                Message::user("hi"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Thinking {
+                        text: "only thinking".into(),
+                        provider_data: json!({}),
+                    }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::Thinking {
+                            text: "t".into(),
+                            provider_data: json!({}),
+                        },
+                        ContentBlock::Text {
+                            text: "kept".into(),
+                        },
+                    ],
+                },
+            ],
+            ..plan_request()
+        };
+        let out = without_thinking(&req, 3);
+        assert_eq!(out.messages.len(), 2);
+        assert_eq!(
+            out.messages[1].content,
+            vec![ContentBlock::Text {
+                text: "kept".into()
+            }]
+        );
+        // only the first n
+        assert_eq!(without_thinking(&req, 2).messages[1], req.messages[2]);
+        assert_eq!(without_thinking(&req, 9).messages.len(), 2);
     }
 }
