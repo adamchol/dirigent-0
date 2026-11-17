@@ -77,12 +77,16 @@ jobs:
       - name: Build the tests
         run: nix develop -c cargo test -q -p dirigent-player --test kube --no-run
       # as root (k3s): the store (single-user, the runner's until now) becomes root's, and the
-      # runner's home and environment are kept, so the tests built above are the ones run
+      # runner's home and environment are kept, so the tests built above are the ones run (from a
+      # file: the runner's sudo, sudo-rs, keeps no environment)
       - name: Test
         run: |
           sudo chown -R root:root /nix
-          sudo --preserve-env env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" \
-            nix develop -c bash -c 'kube-test up && kube-test install && kube-test e2e'
+          export -p >"$RUNNER_TEMP/env.sh"
+          # shellcheck disable=SC2016 # expanded by root's bash
+          sudo bash -c '. "$1" && export CARGO_HOME="$HOME/.cargo" &&
+            nix develop -c bash -c "kube-test up && kube-test install && kube-test e2e"' \
+            bash "$RUNNER_TEMP/env.sh"
       - name: Free memory and the runner's files
         if: always()
         run: |
@@ -131,11 +135,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: nix develop -c cargo build -q -p dirigent-control -p dirigent-player -p dirigent-cli --all-targets
-      # the stack in tmux (dnvr up wants a terminal); the tests once control answers and chlive
-      # ingests
+      # the stack in tmux (dnvr up wants a terminal), with dnvr's tmux runner (the shell's default
+      # is Rex's terminal, which CI hasn't; its own tmux server, so TMUX is unset for its attach);
+      # the tests once control answers and chlive ingests. The shell entered once first: its hook
+      # writes .dnvr's files, which two shells entered at once race for.
       - name: Start the stack
         run: |
-          tmux new-session -d -s up -x 200 -y 50 "nix develop -c dnvr up 2>&1 | tee $RUNNER_TEMP/up.log"
+          nix develop -c true
+          tmux new-session -d -s up -x 200 -y 50 \
+            "env -u TMUX nix develop -c dnvr up --runner tmux 2>&1 | tee $RUNNER_TEMP/up.log"
           # shellcheck disable=SC2016 # expanded in the dev shell
           nix develop -c timeout 900 bash -c '
             until [ -n "$(dnvr-state get chlive.url 2>/dev/null)" ] &&
