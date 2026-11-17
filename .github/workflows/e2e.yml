@@ -1,0 +1,142 @@
+# The end-to-end tests of a pull request, on GitHub's runners with the Nix builds on nixbuild.net:
+# `kube`, the chart on a test cluster (kube-test: k3s, KubeVirt, mock players in VMs), and
+# `stack`, control's and the player's tests against the dev stack (dnvr up, dnvr e2e). Both wait
+# for an approval of the `e2e` environment (its reviewers), so nobody's PR spends nixbuild.net
+# time unasked. A release is a `release/*` PR: release.yml tags its merge only when both passed
+# on its last commit.
+name: e2e
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BUILD_STORE: ssh-ng://eu.nixbuild.net
+
+jobs:
+  kube:
+    runs-on: ubuntu-latest
+    environment: e2e
+    timeout-minutes: 150
+    steps:
+      # the images (the player's VM's is 5 GB) are loaded into k3s too: room for both
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache /usr/share/swift
+          sudo docker system prune -af >/dev/null
+          df -h /
+      - name: Check KVM
+        run: test -c /dev/kvm
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ github.token }}
+            accept-flake-config = true
+            extra-substituters = https://dirigent.cachix.org https://openmig.cachix.org
+            extra-trusted-public-keys = dirigent.cachix.org-1:9st/693o4bC8VbqMDHIoYcYn6Mp4PR/zLNCJ7YSI+GQ= openmig.cachix.org-1:Aq6s2uCRbfkN/M9U2czjzjjWrOZVopfe1rv5+1cxLpo=
+      - uses: nixbuild/nixbuild-action@v27
+        with:
+          nixbuild_token: ${{ secrets.NIXBUILD_TOKEN }}
+          settings: |
+            substituters = https://cache.nixos.org/ https://openmig.cachix.org https://dirigent.cachix.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= openmig.cachix.org-1:Aq6s2uCRbfkN/M9U2czjzjjWrOZVopfe1rv5+1cxLpo= dirigent.cachix.org-1:9st/693o4bC8VbqMDHIoYcYn6Mp4PR/zLNCJ7YSI+GQ=
+      # built in nixbuild.net's store, which keeps what they need; only the archives and the
+      # chart copied here, where kube-test's own `nix build` then finds them
+      - name: Build the images
+        run: |
+          installables=(.#chart .#{control,web,tools,player-vm,player}-image)
+          nix build --store "$BUILD_STORE" --eval-store auto --builders "" --max-jobs 2 \
+            --no-link --print-build-logs "${installables[@]}"
+          mapfile -t paths < <(nix build --store "$BUILD_STORE" --eval-store auto --builders "" --no-link \
+            --print-out-paths "${installables[@]}")
+          nix copy --from "$BUILD_STORE" --no-check-sigs "${paths[@]}"
+          df -h /
+      - name: Build the dev shell
+        run: |
+          # shellcheck disable=SC2016 # expanded in the dev shell
+          nix develop -c bash -c 'dirname "$(command -v cargo)"' >>"$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the tests
+        run: nix develop -c cargo test -q -p dirigent-player --test kube --no-run
+      # as root (k3s), with the runner's cargo home, so the tests built above are the ones run
+      - name: Test
+        run: |
+          nix develop -c sudo --preserve-env env "PATH=$PATH" "CARGO_HOME=$HOME/.cargo" \
+            bash -c 'kube-test up && kube-test install && kube-test e2e'
+      - name: Free memory and the runner's files
+        if: always()
+        run: |
+          free -m
+          df -h /
+          sudo chown -R "$USER" . "$HOME/.cargo" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kube-runs
+          path: .dnvr/k3s/runs/
+          if-no-files-found: ignore
+
+  stack:
+    runs-on: ubuntu-latest
+    environment: e2e
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ github.token }}
+            accept-flake-config = true
+            extra-substituters = https://dirigent.cachix.org https://openmig.cachix.org
+            extra-trusted-public-keys = dirigent.cachix.org-1:9st/693o4bC8VbqMDHIoYcYn6Mp4PR/zLNCJ7YSI+GQ= openmig.cachix.org-1:Aq6s2uCRbfkN/M9U2czjzjjWrOZVopfe1rv5+1cxLpo=
+      - uses: nixbuild/nixbuild-action@v27
+        with:
+          nixbuild_token: ${{ secrets.NIXBUILD_TOKEN }}
+          settings: |
+            substituters = https://cache.nixos.org/ https://openmig.cachix.org https://dirigent.cachix.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= openmig.cachix.org-1:Aq6s2uCRbfkN/M9U2czjzjjWrOZVopfe1rv5+1cxLpo= dirigent.cachix.org-1:9st/693o4bC8VbqMDHIoYcYn6Mp4PR/zLNCJ7YSI+GQ=
+      - name: Build the dev shell
+        run: |
+          # shellcheck disable=SC2016 # expanded in the dev shell
+          nix develop -c bash -c 'dirname "$(command -v cargo)"' >>"$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: nix develop -c cargo build -q -p dirigent-control -p dirigent-player -p dirigent-cli --all-targets
+      # the stack in tmux (dnvr up wants a terminal); the tests once control answers and chlive
+      # ingests
+      - name: Start the stack
+        run: |
+          tmux new-session -d -s up -x 200 -y 50 "nix develop -c dnvr up 2>&1 | tee $RUNNER_TEMP/up.log"
+          # shellcheck disable=SC2016 # expanded in the dev shell
+          nix develop -c timeout 900 bash -c '
+            until [ -n "$(dnvr-state get chlive.url 2>/dev/null)" ] &&
+              [ "$(dnvr-state get connectors.ready 2>/dev/null)" = 1 ] &&
+              curl -fs -o /dev/null "$(dnvr-state get control.url 2>/dev/null)/auth"; do
+              sleep 5
+            done'
+          nix develop -c dnvr ps
+      - name: Test
+        run: nix develop -c timeout 3600 dnvr e2e
+      - name: Stack logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/stack"
+          cp "$RUNNER_TEMP/up.log" "$RUNNER_TEMP/stack/" 2>/dev/null || true
+          nix develop -c dnvr logs >"$RUNNER_TEMP/stack/logs.txt" 2>&1 || true
+          cp -r .dnvr/sessions "$RUNNER_TEMP/stack/" 2>/dev/null || true
+          free -m
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stack-logs
+          path: ${{ runner.temp }}/stack/
+          if-no-files-found: ignore
