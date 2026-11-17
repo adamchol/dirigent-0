@@ -133,8 +133,17 @@ install() {
   load
   local was=false
   installed && was=true
-  helm upgrade --install dirigent "$(chart)" -n dirigent -f "$root/nix/kube-test/values.yaml" \
-    --timeout 20m --wait --wait-for-jobs "$@"
+  if ! helm upgrade --install dirigent "$(chart)" -n dirigent -f "$root/nix/kube-test/values.yaml" \
+    --timeout 20m --wait --wait-for-jobs "$@"; then
+    # what kept it from being ready, as a run's (gather)
+    local out
+    out=$dir/runs/$(date -u +%Y%m%dT%H%M%SZ)/install
+    mkdir -p "$out/logs"
+    gather "$out"
+    kubectl -n dirigent describe pods >"$out/pods.txt" 2>&1 || true
+    say "the chart didn't install: $out"
+    return 1
+  fi
   [ "$was" = false ] || heal
   kubectl -n dirigent get pods
 }

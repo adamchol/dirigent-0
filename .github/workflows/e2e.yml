@@ -78,7 +78,8 @@ jobs:
         run: nix develop -c cargo test -q -p dirigent-player --test kube --no-run
       # as root (k3s): the store (single-user, the runner's until now) becomes root's, and the
       # runner's home and environment are kept, so the tests built above are the ones run (from a
-      # file: the runner's sudo, sudo-rs, keeps no environment)
+      # file: the runner's sudo, sudo-rs, keeps no environment, and its `env`, uutils', can't exec
+      # nix)
       - name: Test
         run: |
           sudo chown -R root:root /nix
@@ -136,14 +137,15 @@ jobs:
       - name: Build
         run: nix develop -c cargo build -q -p dirigent-control -p dirigent-player -p dirigent-cli --all-targets
       # the stack in tmux (dnvr up wants a terminal), with dnvr's tmux runner (the shell's default
-      # is Rex's terminal, which CI hasn't; its own tmux server, so TMUX is unset for its attach);
-      # the tests once control answers and chlive ingests. The shell entered once first: its hook
-      # writes .dnvr's files, which two shells entered at once race for.
+      # is Rex's terminal, which CI hasn't; its own tmux server, so TMUX is unset for its attach,
+      # by the shell: the runner's `env`, uutils', can't exec nix); the tests once control answers
+      # and chlive ingests. The shell entered once first: its hook writes .dnvr's files, which two
+      # shells entered at once race for.
       - name: Start the stack
         run: |
           nix develop -c true
           tmux new-session -d -s up -x 200 -y 50 \
-            "env -u TMUX nix develop -c dnvr up --runner tmux 2>&1 | tee $RUNNER_TEMP/up.log"
+            "unset TMUX; nix develop -c dnvr up --runner tmux 2>&1 | tee $RUNNER_TEMP/up.log"
           # shellcheck disable=SC2016 # expanded in the dev shell
           nix develop -c timeout 900 bash -c '
             until [ -n "$(dnvr-state get chlive.url 2>/dev/null)" ] &&
@@ -159,7 +161,8 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/stack"
           cp "$RUNNER_TEMP/up.log" "$RUNNER_TEMP/stack/" 2>/dev/null || true
-          nix develop -c dnvr logs >"$RUNNER_TEMP/stack/logs.txt" 2>&1 || true
+          # each process's (dnvr's tmux runner keeps them there)
+          cp -r .dnvr/logs "$RUNNER_TEMP/stack/" 2>/dev/null || true
           cp -r .dnvr/sessions "$RUNNER_TEMP/stack/" 2>/dev/null || true
           free -m
       - uses: actions/upload-artifact@v4
