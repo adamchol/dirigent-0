@@ -291,7 +291,7 @@ async fn connect(
         memory: machine.memory,
         labels: config.labels.clone(),
         slots: config.slots(),
-        version: dirigent_player::VERSION.into(),
+        version: dirigent_player::version().into(),
         sessions: sessions(roots),
     };
     let (tx, rx) = tokio::sync::mpsc::channel(16);

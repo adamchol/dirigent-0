@@ -17,8 +17,6 @@ const result = await Bun.build({
   plugins: [tailwind, wasmUrl],
   define: {
     "process.env.NODE_ENV": JSON.stringify("production"),
-    // its version, which the app shows (nix sets it: `<appVersion>+<commit>`)
-    "process.env.DIRIGENT_VERSION": JSON.stringify(process.env.DIRIGENT_VERSION ?? "dev"),
   },
 });
 if (!result.success) {

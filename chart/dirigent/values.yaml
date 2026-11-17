@@ -217,7 +217,7 @@ control:
 chlive:
   # the published image of the flake's chlive (sha-<12 chars of its commit>; `nix flake check`
   # checks it)
-  image: { repository: ghcr.io/dialohq/chlive, tag: sha-95ca2bca52bf, pullPolicy: IfNotPresent }
+  image: { repository: ghcr.io/dialohq/chlive, tag: sha-683bd5be5d31, pullPolicy: IfNotPresent }
   resources:
     requests: { cpu: 250m, memory: 512Mi }
   cacheSize: 10Gi

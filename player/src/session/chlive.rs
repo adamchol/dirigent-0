@@ -98,7 +98,7 @@ impl ChliveSession {
             id.clone(),
             &Event::PlayerAttached {
                 epoch: self.epoch,
-                version: Some(crate::VERSION.into()),
+                version: Some(crate::version().into()),
                 environment: self.environment.clone(),
                 settings: self.settings.clone(),
             },

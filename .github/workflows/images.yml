@@ -1,5 +1,5 @@
 # The chart's own images and the chart, built in nixbuild.net's store (the runner evaluates the
-# flake and gets only the archives, as its disk is too small for everything the builds need) and
+# flake and gets only the images, as its disk is too small for everything the builds need) and
 # pushed to GHCR by nix/push-images.sh: master as sha-<commit> and master, a v1.2.3 tag as 1.2.3
 # (which must be Chart.yaml's version). Pull requests only build.
 name: images
@@ -46,15 +46,15 @@ jobs:
           nix_conf: |
             experimental-features = nix-command flakes
             access-tokens = github.com=${{ github.token }}
-            extra-substituters = https://openmig.cachix.org
-            extra-trusted-public-keys = openmig.cachix.org-1:Aq6s2uCRbfkN/M9U2czjzjjWrOZVopfe1rv5+1cxLpo=
+            extra-substituters = https://dirigent.cachix.org https://openmig.cachix.org
+            extra-trusted-public-keys = dirigent.cachix.org-1:9st/693o4bC8VbqMDHIoYcYn6Mp4PR/zLNCJ7YSI+GQ= openmig.cachix.org-1:Aq6s2uCRbfkN/M9U2czjzjjWrOZVopfe1rv5+1cxLpo=
       - uses: nixbuild/nixbuild-action@v27
         with:
           nixbuild_token: ${{ secrets.NIXBUILD_TOKEN }}
-          # where nixbuild.net's store substitutes from: openmig's cache too
+          # where nixbuild.net's store substitutes from: openmig's and ours (the Rust dependencies) too
           settings: |
-            substituters = https://cache.nixos.org/ https://openmig.cachix.org
-            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= openmig.cachix.org-1:Aq6s2uCRbfkN/M9U2czjzjjWrOZVopfe1rv5+1cxLpo=
+            substituters = https://cache.nixos.org/ https://openmig.cachix.org https://dirigent.cachix.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= openmig.cachix.org-1:Aq6s2uCRbfkN/M9U2czjzjjWrOZVopfe1rv5+1cxLpo= dirigent.cachix.org-1:9st/693o4bC8VbqMDHIoYcYn6Mp4PR/zLNCJ7YSI+GQ=
       - name: Build
         if: github.event_name == 'pull_request'
         run: |

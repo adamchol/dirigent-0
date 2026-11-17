@@ -50,8 +50,8 @@ jobs:
           settings: |
             substituters = https://cache.nixos.org/ https://openmig.cachix.org https://dirigent.cachix.org
             trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= openmig.cachix.org-1:Aq6s2uCRbfkN/M9U2czjzjjWrOZVopfe1rv5+1cxLpo= dirigent.cachix.org-1:9st/693o4bC8VbqMDHIoYcYn6Mp4PR/zLNCJ7YSI+GQ=
-      # built in nixbuild.net's store, which keeps what they need; only the archives and the
-      # chart copied here, where kube-test's own `nix build` then finds them
+      # built in nixbuild.net's store, which keeps what they need; only the images (their layers)
+      # and the chart copied here, where kube-test's own `nix build` then finds them
       - name: Build the images
         run: |
           installables=(.#chart .#{control,web,tools,player-vm,player}-image)
@@ -61,10 +61,18 @@ jobs:
             --print-out-paths "${installables[@]}")
           nix copy --from "$BUILD_STORE" --no-check-sigs "${paths[@]}"
           df -h /
+      # with what it's built from pushed to the dirigent cache (all but cache.nixos.org's: chlive,
+      # ClickHouse, Redpanda, …), which the next run, nixbuild.net and your machines substitute
+      - uses: cachix/cachix-action@v16
+        with:
+          name: dirigent
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: true
       - name: Build the dev shell
         run: |
           # shellcheck disable=SC2016 # expanded in the dev shell
-          nix develop -c bash -c 'dirname "$(command -v cargo)"' >>"$GITHUB_PATH"
+          nix develop --profile "$RUNNER_TEMP/shell" -c bash -c 'dirname "$(command -v cargo)"' >>"$GITHUB_PATH"
+          cachix push dirigent "$RUNNER_TEMP/shell"
       - uses: Swatinem/rust-cache@v2
       - name: Build the tests
         run: nix develop -c cargo test -q -p dirigent-player --test kube --no-run
@@ -91,7 +99,7 @@ jobs:
   stack:
     runs-on: ubuntu-latest
     environment: e2e
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v6
       - uses: nixbuild/nix-quick-install-action@v35
@@ -108,10 +116,18 @@ jobs:
           settings: |
             substituters = https://cache.nixos.org/ https://openmig.cachix.org https://dirigent.cachix.org
             trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= openmig.cachix.org-1:Aq6s2uCRbfkN/M9U2czjzjjWrOZVopfe1rv5+1cxLpo= dirigent.cachix.org-1:9st/693o4bC8VbqMDHIoYcYn6Mp4PR/zLNCJ7YSI+GQ=
+      # with what it's built from pushed to the dirigent cache (all but cache.nixos.org's: chlive,
+      # ClickHouse, Redpanda, …), which the next run, nixbuild.net and your machines substitute
+      - uses: cachix/cachix-action@v16
+        with:
+          name: dirigent
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: true
       - name: Build the dev shell
         run: |
           # shellcheck disable=SC2016 # expanded in the dev shell
-          nix develop -c bash -c 'dirname "$(command -v cargo)"' >>"$GITHUB_PATH"
+          nix develop --profile "$RUNNER_TEMP/shell" -c bash -c 'dirname "$(command -v cargo)"' >>"$GITHUB_PATH"
+          cachix push dirigent "$RUNNER_TEMP/shell"
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: nix develop -c cargo build -q -p dirigent-control -p dirigent-player -p dirigent-cli --all-targets

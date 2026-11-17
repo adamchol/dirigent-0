@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use auth::{Auth, OidcArgs};
@@ -59,12 +60,13 @@ use crate::secrets::{KeyArgs, Keys};
 use crate::system::System;
 use crate::token::{Signer, CHLIVE, CONTROL};
 
-/// control's version, as the build tells it (nix: `<the chart's appVersion>+<commit>`); `dev`
-/// from cargo.
-const VERSION: &str = match option_env!("DIRIGENT_VERSION") {
-    Some(v) => v,
-    None => "dev",
-};
+/// control's version, `<the chart's appVersion>+<commit>`, as its image tells it
+/// (`DIRIGENT_VERSION`: nix/images.nix); `dev` without.
+fn version() -> &'static str {
+    static VERSION: LazyLock<&'static str> =
+        LazyLock::new(|| std::env::var("DIRIGENT_VERSION").map_or("dev", |v| v.leak()));
+    &VERSION
+}
 /// How long `GET /about` waits for each thing it asks.
 const ABOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -618,7 +620,7 @@ async fn about(
     let mut errors = vec![];
     Json(serde_json::json!({
         "control": {
-            "version": VERSION,
+            "version": version(),
             "started": control.started,
             "runner": control.runner.map(|r| r.id()),
         },
@@ -5176,7 +5178,7 @@ mod e2e {
         };
         let (status, about) = get_json(&base, A, "/about").await;
         assert_eq!(status, reqwest::StatusCode::OK);
-        assert_eq!(about["control"]["version"], VERSION);
+        assert_eq!(about["control"]["version"], version());
         assert!(about["control"]["started"].as_str().is_some(), "{about}");
         assert_eq!(about["players"]["vm"], system::VM);
         assert_eq!(about["players"]["system"]["configured"], false);

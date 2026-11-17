@@ -12,6 +12,8 @@
   chliveClient,
   openmig,
   postgresql,
+  # nix2container's, which copies the images (nix/images.nix)
+  skopeo,
 }:
 let
   # chlive's TS client into web/chlive-client, where web/tsconfig.json has it: $CHLIVE_CLIENT's (a
@@ -388,6 +390,7 @@ in
       description = "The chart on a test cluster here or on the test instance (k3s, KubeVirt, CloudNativePG; mock players): kube-test up|install|load|e2e|gc|remote|down|kubectl …, see nix/kube-test/kube-test.sh";
       runtimeInputs = [
         pkgs.k3s
+        skopeo
         pkgs.kubernetes-helm
         pkgs.curl
         pkgs.util-linux
@@ -400,7 +403,7 @@ in
     push-images = {
       description = "Push the chart's images and the chart to a registry (ghcr.io/adamchol): push-images [--registry R] TAG [TAG…], logged in with `skopeo login` and `helm registry login`; see nix/push-images.sh";
       runtimeInputs = [
-        pkgs.skopeo
+        skopeo
         pkgs.kubernetes-helm
       ];
       text = ''exec bash ${./push-images.sh} "$@"'';

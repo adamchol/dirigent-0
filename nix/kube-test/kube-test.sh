@@ -80,9 +80,11 @@ heal() {
 load() {
   mkdir -p "$dir/roots"
   for image in "${images[@]}"; do
-    # kept from `kube-test gc` (and the Nix store's own)
-    archive=$(nix build "$root#$image-image" --out-link "$dir/roots/$image" --print-out-paths)
-    ctr images import "$archive" >/dev/null
+    # kept from `kube-test gc` (and the Nix store's own); streamed into containerd as a
+    # docker-archive, as the image's name and tag (the chart's appVersion)
+    json=$(nix build "$root#$image-image" --out-link "$dir/roots/$image" --print-out-paths)
+    ref=$(nix eval --raw "$root#$image-image.imageRefUnsafe")
+    skopeo --insecure-policy copy -q "nix:$json" "docker-archive:/dev/stdout:$ref" | ctr images import - >/dev/null
     say "loaded $image"
   done
   if installed; then

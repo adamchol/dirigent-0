@@ -21,7 +21,7 @@ mod tools;
 mod workspace;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -46,12 +46,17 @@ use dirigent_protocol::Event;
 
 pub use crate::session::control::channel as control_channel;
 
-/// This player's version, as the build tells it (nix: `<the chart's appVersion>+<commit>`);
-/// `dev` from cargo.
-pub const VERSION: &str = match option_env!("DIRIGENT_VERSION") {
-    Some(v) => v,
-    None => "dev",
-};
+/// This player's version, `<the chart's appVersion>+<commit>`: the CLI's build's (nix), else
+/// `DIRIGENT_VERSION`'s (a players' VM's, from the player's disk: nix/images.nix); `dev` from
+/// cargo.
+pub fn version() -> &'static str {
+    static VERSION: LazyLock<&'static str> =
+        LazyLock::new(|| match option_env!("DIRIGENT_VERSION") {
+            Some(v) => v,
+            None => std::env::var("DIRIGENT_VERSION").map_or("dev", |v| v.leak()),
+        });
+    &VERSION
+}
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 /// Where the cluster's players run, as the system prompt says.
