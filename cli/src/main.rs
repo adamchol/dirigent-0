@@ -42,7 +42,7 @@ const HELP_STYLES: Styles = Styles::styled()
 #[command(
     name = "dirigent",
     about = "dirigent's command line",
-    version = dirigent_player::VERSION,
+    version = dirigent_player::version(),
     styles = HELP_STYLES
 )]
 struct Cli {
@@ -370,7 +370,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!(
                 "dirigent {}, this CLI {}",
                 about.control.version,
-                dirigent_player::VERSION
+                dirigent_player::version()
             );
             match me.chatgpt {
                 None => println!("ChatGPT: not linked (dirigent link chatgpt)"),
@@ -463,7 +463,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Command::Version { json } => {
-            let cli = dirigent_player::VERSION;
+            let cli = dirigent_player::version();
             let fetched = async {
                 let mut api = Api::signed_in(http)?;
                 let (about, hosts) = version::fetch(&mut api).await?;

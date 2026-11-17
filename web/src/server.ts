@@ -10,7 +10,7 @@ import index from "./index.html";
 const control = process.env.CONTROL ?? "http://127.0.0.1:8090";
 const chlive = process.env.CHLIVE_URL ?? "ws://127.0.0.1:8080/live";
 const development = process.env.NODE_ENV !== "production";
-// `<the chart's appVersion>+<commit>`, set at build (web/build.ts, from nix); `dev` otherwise
+// `<the chart's appVersion>+<commit>`, its image's (nix/images.nix); `dev` otherwise
 const version = process.env.DIRIGENT_VERSION ?? "dev";
 
 /** A browser's WebSocket passed on: where to, as whom, and what came before it opened. */

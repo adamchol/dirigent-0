@@ -8,9 +8,10 @@
 #   (DIRIGENT_KOPIA_TOKEN; API keys and sessions' secrets come on the lease instead);
 # - an empty disk with serial `dirigent-work`, formatted on first boot: the workspace and the
 #   player's state. Its files of any size are checkpointed, those over the log's 50 MB there alone.
-# - the player, as a disk with serial `dirigent-player` (ISO 9660: `player`, its binary, the
-#   players' image of its own, so a new player doesn't make a new VM image). It runs on the
-#   glibc and libgcc this image keeps for it (the flake checks they're the ones it needs).
+# - the player, as a disk with serial `dirigent-player` (ISO 9660: `player`, its binary, and
+#   `version`, its version; the players' image of its own, so a new player doesn't make a new VM
+#   image). It runs on the glibc and libgcc this image keeps for it (the flake checks they're the
+#   ones it needs).
 # Deleted (a node drained, the VM deleted), KubeVirt shuts the VM down and the player gets
 # SIGTERM; the VM's grace period (`terminationGracePeriodSeconds`) bounds how long it has to
 # finish the turn, checkpoint and hand the session over (its DIRIGENT_STOP_GRACE is less).
@@ -312,6 +313,10 @@ in
       fi
       mkdir -p ${player}
       mountpoint -q ${player} || mount -o ro /dev/disk/by-id/virtio-dirigent-player ${player}
+      # its version, which its disk has (nix/images.nix)
+      if [ -r ${player}/version ]; then
+        export DIRIGENT_VERSION="$(< ${player}/version)"
+      fi
       exec ${player}/player --workdir ${work}/workspace --state-dir ${work}/state
     '';
   };

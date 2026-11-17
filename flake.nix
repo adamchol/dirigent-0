@@ -1,8 +1,8 @@
 {
   description = "dirigent: event-driven coding agents";
 
-  # releases' CLI, built by CI (.github/workflows/cachix.yml); Nix asks before using it, unless
-  # it's trusted (--accept-flake-config, or the cache in nix.conf)
+  # releases' CLI (.github/workflows/cachix.yml) and the dev shell (e2e.yml), built by CI; Nix asks
+  # before using it, unless it's trusted (--accept-flake-config, or the cache in nix.conf)
   nixConfig = {
     extra-substituters = [ "https://dirigent.cachix.org" ];
     extra-trusted-public-keys = [
@@ -32,6 +32,8 @@
       inputs.flake-parts.follows = "flake-parts";
       inputs.dnvr.follows = "dnvr";
       inputs.continuous-backup.follows = "continuous-backup";
+      inputs.nix2container.follows = "nix2container";
+      inputs.crane.follows = "crane";
     };
     # schema migrations for ClickHouse and Postgres (openmig.toml, db/)
     openmig = {
@@ -42,6 +44,10 @@
     };
     # the Rust builds: the workspace's dependencies once, then each binary on them
     crane.url = "github:ipetkov/crane";
+    # the images (nix/images.nix): each layer built once, the same whatever the version, and
+    # pushed by the layers the registry hasn't
+    nix2container.url = "github:nlewo/nix2container";
+    nix2container.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -78,12 +84,8 @@
           inherit (inputs'.chlive.packages) clickhouse;
           inherit (inputs'.openmig.packages) openmig;
           postgresql = pkgs.postgresql_17;
-          # TODO: drop once chlive's package has them: its fileset misses the `wasm` workspace
-          # member (cargo can't load the workspace), and reqwest's native-tls needs OpenSSL
-          chlive = inputs'.chlive.packages.chlive.overrideAttrs (old: {
-            src = inputs.chlive;
-            buildInputs = old.buildInputs ++ [ pkgs.openssl ];
-          });
+          # chlive's own, as its flake builds it: what a cache of its builds has
+          inherit (inputs'.chlive.packages) chlive;
           # the stock players' VM's system (nix/vm), which the VM image has (images.nix); a
           # cluster's own system is built for it, so control knows it (its store path's hash)
           vmSystem =
@@ -101,8 +103,8 @@
               )
             else
               "none";
-          # the player tells its version (in its `player_attached`): the release it follows, and the
-          # commit it was built from
+          # the CLI tells its version (`<appVersion>+<rev>`): the release it follows, and the commit
+          # it was built from; control and the player are told theirs by their images
           dirigent = pkgs.callPackage ./nix/packages/dirigent.nix {
             craneLib = inputs.crane.mkLib pkgs;
             version = chartVersion "appVersion";
@@ -115,17 +117,10 @@
           chliveClient = pkgs.runCommand "chlive-client" { } ''
             mkdir $out
             cp -r ${inputs.chlive}/client/src $out/src
-            # TODO: drop the override once chlive pins it: wasm-bindgen's CLI must be its
-            # Cargo.lock's crate
-            cp -r ${
-              inputs'.chlive.packages.chlive-wasm.override { wasm-bindgen-cli = pkgs.wasm-bindgen-cli_0_2_127; }
-            } $out/wasm
+            cp -r ${inputs'.chlive.packages.chlive-wasm} $out/wasm
           '';
-          # it tells its version as the rest do (`<appVersion>+<rev>`)
-          web = pkgs.callPackage ./nix/packages/web.nix {
-            inherit chliveClient;
-            version = "${chartVersion "appVersion"}+${rev}";
-          };
+          # its version is its image's (DIRIGENT_VERSION)
+          web = pkgs.callPackage ./nix/packages/web.nix { inherit chliveClient; };
           # the chart's `version` or `appVersion` (Chart.yaml), which a release's tag is (v<it>);
           # the images' tag here is its appVersion, which the chart pulls when images.tag is empty
           chartVersion =
@@ -148,10 +143,14 @@
               web
               openmig
               vmSystem
+              rev
               ;
             inherit (inputs) nixpkgs;
+            inherit (inputs'.nix2container.packages) nix2container;
             version = chartVersion "appVersion";
           };
+          # skopeo with nix2container's `nix:` transport, which copies its images
+          skopeo = inputs'.nix2container.packages.skopeo-nix2container;
         in
         {
           formatter = pkgs.nixfmt;
@@ -174,7 +173,7 @@
             push-images = pkgs.writeShellApplication {
               name = "push-images";
               runtimeInputs = [
-                pkgs.skopeo
+                skopeo
                 pkgs.kubernetes-helm
               ];
               text = ''exec bash ${./nix/push-images.sh} "$@"'';
@@ -268,7 +267,7 @@
               postgresql
               ;
             inherit (inputs) continuous-backup;
-            inherit chlive chliveClient;
+            inherit chlive chliveClient skopeo;
           };
         };
     };

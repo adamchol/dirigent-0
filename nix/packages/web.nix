@@ -1,32 +1,27 @@
 # The web UI (web/), built: its Bun server with the app bundled in (web/build.ts), run as
-# `bun server.js`. chlive's client (chliveClient: its src/ and its WebAssembly core) is copied
-# inside the app, where web/tsconfig.json has it, so its own imports find the app's node_modules.
+# `bun server.js`; its version is its environment's (DIRIGENT_VERSION, the image's), so a commit
+# that doesn't change web/ doesn't build it again. chlive's client (chliveClient: its src/ and
+# its WebAssembly core) is copied inside the app, where web/tsconfig.json has it, so its own
+# imports find the app's node_modules.
 {
   lib,
   stdenvNoCC,
   bun,
   chliveClient,
-  # `<the chart's appVersion>+<commit>`, which the app shows (Settings → About)
-  version,
 }:
 let
-  src = lib.fileset.toSource {
-    root = ../../web;
-    fileset = lib.fileset.unions [
-      ../../web/package.json
-      ../../web/bun.lock
-      ../../web/bunfig.toml
-      ../../web/tsconfig.json
-      ../../web/build.ts
-      ../../web/wasm-url.ts
-      ../../web/src
-    ];
-  };
-  # the dependencies, fetched: update the hash when bun.lock changes
+  # the dependencies, fetched from what names them alone: update the hash when bun.lock changes
   nodeModules = stdenvNoCC.mkDerivation {
     pname = "dirigent-web-node-modules";
     version = "0.1.0";
-    inherit src;
+    src = lib.fileset.toSource {
+      root = ../../web;
+      fileset = lib.fileset.unions [
+        ../../web/package.json
+        ../../web/bun.lock
+        ../../web/bunfig.toml
+      ];
+    };
     nativeBuildInputs = [ bun ];
     dontConfigure = true;
     dontFixup = true;
@@ -42,8 +37,19 @@ let
 in
 stdenvNoCC.mkDerivation {
   pname = "dirigent-web";
-  inherit version src;
-  env.DIRIGENT_VERSION = version;
+  version = "0.1.0";
+  src = lib.fileset.toSource {
+    root = ../../web;
+    fileset = lib.fileset.unions [
+      ../../web/package.json
+      ../../web/bun.lock
+      ../../web/bunfig.toml
+      ../../web/tsconfig.json
+      ../../web/build.ts
+      ../../web/wasm-url.ts
+      ../../web/src
+    ];
+  };
   nativeBuildInputs = [ bun ];
   buildPhase = ''
     export HOME=$TMPDIR
@@ -54,4 +60,5 @@ stdenvNoCC.mkDerivation {
     bun build.ts
   '';
   installPhase = "cp -r dist $out";
+  passthru = { inherit nodeModules; };
 }

@@ -5,24 +5,29 @@
         "continuous-backup": [
           "continuous-backup"
         ],
+        "crane": [
+          "crane"
+        ],
         "dnvr": [
           "dnvr"
         ],
         "flake-parts": [
           "flake-parts"
         ],
-        "nix2container": "nix2container",
+        "nix2container": [
+          "nix2container"
+        ],
         "nixpkgs": [
           "nixpkgs"
         ],
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1794221289,
-        "narHash": "sha256-sdEmoW4lWf6gfO9wGLE1u8wtzYnWHVvyB/DmMzbrNxM=",
+        "lastModified": 1794953787,
+        "narHash": "sha256-jBfXN58jrWDmApoBwTL16IR0zbGl5kPB7w7Tzm5SuwA=",
         "ref": "master",
-        "rev": "95ca2bca52bf42b6a5ce4b65642b13c7551ce4db",
-        "revCount": 132,
+        "rev": "683bd5be5d31f40256bf7eca77d0192aa72bbb06",
+        "revCount": 133,
         "type": "git",
         "url": "https://github.com/dialohq/chlive"
       },
@@ -108,7 +113,6 @@
     "nix2container": {
       "inputs": {
         "nixpkgs": [
-          "chlive",
           "nixpkgs"
         ]
       },
@@ -175,6 +179,7 @@
         "crane": "crane",
         "dnvr": "dnvr",
         "flake-parts": "flake-parts",
+        "nix2container": "nix2container",
         "nixpkgs": "nixpkgs",
         "openmig": "openmig"
       }

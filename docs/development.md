@@ -81,6 +81,16 @@ the EC2 machine tagged `project=dirigent-test` (16 cores, 32 GB), started only f
 | `db/` | Schemas and migrations (openmig), Postgres and ClickHouse |
 | `nix/` | Packages (crane), images, the players' VM (`vm/`), the dev stack, kube-test, the Nix modules, the Homebrew formula |
 
+**Images and caches.** The images (`nix/images.nix`) are built with nix2container: each layer is a
+derivation of its own, and what changes least has one (Bun, kopia, the tools, the players' VM's
+disk), so a build makes again only the layers its change touched, and a push or a pull moves only
+those. The version (`<appVersion>+<commit>`) isn't built into control, the player or the web: their
+images tell it to them (`DIRIGENT_VERSION`, and the player's disk), so a commit or a release that
+doesn't change their code doesn't rebuild them; only the CLI is built with it. The Rust
+dependencies (`dirigent.deps`) change only with `Cargo.lock`. The e2e jobs push the dev shell's
+closure to `dirigent.cachix.org` (all of it but cache.nixos.org's: chlive, ClickHouse, Redpanda, …),
+which CI, nixbuild.net and your machines then substitute.
+
 ## Releasing
 
 A release is a pull request from a `release/X.Y.Z` branch, and the tag `vX.Y.Z` its merge gets:

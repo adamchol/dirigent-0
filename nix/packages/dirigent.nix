@@ -1,9 +1,11 @@
 # dirigent's Rust binaries, with crane: the workspace's dependencies once (`deps`, which no
-# commit of ours changes), then each binary on them: `control`, `player` and the CLI,
-# `dirigent`. The player tells its version, `<version>+<rev>`; control knows the players' VM
-# image it goes with, `vm` (what a cluster's own system is built for). Most tests need the
-# running stack (`dnvr up`, then `e2e`): only the player's loading of the logs older players
-# wrote (player/logs) runs here, so no image is built with a player that can't go on with old
+# commit or release of ours changes: only Cargo.lock does), then each binary on them: `control`,
+# `player` and the CLI, `dirigent`. Only the CLI is built with its version, `<version>+<rev>`
+# (control and the player are told theirs by their images, nix/images.nix, so a release or a
+# commit that doesn't change them doesn't build them again); control knows the players' VM image
+# it goes with, `vm` (what a cluster's own system is built for). Most tests need the running
+# stack (`dnvr up`, then `e2e`): only the player's loading of the logs older players wrote
+# (player/logs) runs here, so no image is built with a player that can't go on with old
 # sessions.
 {
   lib,
@@ -16,7 +18,8 @@
 let
   common = {
     pname = "dirigent";
-    inherit version;
+    # the crates' (all one), not the release's
+    version = (lib.importTOML ../../player/Cargo.toml).package.version;
     src = lib.fileset.toSource {
       root = ../..;
       # the cluster tests (player/tests) build no binary: editing them rebuilds nothing
@@ -42,20 +45,23 @@ let
         cargoArtifacts = deps;
         cargoExtraArgs = "--locked -p ${crate}";
         doCheck = false;
-        env = {
-          DIRIGENT_VERSION = "${version}+${rev}";
-          DIRIGENT_VM = vm;
-        };
       }
       // args
     );
-  control = binary "dirigent-control" { meta.mainProgram = "control"; };
+  control = binary "dirigent-control" {
+    env.DIRIGENT_VM = vm;
+    meta.mainProgram = "control";
+  };
   player = binary "dirigent-player" {
     doCheck = true;
     cargoTestExtraArgs = "old_logs";
     meta.mainProgram = "player";
   };
-  cli = binary "dirigent-cli" { meta.mainProgram = "dirigent"; };
+  cli = binary "dirigent-cli" {
+    version = "${version}+${rev}";
+    env.DIRIGENT_VERSION = "${version}+${rev}";
+    meta.mainProgram = "dirigent";
+  };
 in
 symlinkJoin {
   name = "dirigent-${version}";
