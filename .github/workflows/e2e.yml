@@ -36,9 +36,10 @@ jobs:
       - name: Check KVM
         run: test -c /dev/kvm
       - uses: actions/checkout@v6
-      - uses: cachix/install-nix-action@v31
+      - uses: nixbuild/nix-quick-install-action@v35
         with:
-          extra_nix_config: |
+          nix_conf: |
+            experimental-features = nix-command flakes
             access-tokens = github.com=${{ github.token }}
             accept-flake-config = true
             extra-substituters = https://dirigent.cachix.org https://openmig.cachix.org
@@ -67,11 +68,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build the tests
         run: nix develop -c cargo test -q -p dirigent-player --test kube --no-run
-      # as root (k3s), with the runner's cargo home, so the tests built above are the ones run
+      # as root (k3s): the store (single-user, the runner's until now) becomes root's, and the
+      # runner's home and environment are kept, so the tests built above are the ones run
       - name: Test
         run: |
-          nix develop -c sudo --preserve-env env "PATH=$PATH" "CARGO_HOME=$HOME/.cargo" \
-            bash -c 'kube-test up && kube-test install && kube-test e2e'
+          sudo chown -R root:root /nix
+          sudo --preserve-env env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" \
+            nix develop -c bash -c 'kube-test up && kube-test install && kube-test e2e'
       - name: Free memory and the runner's files
         if: always()
         run: |
@@ -91,9 +94,10 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
-      - uses: cachix/install-nix-action@v31
+      - uses: nixbuild/nix-quick-install-action@v35
         with:
-          extra_nix_config: |
+          nix_conf: |
+            experimental-features = nix-command flakes
             access-tokens = github.com=${{ github.token }}
             accept-flake-config = true
             extra-substituters = https://dirigent.cachix.org https://openmig.cachix.org

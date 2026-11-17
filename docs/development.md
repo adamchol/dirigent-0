@@ -63,8 +63,9 @@ and CloudNativePG, with stand-ins for ClickHouse and Kafka, on this machine or o
 | `kube-test remote <command>` | The same on the test instance: starts it, syncs the tree, runs, copies the results back. `kube-test remote stop` stops it. |
 | `kube-test kubectl …`, `kube-test down`, `kube-test gc` | |
 
-It needs `/dev/kvm` and a fair amount of memory (the test instance has 16 cores and 32 GB); the
-instance is the EC2 machine tagged `project=dirigent-test`, started only for runs.
+It needs `/dev/kvm` and a fair amount of memory. A pull request's `e2e` workflow runs `up`, `install`
+and `e2e` on a GitHub runner (4 cores, 16 GB), the images built on nixbuild.net; `remote` runs them on
+the EC2 machine tagged `project=dirigent-test` (16 cores, 32 GB), started only for runs.
 
 ## Repository
 
@@ -82,14 +83,20 @@ instance is the EC2 machine tagged `project=dirigent-test`, started only for run
 
 ## Releasing
 
-A release is a tag `vX.Y.Z` on master:
+A release is a pull request from a `release/X.Y.Z` branch, and the tag `vX.Y.Z` its merge gets:
 
 1. Set `version` and `appVersion` in `chart/dirigent/Chart.yaml` to `X.Y.Z`.
 2. Record the release's player logs: with the stack running the release's code, run a few mock
    sessions (turns with tool calls, an interrupted `?demo`, a stop and restart) and save each with
    `dnvr save-log <id> <name>` into `player/logs/X.Y.Z/`.
-3. Turn the changelog's **Unreleased** into `## X.Y.Z (date)`.
-4. Commit `chore: release X.Y.Z`, push master, tag `vX.Y.Z` and push the tag.
+3. Turn the changelog's **Unreleased** into `## X.Y.Z (date)`, and bump `--version` in `docs/operating/installing.md`.
+4. Commit `chore: release X.Y.Z` on `release/X.Y.Z`, push it and open a pull request to master.
+5. Approve its `e2e` run (the `e2e` environment's reviewers; on the run's page): `kube` runs
+   kube-test on a test cluster and `stack` runs `dnvr e2e`, on GitHub's runners with the Nix builds on
+   nixbuild.net. Each uploads what happened (`kube-runs`: kube-test's runs; `stack-logs`).
+6. Merge it once both pass. `release.yml` then tags the merge `vX.Y.Z`, and only when it is the
+   commit both passed on (rebase the branch on master first if master moved). Tags aren't pushed by
+   hand.
 
 The tag's workflows build and push the images and the chart to `ghcr.io/adamchol` (on nixbuild.net;
 the chart's version must match the tag), build the CLI on macOS and update the Homebrew formula in `adamchol/homebrew-dirigent`, and build the
