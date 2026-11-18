@@ -2,7 +2,7 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
-## Unreleased
+## 0.1.17 (2026-11-18)
 
 ### Added
 - GPT-6.2 Astra and Sol (`gpt-6.2-astra`, `gpt-6.2-sol`) on a ChatGPT plan: with no thinking asked, they run at low effort, as OpenAI refuses `none` for them. So do the earlier Astra and Sol models, whose no-thinking calls were refused (GPT-6 Astra's among them).

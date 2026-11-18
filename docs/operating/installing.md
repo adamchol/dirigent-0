@@ -121,7 +121,7 @@ kubectl create namespace dirigent
 kubectl -n dirigent create secret generic clickhouse-admin \
   --from-literal=username=admin --from-literal=password=…
 
-helm upgrade --install dirigent oci://ghcr.io/adamchol/charts/dirigent --version 0.1.16 \
+helm upgrade --install dirigent oci://ghcr.io/adamchol/charts/dirigent --version 0.1.17 \
   -n dirigent -f my-values.yaml --timeout 20m --wait --wait-for-jobs
 ```
 
