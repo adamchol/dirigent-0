@@ -183,7 +183,7 @@ in
           fi
           DIRIGENT_PLAYER_BUILD="$(nix build --no-link --print-out-paths .#player-build)/bin/dirigent-build"
           DIRIGENT_NIX_SIGNING_KEY="$(cat .dnvr/nix-key/secret)"
-          DIRIGENT_NIX_CACHE="s3://$NIX_BUCKET?endpoint=$S3&region=$S3_REGION"
+          DIRIGENT_NIX_CACHE="s3://$NIX_BUCKET?endpoint=$S3&region=$S3_REGION&compression=zstd"
           export DIRIGENT_PLAYER_BUILD DIRIGENT_NIX_SIGNING_KEY DIRIGENT_NIX_CACHE \
             DIRIGENT_NIXOS_CONFIG=.dnvr/nixos AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" \
             AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
