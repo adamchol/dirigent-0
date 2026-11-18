@@ -53,7 +53,9 @@ let
     import "${nixpkgs}/nixos/lib/make-disk-image.nix" {
       inherit pkgs lib;
       inherit (vmSystem) config;
-      format = "qcow2";
+      # compressed (zlib; QEMU decompresses what a VM reads, and its writes go to its own overlay):
+      # several times smaller for each node's pull of a release, and CI's copy
+      format = "qcow2-compressed";
       partitionTableType = "legacy";
       diskSize = "auto";
       # room for what sessions add to the store; the qcow2 is sparse, so the image stays small
