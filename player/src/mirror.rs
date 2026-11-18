@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use dirigent_protocol::Event;
-use dirigent_sync::{events, replace, Bundles, Repo, Workspace};
+use dirigent_sync::{events, Bundles, Repo, Workspace};
 use tracing::{info, warn};
 
 use crate::secrets::{redactions, Secrets};
@@ -25,7 +25,7 @@ pub struct Mirror {
     /// What the repository had mirrored before it fetched the log: where a player before this
     /// one, in this state, left the workspace.
     found: Option<String>,
-    /// What's replaced by `[secret:NAME]` in the commits, and put back on restore.
+    /// What's replaced by `[secret:NAME]` in the commits.
     secrets: Secrets,
 }
 
@@ -74,7 +74,6 @@ impl Mirror {
             return Ok(None);
         };
         self.repo.checkout(self.workdir, last, false).await?;
-        self.unredact().await?;
         info!(commit = last, "the workspace is the log's last commit");
         Ok(Some(last.clone()))
     }
@@ -85,35 +84,6 @@ impl Mirror {
             Some(last) => !self.repo.is_empty(last).await.unwrap_or(true),
             None => false,
         }
-    }
-
-    /// Put the secrets the session has back where a commit has `[secret:NAME]`.
-    async fn unredact(&self) -> anyhow::Result<()> {
-        let secrets = self.secrets.current();
-        if secrets.is_empty() {
-            return Ok(());
-        }
-        for path in Workspace::new(self.workdir).list().await? {
-            let path = self.workdir.join(path);
-            let Ok(text) = std::fs::read(&path) else {
-                continue;
-            };
-            if !text.windows(8).any(|w| w == b"[secret:") {
-                continue;
-            }
-            let mut put = text.clone();
-            for (name, value) in &secrets {
-                put = replace(
-                    &put,
-                    format!("[secret:{name}]").as_bytes(),
-                    value.as_bytes(),
-                );
-            }
-            if put != text {
-                std::fs::write(&path, put)?;
-            }
-        }
-        Ok(())
     }
 
     /// The workspace's changes since the last commit, as the events that publish them: none

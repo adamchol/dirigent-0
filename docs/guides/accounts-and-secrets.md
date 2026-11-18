@@ -64,8 +64,10 @@ How they're kept safe:
   login](../operating/machines-and-systems.md#each-session-on-your-tailnet), and removes them when it
   ends. On hosts, never.
 - Every secret value (6 characters or longer) is replaced by `[secret:NAME]` in tool output before
-  the model or the log sees it, and in workspace files mirrored into the log (they're put back when
-  you `dirigent sync`).
+  the model or the log sees it, and in workspace files mirrored into the log. These markers stay
+  redacted on sync, import and workspace restore, even when the session has the named secret.
+  Recreate credential files explicitly from runtime secrets when needed; literal markers are
+  never interpreted as requests to inject secrets.
 - The agent is told never to print secrets, and to say when one it needs is missing. A
   [dirigent](dirigents.md#secrets) can ask you for one.
 

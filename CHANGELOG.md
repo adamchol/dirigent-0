@@ -2,6 +2,11 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
+## Unreleased
+
+### Fixed
+- Restoring or importing a workspace no longer expands secret markers into credentials, so literal markers in source do not dirty a clean checkout. Redacted workspace files stay redacted, including in older snapshots; regenerate credential files explicitly from runtime secrets. Tool environments and VM runtime secret files are unchanged.
+
 ## 0.1.17 (2026-11-18)
 
 ### Added
