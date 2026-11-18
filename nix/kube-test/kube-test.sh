@@ -46,6 +46,9 @@ up() {
   if [ -e "$dir/k3s.pid" ] && kill -0 "$(cat "$dir/k3s.pid")" 2>/dev/null; then
     echo "k3s is running"
   else
+    # libvirt sets its QEMU's core file size unlimited, which only a hard limit this high allows
+    # (its pods inherit k3s's; GitHub's runners' is lower): the VMs won't start otherwise
+    ulimit -c unlimited
     setsid k3s server --data-dir "$dir/data" --write-kubeconfig "$KUBECONFIG" \
       --write-kubeconfig-mode 600 --disable traefik --disable metrics-server \
       --node-name dirigent-test --cluster-cidr 10.42.0.0/16 --service-cidr 10.43.0.0/16 \
