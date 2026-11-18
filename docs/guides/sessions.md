@@ -27,8 +27,8 @@ another spec it's refused (`409`). The caller becomes the owner.
   The model is one of your plan's (`dirigent models` lists them). Making a ChatGPT session needs a
   working link.
 - **Effort** is how much the model thinks before answering: `low`, `medium` (default), `high`, `max`,
-  or none (`null`). Models that can't stop thinking (Claude Opus and Sonnet 5.5 and later, Fable)
-  run "none" at their lowest effort instead.
+  or none (`null`). Models that can't stop thinking (Claude Opus and Sonnet 5.5 and later, Fable;
+  GPT's Astra and Sol, GPT-6.2 Astra among them) run "none" at their lowest effort instead.
 
 The context window is 200k tokens on Anthropic and 272k on ChatGPT; long sessions are
 [compacted](agent.md#compaction) before they reach it.

@@ -4,6 +4,9 @@ dirigent's releases: the chart and the images, both at the chart's version (`cha
 
 ## Unreleased
 
+### Added
+- GPT-6.2 Astra and Sol (`gpt-6.2-astra`, `gpt-6.2-sol`) on a ChatGPT plan: with no thinking asked, they run at low effort, as OpenAI refuses `none` for them. So do the earlier Astra and Sol models, whose no-thinking calls were refused (GPT-6 Astra's among them).
+
 ### Changed
 - The images are built with nix2container, in layers that stay the same from one release to the next unless what's in them changed (the players' VM's disk, Bun, kopia, the tools), so a cluster pulling a new release fetches only what changed.
 - The players' Nix cache is written with zstd rather than xz, so a cluster's system (after its NixOS configuration changes) and what a session built is much faster to put there; what's in it already stays readable.
