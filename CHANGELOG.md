@@ -7,6 +7,7 @@ dirigent's releases: the chart and the images, both at the chart's version (`cha
 ### Changed
 - The images are built with nix2container, in layers that stay the same from one release to the next unless what's in them changed (the players' VM's disk, Bun, kopia, the tools), so a cluster pulling a new release fetches only what changed.
 - The players' Nix cache is written with zstd rather than xz, so a cluster's system (after its NixOS configuration changes) and what a session built is much faster to put there; what's in it already stays readable.
+- The players' VM image's disk is a compressed qcow2, so it's smaller to pull.
 
 ## 0.1.16 (2026-11-16)
 
