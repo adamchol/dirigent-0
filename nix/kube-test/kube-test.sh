@@ -235,6 +235,10 @@ gather() {
     dirigent-ingest-pause-server dirigent-ingest-recovery; do
     kubectl -n dirigent logs "deploy/$d" --all-containers --prefix >"$out/logs/$d.log" 2>&1 || true
   done
+  # Postgres's (CloudNativePG's: its instances and their initdb and join jobs)
+  for d in $(kubectl -n dirigent get pods -l cnpg.io/cluster -o name 2>/dev/null || true); do
+    kubectl -n dirigent logs "$d" --all-containers --prefix >"$out/logs/${d#pod/}.log" 2>&1 || true
+  done
   kubectl get events -A --sort-by=.lastTimestamp >"$out/events.txt" 2>&1 || true
   kubectl -n dirigent get vmi,pods,jobs -o wide >"$out/objects.txt" 2>&1 || true
   kubectl -n dirigent get vmi -o yaml >"$out/vmis.yaml" 2>&1 || true
