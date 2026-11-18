@@ -297,9 +297,17 @@ fn chat_options(req: &Request) -> ChatOptions {
         })
 }
 
-/// Whether `model` refuses to be asked not to think: Claude Fable and Mythos, and Opus and
-/// Sonnet from 5.5 on (Sonnet's own way to stop, `between_tools`, genai doesn't send).
+/// Whether `model` refuses to be asked not to think: Claude Fable and Mythos, Opus and Sonnet
+/// from 5.5 on (Sonnet's own way to stop, `between_tools`, genai doesn't send), and GPT's Astra
+/// and Sol (`gpt-6-astra`, `gpt-6.2-sol`, …), which take no effort `none`.
 fn always_thinks(model: &str) -> bool {
+    if let Some(name) = model.strip_prefix("gpt-") {
+        // its line after the version, before a snapshot's date
+        return name
+            .split('-')
+            .nth(1)
+            .is_some_and(|l| l == "astra" || l == "sol");
+    }
     let Some(name) = model.strip_prefix("claude-") else {
         return false;
     };
@@ -851,6 +859,11 @@ mod tests {
             "claude-sonnet-5-5",
             "claude-opus-6",
             "claude-fable-5-1",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "gpt-6.2-astra-2026-11-17",
         ] {
             assert!(
                 matches!(effort(model), Some(ReasoningEffort::Low)),
@@ -863,7 +876,9 @@ mod tests {
             "claude-haiku-5-5",
             "claude-sonnet-4-5-20250929",
             "claude-sonnet-5-20260101",
-            "gpt-6-astra",
+            "gpt-5.5",
+            "gpt-6.2",
+            "gpt-6-codex",
         ] {
             assert!(
                 matches!(effort(model), Some(ReasoningEffort::Zero)),
