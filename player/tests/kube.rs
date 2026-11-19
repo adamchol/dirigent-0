@@ -252,7 +252,12 @@ async fn waiting_warm_player(within: Duration) -> String {
         let log = control_log();
         let waits = |p: &&str| {
             log.iter()
-                .any(|l| l.contains("a warm player waits") && l.contains(*p))
+                .rev()
+                .find(|l| {
+                    l.contains(*p)
+                        && (l.contains("a warm player waits") || l.contains("deleting a warm VM"))
+                })
+                .is_some_and(|l| l.contains("a warm player waits"))
         };
         if let Some(p) = players.split_whitespace().find(waits) {
             return p.to_string();
@@ -413,18 +418,46 @@ async fn a_session_takes_a_warm_vm_and_another_is_made() {
         return;
     }
     let boot = Duration::from_secs(600);
-    let waiting = waiting_warm_player(boot).await;
-
-    let asked = Instant::now();
-    let session = put_session(&stack, serde_json::json!({ "start": true })).await;
-    log_within(&stack, &session, boot, |r| attached(r) == [1]).await;
-    // no boot: the player was up already
-    let took = asked.elapsed();
-    assert!(took < Duration::from_secs(30), "attached in {took:?}");
-    assert_eq!(
-        vms(&session),
-        [format!("virtualmachineinstance.kubevirt.io/warm-{waiting}")]
-    );
+    let mut retried = false;
+    let (waiting, session) = loop {
+        let waiting = waiting_warm_player(boot).await;
+        let asked = Instant::now();
+        let session = put_session(&stack, serde_json::json!({ "start": true })).await;
+        log_within(&stack, &session, boot, |r| attached(r) == [1]).await;
+        let took = asked.elapsed();
+        let actual = vms(&session);
+        // Observing the waiter and creating the session are not atomic. A new store
+        // generation can retire exactly that VM in between, forcing a normal cold boot.
+        if !retried
+            && actual
+                == [format!(
+                    "virtualmachineinstance.kubevirt.io/player-{session}-1"
+                )]
+        {
+            let log = control_log();
+            if let Some(made) = log
+                .iter()
+                .position(|l| l.contains("session made") && l.contains(&session))
+            {
+                if log[..made].iter().any(|l| {
+                    l.contains("deleting a warm VM")
+                        && l.contains(&waiting)
+                        && l.contains("why=\"not current\"")
+                }) {
+                    eprintln!("{waiting} was retired before {session} was created; waiting for its replacement");
+                    stop_and_clear(&stack, &session).await;
+                    retried = true;
+                    continue;
+                }
+            }
+        }
+        assert_eq!(
+            actual,
+            [format!("virtualmachineinstance.kubevirt.io/warm-{waiting}")]
+        );
+        assert!(took < Duration::from_secs(30), "attached in {took:?}");
+        break (waiting, session);
+    };
     // the VM's system has the session: its target, its name, its env
     say(
         &stack,
