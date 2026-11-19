@@ -1210,7 +1210,7 @@ mod tests {
             workdir,
             checkpoints,
             mirror: None,
-            secrets: secrets.clone(),
+            secrets,
         };
         let (tx, inbox) = mpsc::channel(8);
         let (detach, when) = watch::channel(None);
@@ -1221,7 +1221,7 @@ mod tests {
         };
         let task = tokio::spawn(async move {
             if let Some(dir) = mirror {
-                let m = Mirror::open(dir, workdir, &[], secrets).await?;
+                let m = Mirror::open(dir, workdir, &[]).await?;
                 agent.mirror = Some(Box::leak(Box::new(tokio::sync::Mutex::new(m))));
             }
             let log = session.load().await?;
@@ -1725,7 +1725,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_secret_reaches_the_tools_and_stays_out_of_the_history_the_log_and_the_files() {
+    async fn tool_output_is_redacted_but_the_file_the_tool_wrote_is_mirrored_verbatim() {
         let state = tempfile::tempdir().unwrap();
         let (tx, secrets) = Secrets::channel(&[("GITHUB_TOKEN", "ghp_first_value")]);
         let h = with_secrets(state.path(), secrets);
@@ -1783,7 +1783,7 @@ mod tests {
         assert!(!model.contains("ghp_first_value"), "a value in the history");
         assert!(model.contains("[secret:GITHUB_TOKEN]"));
 
-        // the mirrored file has it redacted
+        // The workspace bundle contains the original file, not the redacted tool result.
         let files: Vec<Event> = published
             .lock()
             .unwrap()
@@ -1802,7 +1802,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             std::fs::read_to_string(out.path().join("token.txt")).unwrap(),
-            "[secret:GITHUB_TOKEN]"
+            "ghp_first_value"
         );
     }
 

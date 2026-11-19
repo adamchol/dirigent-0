@@ -5,7 +5,7 @@ dirigent's releases: the chart and the images, both at the chart's version (`cha
 ## Unreleased
 
 ### Fixed
-- Restoring or importing a workspace no longer expands secret markers into credentials, so literal markers in source do not dirty a clean checkout. Redacted workspace files stay redacted, including in older snapshots; regenerate credential files explicitly from runtime secrets. Tool environments and VM runtime secret files are unchanged.
+- Workspace snapshots, imports and restores preserve file contents verbatim, including credentials. Existing secret markers stay literal. Only tool output is redacted.
 
 ## 0.1.17 (2026-11-18)
 

@@ -325,28 +325,9 @@ async fn project(dir: &Path) -> Project {
     }
 }
 
-/// The project's files as one commit's `FilesChanged`, with what looks like secrets redacted in
-/// those git doesn't have as they are (committed ones are on the remote already, and a test's
-/// key there stays as it is): how many of each kind.
-async fn files(
-    project: &Project,
-    redact: bool,
-) -> anyhow::Result<(Vec<Event>, Vec<(String, usize)>)> {
-    let dir = &project.dir;
-    let mut work = Workspace::new(dir);
-    let mut found = redact::Found::default();
-    if redact {
-        let changed = match project.git {
-            true => changed(dir).await?,
-            false => work.list().await?,
-        };
-        for path in changed {
-            if let Ok(text) = std::fs::read_to_string(dir.join(&path)) {
-                found.scan(&text);
-            }
-        }
-        work.redact(found.values("REDACTED"));
-    }
+/// The project's files as one commit's `FilesChanged`.
+async fn files(project: &Project) -> anyhow::Result<Vec<Event>> {
+    let mut work = Workspace::new(&project.dir);
     let scratch = tempdir()?;
     let repo = Repo::open(&scratch).await?;
     let snapshot = repo
@@ -357,36 +338,7 @@ async fn files(
     let events = snapshot
         .map(|s| dirigent_sync::events(&s))
         .unwrap_or_default();
-    Ok((events, found.counts()))
-}
-
-/// The files in `dir`'s repository that its last commit doesn't have as they are: changed, or
-/// not in git (and not ignored).
-async fn changed(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let out = tokio::process::Command::new("git")
-        .current_dir(dir)
-        .args([
-            "ls-files",
-            "-z",
-            "--modified",
-            "--others",
-            "--exclude-standard",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .context("running git")?;
-    anyhow::ensure!(
-        out.status.success(),
-        "git ls-files: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
-    Ok(out
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|p| !p.is_empty())
-        .map(|p| PathBuf::from(String::from_utf8_lossy(p).into_owned()))
-        .collect())
+    Ok(events)
 }
 
 fn tempdir() -> anyhow::Result<PathBuf> {
@@ -411,12 +363,20 @@ pub async fn import(mut api: Api, ask: Import) -> anyhow::Result<()> {
     );
     let mut found = redact::Found::default();
     for (_, event) in &mut conv.events {
-        strings(event, &mut |s| {
-            if ask.redact {
-                found.redact(s);
+        if ask.redact {
+            match event {
+                Event::ToolResult { content, .. } => found.redact(content),
+                Event::AssistantMessage { content, .. } => {
+                    for block in content {
+                        if let ContentBlock::ToolResult { content, .. } = block {
+                            found.redact(content);
+                        }
+                    }
+                }
+                _ => {}
             }
-            clip(s);
-        });
+        }
+        strings(event, &mut clip);
     }
 
     let dir = ask.dir.clone().unwrap_or_else(|| conv.cwd.clone());
@@ -426,9 +386,9 @@ pub async fn import(mut api: Api, ask: Import) -> anyhow::Result<()> {
     };
     // outside git, only a project asked for: a session may have worked anywhere, $HOME too
     let project = project.filter(|p| p.git || ask.dir.is_some());
-    let (files, in_files) = match &project {
-        Some(p) => files(p, ask.redact).await?,
-        None => (Vec::new(), Vec::new()),
+    let files = match &project {
+        Some(p) => files(p).await?,
+        None => Vec::new(),
     };
 
     let spec = SessionSpec {
@@ -484,9 +444,6 @@ pub async fn import(mut api: Api, ask: Import) -> anyhow::Result<()> {
     }
     for (what, n) in found.counts() {
         println!("  redacted in the conversation: {n} × {what}");
-    }
-    for (what, n) in in_files {
-        println!("  redacted in the files: {n} × {what}");
     }
     if ask.dry_run {
         return Ok(());

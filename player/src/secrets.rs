@@ -86,15 +86,6 @@ pub fn redact(text: &str, secrets: &BTreeMap<String, String>) -> String {
     out
 }
 
-/// The values to redact, as `dirigent_sync` takes them: `(name, value)`, too short ones left out.
-pub fn redactions(secrets: &BTreeMap<String, String>) -> Vec<(String, String)> {
-    secrets
-        .iter()
-        .filter(|(_, v)| v.len() >= MIN_REDACTED)
-        .map(|(n, v)| (n.clone(), v.clone()))
-        .collect()
-}
-
 /// The secret git uses for GitHub, and `gh` too.
 pub const GITHUB_TOKEN: &str = "GITHUB_TOKEN";
 
@@ -150,7 +141,6 @@ mod tests {
             redact("a ghp_abcdef123 b ghp_abcdef c abc", &secrets),
             "a [secret:LONGER] b [secret:TOKEN] c abc"
         );
-        assert_eq!(redactions(&secrets).len(), 2);
     }
 
     #[test]

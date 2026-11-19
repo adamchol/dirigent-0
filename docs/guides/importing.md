@@ -45,9 +45,9 @@ events themselves carry the time of the import.
 
 ## Redaction
 
-What looks like a key or token is replaced before anything leaves your machine: in the conversation
-with `[redacted]`, and in files git doesn't have as committed (changed and untracked ones) with
-`[secret:REDACTED]`. It looks for Anthropic, OpenAI, GitHub, GitLab, AWS, Slack, Google, Stripe keys
+In imported tool output, text that looks like a key or token is replaced with `[redacted]` before
+upload. Workspace files, including changed and untracked files, are imported as-is. The tool
+output check looks for Anthropic, OpenAI, GitHub, GitLab, AWS, Slack, Google, Stripe keys
 and PEM private keys. `--dry-run` says how many it found; `--no-redact` turns it off.
 
 ## Options

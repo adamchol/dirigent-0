@@ -1052,11 +1052,8 @@ mod e2e {
         );
         let on_disk = std::fs::read_to_string(player.dir.path().join("f.txt")).unwrap();
         assert_eq!(on_disk, value);
-        // and in the workspace's mirror, redacted
+        // The workspace mirror preserves what the tool wrote.
         let files = files(&stack, &session).await;
-        assert!(files
-            .iter()
-            .all(|e| !serde_json::to_string(e).unwrap().contains(&value)));
         let mut bundles = dirigent_sync::Bundles::default();
         let whole: Vec<_> = files.iter().filter_map(|e| bundles.push(e)).collect();
         let reader = tempfile::tempdir().unwrap();
@@ -1068,7 +1065,7 @@ mod e2e {
             .unwrap();
         assert_eq!(
             std::fs::read_to_string(out.path().join("f.txt")).unwrap(),
-            "[secret:E2E_TOKEN]"
+            value
         );
         player.stop().await;
     }

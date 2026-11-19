@@ -11,8 +11,6 @@ use dirigent_protocol::Event;
 use dirigent_sync::{events, Bundles, Repo, Workspace};
 use tracing::{info, warn};
 
-use crate::secrets::{redactions, Secrets};
-
 /// How long a snapshot may take; then the change is in the next one.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -25,19 +23,12 @@ pub struct Mirror {
     /// What the repository had mirrored before it fetched the log: where a player before this
     /// one, in this state, left the workspace.
     found: Option<String>,
-    /// What's replaced by `[secret:NAME]` in the commits.
-    secrets: Secrets,
 }
 
 impl Mirror {
     /// The mirror of `workdir`, its repository in `dir`, having fetched what `files` (the log's
     /// `FilesChanged`, in order) has.
-    pub async fn open(
-        dir: &Path,
-        workdir: &'static Path,
-        files: &[Event],
-        secrets: Secrets,
-    ) -> anyhow::Result<Self> {
+    pub async fn open(dir: &Path, workdir: &'static Path, files: &[Event]) -> anyhow::Result<Self> {
         let repo = Repo::open(dir).await?;
         let found = repo.live().await;
         let mut bundles = Bundles::default();
@@ -52,7 +43,6 @@ impl Mirror {
             files: Workspace::new(workdir),
             last,
             found,
-            secrets,
         })
     }
 
@@ -89,7 +79,6 @@ impl Mirror {
     /// The workspace's changes since the last commit, as the events that publish them: none
     /// when nothing changed, or when it couldn't be committed (the next snapshot has it).
     pub async fn snapshot(&mut self, why: &str) -> Vec<Event> {
-        self.files.redact(redactions(&self.secrets.current()));
         let made = tokio::time::timeout(
             SNAPSHOT_TIMEOUT,
             self.repo

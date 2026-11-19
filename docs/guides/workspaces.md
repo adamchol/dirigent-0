@@ -30,15 +30,11 @@ workspace's files into a git repository of its own, kept apart from the workspac
 writes the new objects into the log as a git bundle (`files_changed`). It takes:
 
 - every file `.gitignore` doesn't exclude, hidden ones included;
-- not `.git` directories, and not files over 50 MB;
-- secret values replaced with `[secret:NAME]`.
+- not `.git` directories, and not files over 50 MB.
 
-Restoring or importing a workspace never expands these markers, including in older snapshots.
-Literal markers in source stay unchanged, and redacted credentials stay redacted. Programs that
-need credential files must regenerate them explicitly from the session's runtime secrets (see
-[Accounts and secrets](accounts-and-secrets.md#secrets)); tool environments and the VM's runtime
-secret files are still provisioned. This does not scrub secrets already present in a retained
-workspace or in files restored only from a checkpoint, outside the mirror.
+Included files are saved and restored verbatim. A credential written to one of these files
+will be in the session's workspace history. Literal `[secret:NAME]` markers, including those
+in older snapshots, are restored as text, never expanded.
 
 The workspace's own git history isn't touched: the agent's commits, branches and stashes stay the
 agent's business.
