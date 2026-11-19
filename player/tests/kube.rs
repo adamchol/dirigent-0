@@ -355,6 +355,7 @@ async fn a_player_in_a_vm_finishes_its_turn_when_the_vm_goes_and_hands_over() {
 #[tokio::test]
 async fn a_session_on_a_machine_of_its_own_gets_a_vm_that_size() {
     let Some(stack) = stack() else { return };
+    let system = system_within(&stack, Duration::from_secs(2400)).await;
     let machine = serde_json::json!({ "cpu": 2, "memory": 2, "disk": 3 });
     let session = put_session(
         &stack,
@@ -364,7 +365,7 @@ async fn a_session_on_a_machine_of_its_own_gets_a_vm_that_size() {
     say(
         &stack,
         &session,
-        "!echo cores:$(nproc) mib:$(free -m | awk '/Mem/ {print $2}') \
+        "!readlink /run/current-system && echo cores:$(nproc) mib:$(free -m | awk '/Mem/ {print $2}') \
          gib:$(df -BG --output=size /var/lib/dirigent | tail -1 | tr -d ' G')",
     )
     .await;
@@ -381,6 +382,17 @@ async fn a_session_on_a_machine_of_its_own_gets_a_vm_that_size() {
             })
             .unwrap_or_else(|| panic!("no {what} in {out}"))
     };
+    if let Some(system) = system {
+        let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            result["content"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .any(|line| line == system),
+            "custom-sized VM is not on the cluster's system: {out}"
+        );
+    }
     assert_eq!(got("cores"), 2, "{out}");
     // the guest's own take of its 2 GiB, and of its 3 GiB disk once formatted
     assert!((1500..=2048).contains(&got("mib")), "{out}");

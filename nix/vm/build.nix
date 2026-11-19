@@ -47,7 +47,7 @@ pkgs.writeShellApplication {
       failed
     fi
     echo "building the cluster's system"
-    if ! out=$(nix build --no-link --print-out-paths -L --file ${builder} \
+    if ! out=$(nix build --option require-sigs true --fallback --no-link --print-out-paths -L --file ${builder} \
       --arg configuration "$dir/configuration.nix" 2> "$log"); then
       failed
     fi
@@ -55,6 +55,13 @@ pkgs.writeShellApplication {
     echo "built $out; putting it in the cache"
     nix store sign --key-file "$key" --recursive "$out" 2> "$log" || failed
     nix copy --to "$DIRIGENT_NIX_CACHE" "$out" 2> "$log" || failed
+    # copy skips existing paths, including unsigned ones uploaded by players.
+    nix store copy-sigs --store "$DIRIGENT_NIX_CACHE" --substituter auto \
+      --recursive "$out" 2> "$log" || failed
+    public=''${DIRIGENT_NIX_KEY:-$(nix key convert-secret-to-public < "$key")}
+    nix store verify --store "$DIRIGENT_NIX_CACHE" --recursive --no-contents --sigs-needed 1 \
+      --option trusted-public-keys "$public" --option narinfo-cache-positive-ttl 0 \
+      "$out" 2> "$log" || failed
     jq -n --arg path "$out" '{ok: true, store_path: $path}' | report
     echo "the cluster's system is $out"
   '';
