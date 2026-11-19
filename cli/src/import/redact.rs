@@ -1,8 +1,6 @@
-//! What looks like a secret in an imported transcript or project: keys and tokens of the common
-//! services, by their formats, and private keys. A transcript's are replaced by `[redacted]`;
-//! a project's are given to its commit's redaction (`[secret:REDACTED]`).
+//! Keys, tokens and private keys in imported tool output are replaced by `[redacted]`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -38,25 +36,13 @@ static PATTERNS: LazyLock<Vec<(&str, Regex)>> = LazyLock::new(|| {
     .collect()
 });
 
-/// The secrets found so far: how many of each kind, and their values.
+/// How many secrets of each kind were redacted.
 #[derive(Default)]
 pub struct Found {
     counts: BTreeMap<&'static str, usize>,
-    values: BTreeSet<String>,
 }
 
 impl Found {
-    /// Count and keep the secrets `text` has.
-    pub fn scan(&mut self, text: &str) {
-        for (what, re) in PATTERNS.iter() {
-            for caps in re.captures_iter(text) {
-                let value = caps.get(1).unwrap_or_else(|| caps.get(0).expect("a match"));
-                *self.counts.entry(what).or_default() += 1;
-                self.values.insert(value.as_str().to_string());
-            }
-        }
-    }
-
     /// `text` with its secrets replaced by `[redacted]`, counted.
     pub fn redact(&mut self, text: &mut String) {
         for (what, re) in PATTERNS.iter() {
@@ -79,14 +65,6 @@ impl Found {
             *text = replaced.into_owned();
             *self.counts.entry(what).or_default() += n;
         }
-    }
-
-    /// The values found, each as `(name, value)`.
-    pub fn values(&self, name: &str) -> Vec<(String, String)> {
-        self.values
-            .iter()
-            .map(|v| (name.to_string(), v.clone()))
-            .collect()
     }
 
     pub fn counts(&self) -> Vec<(String, usize)> {
@@ -132,14 +110,5 @@ mod tests {
                 ("private key".to_string(), 1),
             ]
         );
-    }
-
-    #[test]
-    fn a_scan_keeps_the_values() {
-        let gh = format!("ghp_{}", "B".repeat(36));
-        let mut found = Found::default();
-        found.scan(&format!("TOKEN={gh}\nTOKEN={gh}\n"));
-        assert_eq!(found.values("REDACTED"), [("REDACTED".to_string(), gh)]);
-        assert_eq!(found.counts(), [("GitHub token".to_string(), 2)]);
     }
 }

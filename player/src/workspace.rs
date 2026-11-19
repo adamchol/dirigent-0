@@ -44,7 +44,7 @@ pub async fn open(
         Err(error) => anyhow::bail!("the workspace couldn't be made: {error}"),
     };
     let files = session.files().await?;
-    let mirror = match Mirror::open(mirror, workdir, &files, secrets).await {
+    let mirror = match Mirror::open(mirror, workdir, &files).await {
         Ok(m) => Some(m),
         Err(e) => {
             warn!("the workspace isn't mirrored: {e:#}");
@@ -579,10 +579,10 @@ pub(crate) mod tests {
             std::fs::metadata(work.join("big")).unwrap().len(),
             dirigent_sync::MAX_FILE_SIZE + 1
         );
-        // a secret it wrote stays redacted when restored from the log
+        // The log restores the exact bytes written after the checkpoint.
         assert_eq!(
             std::fs::read_to_string(work.join(".env")).unwrap(),
-            "TOKEN=[secret:GITHUB_TOKEN]\n"
+            "TOKEN=ghp_secret123\n"
         );
         let reader = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
@@ -595,7 +595,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             std::fs::read_to_string(out.path().join(".env")).unwrap(),
-            "TOKEN=[secret:GITHUB_TOKEN]\n"
+            "TOKEN=ghp_secret123\n"
         );
 
         // and its next commit builds on the log's last
@@ -614,7 +614,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = repo(tmp.path());
         let local = tmp.path().join("work");
-        let expected = "literal=[secret:TEST_TOKEN]\nvalue=[secret:TEST_TOKEN]\n";
+        let expected = "literal=[secret:TEST_TOKEN]\nvalue=test-secret-value\n";
         std::fs::write(local.join("file"), expected).unwrap();
         let out = std::process::Command::new("sh")
             .args([
@@ -626,58 +626,47 @@ pub(crate) mod tests {
             .unwrap();
         assert!(out.status.success(), "{out:?}");
         let source = git_source(&url, None);
-        for (i, content) in [
-            expected,
-            "literal=[secret:TEST_TOKEN]\nvalue=test-secret-value\n",
-            "literal=test-secret-value\nvalue=test-secret-value\n",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            std::fs::write(local.join("file"), content).unwrap();
-            let repo = dirigent_sync::Repo::open(&tmp.path().join(format!("cli{i}")))
-                .await
-                .unwrap();
-            let mut files = dirigent_sync::Workspace::new(&local);
-            files.redact(vec![("TEST_TOKEN".into(), "test-secret-value".into())]);
-            let snapshot = repo
-                .snapshot(&mut files, None, "imported")
-                .await
-                .unwrap()
-                .unwrap();
-            let mut session = Logged {
-                log: Vec::new(),
-                files: dirigent_sync::events(&snapshot),
-                published: Vec::new(),
-            };
-            let work = tmp.path().join(format!("ws{i}"));
-            std::fs::create_dir(&work).unwrap();
-            let (_, mirror) = open(
-                &mut session,
-                leak(&work),
-                Some(&source),
-                None,
-                &tmp.path().join(format!("mirror{i}")),
-                Secrets::channel(&[("TEST_TOKEN", "test-secret-value")]).1,
-            )
+        let repo = dirigent_sync::Repo::open(&tmp.path().join("cli"))
             .await
             .unwrap();
-            let mut mirror = mirror.unwrap();
-            for _ in 0..3 {
-                assert_eq!(
-                    std::fs::read(work.join("file")).unwrap(),
-                    expected.as_bytes()
-                );
-                let status = std::process::Command::new("git")
-                    .args(["status", "--porcelain"])
-                    .current_dir(&work)
-                    .output()
-                    .unwrap();
-                assert!(status.status.success());
-                assert!(status.stdout.is_empty(), "{status:?}");
-                assert!(mirror.snapshot("unchanged").await.is_empty());
-                mirror.restore().await.unwrap();
-            }
+        let mut files = dirigent_sync::Workspace::new(&local);
+        let snapshot = repo
+            .snapshot(&mut files, None, "imported")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut session = Logged {
+            log: Vec::new(),
+            files: dirigent_sync::events(&snapshot),
+            published: Vec::new(),
+        };
+        let work = tmp.path().join("ws");
+        std::fs::create_dir(&work).unwrap();
+        let (_, mirror) = open(
+            &mut session,
+            leak(&work),
+            Some(&source),
+            None,
+            &tmp.path().join("mirror"),
+            Secrets::channel(&[("TEST_TOKEN", "test-secret-value")]).1,
+        )
+        .await
+        .unwrap();
+        let mut mirror = mirror.unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                std::fs::read(work.join("file")).unwrap(),
+                expected.as_bytes()
+            );
+            let status = std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            assert!(status.status.success());
+            assert!(status.stdout.is_empty(), "{status:?}");
+            assert!(mirror.snapshot("unchanged").await.is_empty());
+            mirror.restore().await.unwrap();
         }
     }
 

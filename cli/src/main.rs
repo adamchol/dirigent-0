@@ -120,7 +120,7 @@ enum Command {
         command: HostCommand,
     },
     /// Make another agent's session here a dirigent session that goes on from where it was:
-    /// its conversation (thinking kept to read, secrets redacted), on the project's git remote
+    /// its conversation (thinking kept to read, tool output redacted), on the project's git remote
     /// with the files as they are here. Not started: your next message starts it.
     Import {
         agent: ImportAgent,
