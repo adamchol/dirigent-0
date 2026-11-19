@@ -2,9 +2,10 @@
 
 dirigent's releases: the chart and the images, both at the chart's version (`chart/dirigent/Chart.yaml`).
 
-## Unreleased
+## 0.1.18 (2026-11-19)
 
 ### Fixed
+- Custom NixOS system builds fall back to building when an unsigned cache entry is rejected and verify the published closure before reporting it ready.
 - Workspace snapshots, imports and restores preserve file contents verbatim, including credentials. Existing secret markers stay literal. Only tool output is redacted.
 
 ## 0.1.17 (2026-11-18)
